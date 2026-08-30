@@ -10,21 +10,36 @@
    - 旧版运行时传 messages，返回 {"role": "system", "content": ...}。
    两条路径同时给出，运行时只会读取自己认识的那个键，互不干扰。
 
+3. 歌词文件收件箱: 把 .txt / .lrc 歌词文件丢进 assets/lyrics_inbox/，
+   插件加载时或收到「/加歌」命令时自动解析入库（写进 assets/user_songs.json），
+   成功后文件归档到 lyrics_inbox/imported/。
+
 数据: assets/knowledge_db.db (中文 VOCALOID 歌曲元数据) +
-      assets/song_lyric_keywords.txt (歌词句 -> 歌名 关键词表)
+      assets/song_lyric_keywords.txt (歌词句 -> 歌名 关键词表) +
+      assets/user_songs.json (自定义/导入的歌曲)
 """
+import asyncio
+import json
 import re
 import sqlite3
+import sys
 import time
 import unicodedata
 import uuid
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
-from maibot_sdk import EventHandler, Field, HookHandler, MaiBotPlugin, PluginConfigBase
+_PLUGIN_DIR = str(Path(__file__).resolve().parent)
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
+
+from maibot_sdk import Command, EventHandler, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import ErrorPolicy, EventType, HookMode, HookOrder
+
+import lyrics_import
+from lyrics_import import ImportReport
 
 ASSET_DIR = Path(__file__).parent / "assets"
 
@@ -50,6 +65,13 @@ def _clean(text: str) -> str:
     return "".join(ch for ch in normalized if ch.isalnum())
 
 
+def _as_lines(raw: Any) -> list[str]:
+    """把 user_songs.json 里的 lyrics 字段统一成行列表。"""
+    if isinstance(raw, str):
+        return raw.splitlines()
+    return [str(x) for x in raw or []]
+
+
 class PluginSection(PluginConfigBase):
     """插件配置。"""
 
@@ -60,6 +82,16 @@ class PluginSection(PluginConfigBase):
     min_line_len: int = Field(default=4, ge=2, le=20, description="参与匹配的歌词句最短字数（过滤过短误报）")
     ttl_seconds: int = Field(default=600, ge=30, le=86400, description="命中结果的有效期（秒），过期不再注入")
     max_inject: int = Field(default=3, ge=1, le=10, description="单次注入最多携带的歌曲数")
+    auto_import_inbox: bool = Field(
+        default=True,
+        description="插件加载时自动导入 assets/lyrics_inbox 里的歌词文件",
+    )
+    max_lines_per_song: int = Field(
+        default=lyrics_import.DEFAULT_MAX_LINES,
+        ge=50,
+        le=20000,
+        description="单个歌词文件最多入库的行数",
+    )
 
 
 class CVLyricContextConfig(PluginConfigBase):
@@ -75,15 +107,18 @@ class CVLyricContextPlugin(MaiBotPlugin):
         super().__init__()
         # 清洗后的歌词句 -> [歌名, ...]（个别句子属于多首歌）
         self._songs_by_line: dict[str, list[str]] = {}
-        # 歌名 -> (歌手, UP主)
+        # 歌名 -> (歌手, P主)
         self._meta_by_name: dict[str, tuple[str, str]] = {}
+        # 归一化歌名 -> (歌手, P主)，只来自 knowledge_db.db，供歌词文件导入时反查
+        self._db_meta: dict[str, tuple[str, str]] = {}
         # 会话 -> 最近命中 [(timestamp, 歌词原文, 歌名), ...]
         self._hits: dict[str, deque[tuple[float, str, str]]] = {}
         # 会话 -> (时间戳, 最近一次登记的文本)，用于两套监听的去重
         self._last_recorded: dict[str, tuple[float, str]] = {}
-        # 诊断: hook/事件的实际字段名只打一次，避免刷屏
+        # 诊断: hook/事件/命令的实际字段名只打一次，避免刷屏
         self._probed_incoming = False
         self._probed_request = False
+        self._probed_command = False
 
     # ---------- 生命周期 ----------
 
@@ -96,6 +131,13 @@ class CVLyricContextPlugin(MaiBotPlugin):
             "中V歌词识别已加载: %d 句歌词关键词 / %d 首歌元数据",
             len(self._songs_by_line), len(self._meta_by_name),
         )
+        if self.config.plugin.auto_import_inbox:
+            report = await asyncio.to_thread(self._run_import)
+            if report and report.results:
+                self.ctx.logger.info(
+                    "歌词收件箱导入: 成功 %d 个 / 失败 %d 个",
+                    len(report.ok_results), len(report.failed_results),
+                )
 
     async def on_unload(self) -> None:
         self._hits.clear()
@@ -121,7 +163,10 @@ class CVLyricContextPlugin(MaiBotPlugin):
             finally:
                 conn.close()
             for name, singers, uploader in rows:
-                self._meta_by_name[name] = (str(singers or ""), str(uploader or ""))
+                meta = (str(singers or ""), str(uploader or ""))
+                self._meta_by_name[name] = meta
+                # 归一化索引: 导入歌词文件时按歌名反查歌手/P主
+                self._db_meta[_clean(name)] = meta
         else:
             self.ctx.logger.warning("缺少歌曲元数据库: %s", db_path)
 
@@ -140,6 +185,180 @@ class CVLyricContextPlugin(MaiBotPlugin):
                     self._songs_by_line.setdefault(key, []).append(song)
         else:
             self.ctx.logger.warning("缺少歌词关键词文件: %s", txt_path)
+
+        user_count = self._load_user_songs()
+        if user_count:
+            self.ctx.logger.info("自定义歌单已加载: %d 首额外歌曲", user_count)
+
+    def _load_user_songs(self) -> int:
+        """加载 assets/user_songs.json 里的自定义歌曲，返回成功加载的歌曲数。
+
+        自定义歌曲优先于基础词库（同名歌词句以自定义歌为准）。
+        格式见 README 的"添加新歌"一节。
+        """
+        path = ASSET_DIR / "user_songs.json"
+        if not path.exists():
+            return 0
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.ctx.logger.warning("自定义歌单解析失败，已跳过: %s", exc)
+            return 0
+        if not isinstance(data, list):
+            self.ctx.logger.warning("自定义歌单格式应为歌曲列表，已跳过")
+            return 0
+
+        loaded = 0
+        for song in data:
+            if not isinstance(song, dict):
+                continue
+            name = str(song.get("name") or "").strip()
+            if not name:
+                continue
+            self._index_song(
+                name,
+                str(song.get("singers") or ""),
+                str(song.get("uploader") or ""),
+                _as_lines(song.get("lyrics")),
+            )
+            loaded += 1
+        return loaded
+
+    def _index_song(self, name: str, singers: str, uploader: str, lines: list[str]) -> int:
+        """把一首歌写进内存词库，返回新增的歌词句数。
+
+        自定义/导入的歌插到同名词句列表最前，命中时优先于基础词库。
+        元数据按"新值非空才覆盖"合并：user_songs.json 里的空字段不会冲掉
+        knowledge_db.db 里已有的歌手/P主。
+        """
+        old_singers, old_uploader = self._meta_by_name.get(name, ("", ""))
+        self._meta_by_name[name] = (singers or old_singers, uploader or old_uploader)
+        added = 0
+        for line in lines:
+            key = _clean(line)
+            if key and len(_CJK.findall(key)) >= _MIN_CJK_CHARS:
+                bucket = self._songs_by_line.setdefault(key, [])
+                if name not in bucket:
+                    bucket.insert(0, name)
+                    added += 1
+        return added
+
+    # ---------- 歌词文件收件箱 ----------
+
+    def _lookup_db_meta(self, song_name: str) -> tuple[str, str]:
+        """按歌名在 knowledge_db.db 里反查 (歌手, P主)，查不到返回空串。"""
+        return self._db_meta.get(_clean(song_name), ("", ""))
+
+    def _run_import(self) -> Optional[ImportReport]:
+        """扫描 assets/lyrics_inbox 并导入，失败时返回 None（已记日志）。"""
+        inbox = ASSET_DIR / lyrics_import.INBOX_DIR_NAME
+        try:
+            inbox.mkdir(parents=True, exist_ok=True)
+            report = lyrics_import.run_import(
+                ASSET_DIR,
+                min_line_len=self.config.plugin.min_line_len,
+                max_lines=self.config.plugin.max_lines_per_song,
+                meta_lookup=self._lookup_db_meta,
+            )
+        except Exception as exc:
+            self.ctx.logger.error("歌词收件箱导入失败: %s", exc, exc_info=True)
+            return None
+        if report.results:
+            self._apply_import(report)
+        return report
+
+    def _apply_import(self, report: ImportReport) -> None:
+        """把导入结果并入内存词库，立即生效，无需重载插件。"""
+        by_name = {
+            str(s.get("name") or ""): s
+            for s in report.songs
+            if isinstance(s, dict)
+        }
+        for result in report.ok_results:
+            song = by_name.get(result.song_name)
+            if not song:
+                continue
+            added = self._index_song(
+                result.song_name,
+                str(song.get("singers") or ""),
+                str(song.get("uploader") or ""),
+                _as_lines(song.get("lyrics")),
+            )
+            self.ctx.logger.info(
+                "歌词文件已入库: %s -> 《%s》（新增 %d 句）",
+                result.file_name, result.song_name, added,
+            )
+
+    @staticmethod
+    def _pick_stream_id(kwargs: dict) -> str:
+        """从命令载荷里取 stream_id，兼容不同版本/结构的字段名。
+
+        拿不到就返回空串：此时不能静默失败，调用方要记日志并降级，
+        否则用户会看到"发命令后什么都没发生"。
+        """
+        for key in ("stream_id", "chat_id", "session_id", "stream"):
+            value = kwargs.get(key)
+            if value:
+                return str(value)
+        message = kwargs.get("message")
+        if isinstance(message, dict):
+            for key in ("stream_id", "chat_id", "session_id"):
+                if message.get(key):
+                    return str(message[key])
+        return ""
+
+    @Command(
+        "import_lyrics",
+        description="扫描歌词收件箱 assets/lyrics_inbox 并扩充歌曲库",
+        pattern=r"^\s*[/／]\s*(?:加歌|导入歌词|扫描歌词|歌词导入)(?:\s.*)?$",
+        aliases=["/加歌", "/导入歌词", "/扫描歌词"],
+    )
+    async def cmd_import_lyrics(self, **kwargs: Any) -> tuple[bool, str, int]:
+        """/加歌：导入收件箱里的歌词文件并回报结果。
+
+        返回值第三项是拦截级别（不是权重）：2 = 阻止 bot 再对这条命令生成回复。
+        只有在结果确实发出去时才用 2；发不出去就返回 0，让 bot 至少接一句话，
+        避免用户看到"命令石沉大海"。
+        """
+        raw = str(kwargs.get("raw_message") or kwargs.get("text") or "")
+        stream_id = self._pick_stream_id(kwargs)
+        if not self._probed_command:
+            self._probed_command = True
+            self.ctx.logger.info("[诊断] import_lyrics 字段: %s", sorted(kwargs.keys()))
+        self.ctx.logger.info("收到歌词导入命令: raw=%r stream_id=%r", raw, stream_id or "<空>")
+
+        if not self.config.plugin.enabled:
+            text = "歌词插件当前已禁用，无法导入。"
+        else:
+            report = await asyncio.to_thread(self._run_import)
+            if report is None:
+                text = "歌词导入失败，请查看插件日志。"
+            elif not report.results:
+                text = (
+                    "收件箱里没有待导入的歌词文件。\n"
+                    f"把 .txt 或 .lrc 歌词文件放进 {lyrics_import.INBOX_DIR_NAME}/ 再试一次。"
+                )
+            else:
+                text = (
+                    f"歌词导入完成：成功 {len(report.ok_results)} 个，"
+                    f"失败 {len(report.failed_results)} 个。\n" + report.summary()
+                )
+
+        sent = False
+        if stream_id:
+            try:
+                result = await self.ctx.send.text(text, stream_id)
+                sent = result if isinstance(result, bool) else True
+            except Exception as exc:
+                self.ctx.logger.error("导入结果发送失败: %s", exc, exc_info=True)
+        else:
+            self.ctx.logger.error(
+                "命令载荷里没有 stream_id，无法回复结果（字段=%s，raw=%r）",
+                sorted(kwargs.keys()), raw,
+            )
+
+        self.ctx.logger.info("歌词导入结果已回复: sent=%s", sent)
+        return True, text, 2 if sent else 0
 
     # ---------- 入站消息: 歌词命中检测 ----------
 
@@ -245,7 +464,15 @@ class CVLyricContextPlugin(MaiBotPlugin):
                 continue
             seen.add(song)
             singers, uploader = self._meta_by_name.get(song, ("", ""))
-            extra = "、".join(x for x in (singers, uploader) if x)
+            singers, uploader = lyrics_import.flatten_names(singers), lyrics_import.flatten_names(uploader)
+            extra = "，".join(
+                label
+                for label in (
+                    f"演唱：{singers}" if singers else "",
+                    f"P主：{uploader}" if uploader else "",
+                )
+                if label
+            )
             entries.append(f"- 「{lyric}」 出自《{song}》" + (f"（{extra}）" if extra else ""))
             if len(entries) >= cfg.max_inject:
                 break
@@ -256,7 +483,7 @@ class CVLyricContextPlugin(MaiBotPlugin):
             f"{INJECT_MARKER}用户最近在会话中发送了以下歌词原文：\n"
             f"{body}\n"
             "用户可能在引歌词、玩歌词接龙或聊这首歌。请在回复中自然地运用这些歌曲信息"
-            "（歌名/歌手），只在话题相关时提及，不要生硬播报。"
+            "（歌名/歌手/P主），只在话题相关时提及，不要生硬播报。"
         )
 
     @staticmethod
