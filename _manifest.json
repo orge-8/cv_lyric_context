@@ -5,12 +5,12 @@
     "name": "中V歌词识别",
     "description": "入站消息命中中文VOCALOID歌词时，通过 maisaka.replyer.before_model_request Hook 向 LLM 上下文注入歌曲名/歌手信息，让 bot 能自然接住歌词话题。内置 3412 首中V歌曲词库。",
     "author": {
-        "name": "38160",
-        "url": "https://github.com/38160"
+        "name": "orge-8",
+        "url": "https://github.com/orge-8/cv_lyric_context"
     },
     "urls": {
-        "homepage": "https://github.com/38160/cv_lyric_context",
-        "issues": "https://github.com/38160/cv_lyric_context/issues"
+        "homepage": "https://github.com/orge-8/cv_lyric_context",
+        "issues": "https://github.com/orge-8/cv_lyric_context/issues"
     },
     "license": "MIT",
     "host_application": {
