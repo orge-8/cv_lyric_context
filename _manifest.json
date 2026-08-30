@@ -1,0 +1,28 @@
+{
+    "manifest_version": 2,
+    "id": "org.mai-mai.cv-lyric-context",
+    "version": "1.0.0",
+    "name": "中V歌词识别",
+    "description": "入站消息命中中文VOCALOID歌词时，通过 maisaka.replyer.before_model_request Hook 向 LLM 上下文注入歌曲名/歌手信息，让 bot 能自然接住歌词话题。内置 3412 首中V歌曲词库。",
+    "author": {
+        "name": "38160",
+        "url": "https://github.com/38160"
+    },
+    "urls": {
+        "homepage": "https://github.com/38160/cv_lyric_context",
+        "issues": "https://github.com/38160/cv_lyric_context/issues"
+    },
+    "license": "MIT",
+    "host_application": {
+        "min_version": "1.0.0",
+        "max_version": "1.99.99"
+    },
+    "sdk": {
+        "min_version": "2.0.0",
+        "max_version": "2.99.99"
+    },
+    "capabilities": ["send_message"],
+    "i18n": {
+        "default_locale": "zh-CN"
+    }
+}
