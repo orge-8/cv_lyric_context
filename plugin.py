@@ -40,6 +40,8 @@ from maibot_sdk.types import ErrorPolicy, EventType, HookMode, HookOrder
 
 import lyrics_import
 from lyrics_import import ImportReport
+from vcpedia_mixin import DB_FILE as VCPEDIA_DB_FILE, VCPediaMixin
+from vcpedia_sync import SyncStats
 
 ASSET_DIR = Path(__file__).parent / "assets"
 
@@ -49,6 +51,12 @@ _LYRIC_TAIL = re.compile(r"是《(.+)》的歌词\s*$")
 _CJK = re.compile(r"[㐀-䶿一-鿿぀-ヿ]")
 _MIN_CJK_CHARS = 2
 
+# 单条歌词句的字符上限。基础关键词文件里歌词句 p99 只有 18 字、最长 64 字；
+# 超过这个长度的"一行"基本都是整首歌被存成了一坨（knowledge_db.db 里
+# 3318 首有歌词，其中 3290 首没有换行符）。这种巨键永远匹配不到，只会白占内存，
+# 所以统一在入索引的必经之路上拦掉。
+_MAX_LYRIC_LINE_CHARS = 100
+
 # 注入内容标记，用于识别"本次请求已经注入过"，避免重试时重复叠加
 INJECT_MARKER = "【歌词识别】"
 
@@ -57,6 +65,9 @@ DEDUP_SECONDS = 10
 
 # Context Item 快照结构版本，取自 MaiBot 的 CONTEXT_ITEM_SCHEMA_VERSION
 CONTEXT_ITEM_SCHEMA_VERSION = 1
+
+# 兼容旧配置：早期版本跨插件读取 vcpedia-crawler 的库，现在内置后不再需要
+DEFAULT_EXTRA_DB = "plugins/vcpedia-crawler/data/vcpedia_songs.db"
 
 
 def _clean(text: str) -> str:
@@ -92,25 +103,91 @@ class PluginSection(PluginConfigBase):
         le=20000,
         description="单个歌词文件最多入库的行数",
     )
+    extra_song_dbs: str = Field(
+        default="",
+        description=(
+            "额外歌曲库（SQLite）路径，相对 MaiBot 根目录，多个用英文逗号分隔；"
+            "留空则使用内置爬虫同步下来的歌词库"
+        ),
+    )
+    max_results: int = Field(default=5, ge=1, le=20, description="搜索歌曲时最多返回几条")
+    detail_lyric_lines: int = Field(
+        default=30, ge=0, le=200, description="查看歌曲详情时展示的歌词行数（0 表示不展示歌词）"
+    )
+    lyric_preview_chars: int = Field(
+        default=120, ge=20, le=2000, description="工具返回歌词时每条结果的歌词预览字数"
+    )
+
+
+class CrawlerSection(PluginConfigBase):
+    """VCPedia 爬取设置。"""
+
+    __ui_label__ = "VCPedia 爬取"
+    __ui_icon__ = "cloud-download"
+    __ui_order__ = 1
+
+    base_url: str = Field(default="https://vcpedia.cn", description="VCPedia 站点根地址")
+    categories: str = Field(
+        default="Category:洛天依歌曲",
+        description="要爬取的分类，多个用英文逗号分隔。父分类（如殿堂曲）会自动递归子分类",
+    )
+    category_depth: int = Field(default=2, ge=0, le=4, description="子分类递归深度")
+    request_interval: float = Field(
+        default=0.8, ge=0.0, le=10.0, description="两次请求的最小间隔（秒），请保持礼貌爬取"
+    )
+    timeout: int = Field(default=20, ge=5, le=120, description="单次请求超时（秒）")
+    max_fail: int = Field(default=30, ge=1, le=500, description="连续失败达到该次数时提前中止同步")
+    sync_batch_limit: int = Field(
+        default=0, ge=0, le=100000,
+        description="单次同步最多抓取多少首（0 表示不限，全量首次同步会很久）",
+    )
+    allow_sync_command: bool = Field(
+        default=True, description="是否允许通过「/歌词 同步」命令触发同步"
+    )
+    verify_ssl: bool = Field(
+        default=True,
+        description="是否校验 SSL 证书。网络出口有中间人代理导致报证书错误时可临时关闭（不安全）",
+    )
+    ca_bundle: str = Field(
+        default="",
+        description="CA 证书文件路径（PEM）。网络出口有中间人代理时，填代理根证书比关掉校验更好",
+    )
 
 
 class CVLyricContextConfig(PluginConfigBase):
     """插件完整配置。"""
 
     plugin: PluginSection = Field(default_factory=PluginSection)
+    crawler: CrawlerSection = Field(default_factory=CrawlerSection)
 
 
-class CVLyricContextPlugin(MaiBotPlugin):
+class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
+    """歌词识别 + 歌曲库（内置 VCPedia 爬虫）。
+
+    VCPediaMixin 提供 /歌词 系列命令与两个 LLM 工具；实测 MaiBot SDK
+    能正确注册继承来的 @Command / @Tool 组件。
+    """
+
     config_model = CVLyricContextConfig
 
     def __init__(self) -> None:
         super().__init__()
+        # VCPediaMixin 依赖的运行时状态
+        self._store = None
+        self._client = None
+        self._syncer = None
+        self._sync_task = None
+        self._sync_stats = None
+        self._sync_stream = ""
         # 清洗后的歌词句 -> [歌名, ...]（个别句子属于多首歌）
         self._songs_by_line: dict[str, list[str]] = {}
         # 歌名 -> (歌手, P主)
         self._meta_by_name: dict[str, tuple[str, str]] = {}
         # 归一化歌名 -> (歌手, P主)，只来自 knowledge_db.db，供歌词文件导入时反查
         self._db_meta: dict[str, tuple[str, str]] = {}
+        # 歌词句已进 _songs_by_line 的歌名。判断"这首歌还需不需要索引"要看它，
+        # 不能看 _meta_by_name —— 后者只表示知道这首歌，不代表歌词已入库。
+        self._indexed_names: set[str] = set()
         # 会话 -> 最近命中 [(timestamp, 歌词原文, 歌名), ...]
         self._hits: dict[str, deque[tuple[float, str, str]]] = {}
         # 会话 -> (时间戳, 最近一次登记的文本)，用于两套监听的去重
@@ -126,6 +203,8 @@ class CVLyricContextPlugin(MaiBotPlugin):
         if not self.config.plugin.enabled:
             self.ctx.logger.info("插件已在配置中禁用，跳过数据加载")
             return
+        # 先初始化内置爬虫的歌曲库，_load_assets 会把它接进识别词库
+        self._vcpedia_init()
         self._load_assets()
         self.ctx.logger.info(
             "中V歌词识别已加载: %d 句歌词关键词 / %d 首歌元数据",
@@ -140,14 +219,17 @@ class CVLyricContextPlugin(MaiBotPlugin):
                 )
 
     async def on_unload(self) -> None:
+        await self._vcpedia_shutdown()
         self._hits.clear()
         self._last_recorded.clear()
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         if scope == "self":
             self.ctx.logger.info("插件配置已更新: version=%s", version)
+            self._vcpedia_on_config_update(version)
             # 若从"禁用"切到"启用"，补一次数据加载
             if self.config.plugin.enabled and not self._songs_by_line:
+                self._vcpedia_init()
                 self._load_assets()
 
     # ---------- 数据加载 ----------
@@ -183,12 +265,196 @@ class CVLyricContextPlugin(MaiBotPlugin):
                 # 过滤纯数字/纯英文句：缺少足够汉字时极易误命中（如圆周率歌词）
                 if key and len(_CJK.findall(key)) >= _MIN_CJK_CHARS:
                     self._songs_by_line.setdefault(key, []).append(song)
+                    self._indexed_names.add(song)
         else:
             self.ctx.logger.warning("缺少歌词关键词文件: %s", txt_path)
+
+        # 关键词文件本身有漏：db 里 3318 首有歌词，关键词文件只覆盖了 3055 首。
+        # 剩下的歌用 db 自己的 lyrics 列补上，不用等爬虫。
+        if db_path.exists():
+            filled = self._fill_lyrics_from_db(db_path)
+            if filled:
+                self.ctx.logger.info("基础词库歌词补漏: %d 首歌的歌词已补进索引", filled)
 
         user_count = self._load_user_songs()
         if user_count:
             self.ctx.logger.info("自定义歌单已加载: %d 首额外歌曲", user_count)
+
+        extra_count = self._load_extra_dbs()
+        if extra_count:
+            self.ctx.logger.info("外部歌曲库已补充: %d 首歌", extra_count)
+
+    def _fill_lyrics_from_db(self, db_path: Path) -> int:
+        """把 knowledge_db.db 里有歌词、却没进关键词文件的歌补进索引。
+
+        关键词文件是预先生成的，和 db 不完全一致：db 里 3318 首有 lyrics，
+        关键词文件只覆盖了 3055 首，剩下的歌永远识别不到。db 自己就有歌词，
+        直接拿来补，不依赖任何外部数据。
+        """
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            self.ctx.logger.warning("打开 %s 失败: %s", db_path.name, exc)
+            return 0
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(songs)")}
+            if "lyrics" not in columns:
+                return 0
+            rows = conn.execute(
+                "SELECT name, lyrics FROM songs "
+                "WHERE lyrics IS NOT NULL AND TRIM(lyrics) != ''"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            self.ctx.logger.warning("读取 %s 的歌词失败: %s", db_path.name, exc)
+            return 0
+        finally:
+            conn.close()
+
+        filled = 0
+        for name, lyrics in rows:
+            name = str(name or "").strip()
+            if not name or name in self._indexed_names:
+                continue
+            singers, uploader = self._meta_by_name.get(name, ("", ""))
+            if self._index_song(name, singers, uploader, str(lyrics or "").splitlines()):
+                filled += 1
+        return filled
+
+    # ---------- 外部歌曲库（如 vcpedia-crawler 爬到的） ----------
+
+    @staticmethod
+    def _maibot_root() -> Path:
+        """MaiBot 根目录: 插件目录 plugins/<id> 的上两级。"""
+        return Path(__file__).resolve().parent.parent.parent
+
+    @staticmethod
+    def _within(path: Path, root: Path) -> bool:
+        """路径是否仍在 root 之内（Windows 下忽略盘符大小写）。"""
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _extra_db_paths(self) -> list[Path]:
+        """待加载的外部歌曲库: 配置优先，留空则自动找 vcpedia-crawler 的库。
+
+        相对路径一律相对 MaiBot 根目录解析，且不允许越出根目录，
+        避免配置被误填成 ../../.. 之类的路径。
+        """
+        raw_cfg = str(self.config.plugin.extra_song_dbs or "").strip()
+        if raw_cfg:
+            raw_list = [p.strip() for p in raw_cfg.split(",") if p.strip()]
+            # 手填的路径才需要防越界
+            check_escape = True
+        else:
+            # 内置爬虫同步下来的库放在 MaiBot 分配给本插件的 data_dir，天然可信
+            raw_list = [str(Path(self.ctx.paths.data_dir) / VCPEDIA_DB_FILE)]
+            check_escape = False
+
+        root = self._maibot_root()
+        paths: list[Path] = []
+        for raw in raw_list:
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                self.ctx.logger.warning("外部歌曲库路径无效，已跳过: %s", raw)
+                continue
+            if check_escape and not self._within(resolved, root):
+                self.ctx.logger.warning("外部歌曲库路径越出 MaiBot 根目录，已跳过: %s", raw)
+                continue
+            paths.append(resolved)
+        return paths
+
+    def _load_extra_dbs(self) -> int:
+        """从外部歌曲库补充歌词与元数据，返回新增的歌曲数。"""
+        total = 0
+        for db_path in self._extra_db_paths():
+            if not db_path.is_file():
+                # 没装 vcpedia-crawler 或还没同步过，属正常情况
+                continue
+            total += self._load_song_db(db_path)
+        return total
+
+    def _load_song_db(self, db_path: Path) -> int:
+        """读取一个含 songs(name, singers, uploader, lyrics) 的库，返回新增歌曲数。"""
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            self.ctx.logger.warning("无法打开外部歌曲库 %s: %s", db_path.name, exc)
+            return 0
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(songs)")}
+            missing = {"name", "singers", "uploader", "lyrics"} - columns
+            if missing:
+                self.ctx.logger.warning(
+                    "外部歌曲库 %s 的 songs 表缺少字段 %s，已跳过",
+                    db_path.name, sorted(missing),
+                )
+                return 0
+            rows = conn.execute(
+                "SELECT name, singers, uploader, lyrics FROM songs"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            self.ctx.logger.warning("读取外部歌曲库 %s 失败: %s", db_path.name, exc)
+            return 0
+        finally:
+            conn.close()
+
+        added = 0
+        for name, singers, uploader, lyrics in rows:
+            name = str(name or "").strip()
+            if not name:
+                continue
+            meta = (str(singers or ""), str(uploader or ""))
+            # 歌词已经索引过的歌跳过。注意判断依据是 _indexed_names 不是
+            # _meta_by_name：后者只说明"知道这首歌"，不代表歌词已入库，
+            # 用它会把关键词文件漏掉的那几百首一并放过。
+            if name in self._indexed_names:
+                self._db_meta.setdefault(_clean(name), meta)
+                continue
+            self._index_song(name, meta[0], meta[1], str(lyrics or "").splitlines())
+            self._db_meta.setdefault(_clean(name), meta)
+            added += 1
+
+        if added:
+            self.ctx.logger.info("外部歌曲库 %s: 新增 %d 首歌", db_path.name, added)
+        else:
+            self.ctx.logger.info(
+                "外部歌曲库 %s: %d 首歌均已在基础库中，未新增", db_path.name, len(rows)
+            )
+        return added
+
+    async def _vcpedia_after_sync(self, stats: SyncStats) -> str:
+        """爬完新歌后重建内存歌词索引，否则要重启 MaiBot 才能识别。
+
+        重跑 _load_extra_dbs 是幂等的：已有的歌靠 _meta_by_name 判断会跳过，
+        只有新爬到的会进索引。已有歌词的更新不会重索引（属可接受取舍）。
+        """
+        if not (stats.added or stats.updated):
+            return ""
+        try:
+            added = await asyncio.to_thread(self._load_extra_dbs)
+        except Exception as exc:  # noqa: BLE001 - 重建失败不影响已入库的数据
+            self.ctx.logger.warning("歌词库: 同步后重建索引失败: %s", exc, exc_info=True)
+            return "（识别词库重建失败，重启 MaiBot 后新歌才会生效）"
+        self.ctx.logger.info("歌词库: 同步后重建索引，新增 %d 首进入识别词库", added)
+        # 入库数通常大于索引新增数：基础词库（3412 首）里已有的同名歌不重复索引，
+        # 它们的歌词本来就在 song_lyric_keywords.txt 里。不说清楚会被当成丢了歌。
+        already = stats.added - added if stats.updated == 0 else 0
+        if added and already > 0:
+            return (
+                f"已重建识别词库：{added} 首歌词新可被识别，"
+                f"另 {already} 首基础词库已收录，不重复索引"
+            )
+        if added:
+            return f"已重建识别词库，新增 {added} 首可被直接识别"
+        if already > 0:
+            return f"同步的 {already} 首基础词库均已收录，无需重建索引"
+        return ""
 
     def _load_user_songs(self) -> int:
         """加载 assets/user_songs.json 里的自定义歌曲，返回成功加载的歌曲数。
@@ -233,10 +499,12 @@ class CVLyricContextPlugin(MaiBotPlugin):
         """
         old_singers, old_uploader = self._meta_by_name.get(name, ("", ""))
         self._meta_by_name[name] = (singers or old_singers, uploader or old_uploader)
+        # 歌名一旦进过索引就记下来，后续来源（外部库/补漏）不必再处理
+        self._indexed_names.add(name)
         added = 0
         for line in lines:
             key = _clean(line)
-            if key and len(_CJK.findall(key)) >= _MIN_CJK_CHARS:
+            if key and len(key) <= _MAX_LYRIC_LINE_CHARS and len(_CJK.findall(key)) >= _MIN_CJK_CHARS:
                 bucket = self._songs_by_line.setdefault(key, [])
                 if name not in bucket:
                     bucket.insert(0, name)
