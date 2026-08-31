@@ -99,6 +99,16 @@ class PluginSection(PluginConfigBase):
     min_line_len: int = Field(default=4, ge=2, le=20, description="参与匹配的歌词句最短字数（过滤过短误报）")
     ttl_seconds: int = Field(default=600, ge=30, le=86400, description="命中结果的有效期（秒），过期不再注入")
     max_inject: int = Field(default=3, ge=1, le=10, description="单次注入最多携带的歌曲数")
+    inject_context_lines: int = Field(
+        default=2, ge=0, le=5,
+        description="注入命中歌词的前后各几行（接龙/续唱用；0 表示只注入命中的那一句）",
+    )
+    inject_basic_credits: bool = Field(
+        default=True, description="注入年份与作词/作曲/编曲",
+    )
+    inject_full_staff: bool = Field(
+        default=True, description="注入调教/混音/PV/曲绘等完整 STAFF",
+    )
     auto_import_inbox: bool = Field(
         default=True,
         description="插件加载时自动导入 assets/lyrics_inbox 里的歌词文件",
@@ -199,6 +209,9 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         self._meta_by_name: dict[str, tuple[str, str]] = {}
         # 归一化歌名 -> (歌手, P主)，只来自 knowledge_db.db，供歌词文件导入时反查
         self._db_meta: dict[str, tuple[str, str]] = {}
+        # 归一化歌名 -> 完整歌词行。注入「命中行的前后歌词」时用；VCPedia 库太大不常驻，
+        # 按需查库，这里只缓存知识库/自定义歌这些已经在内存里过一遍的。
+        self._lyrics_by_name: dict[str, list[str]] = {}
         # 歌词句已进 _songs_by_line 的歌名。判断"这首歌还需不需要索引"要看它，
         # 不能看 _meta_by_name —— 后者只表示知道这首歌，不代表歌词已入库。
         self._indexed_names: set[str] = set()
@@ -330,7 +343,9 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             if not name or name in self._indexed_names:
                 continue
             singers, uploader = self._meta_by_name.get(name, ("", ""))
-            if self._index_song(name, singers, uploader, str(lyrics or "").splitlines()):
+            lines = str(lyrics or "").splitlines()
+            self._lyrics_by_name.setdefault(_clean(name), lines)
+            if self._index_song(name, singers, uploader, lines):
                 filled += 1
         return filled
 
@@ -424,6 +439,7 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             if not name:
                 continue
             meta = (str(singers or ""), str(uploader or ""))
+            self._lyrics_by_name.setdefault(_clean(name), str(lyrics or "").splitlines())
             # 歌词已经索引过的歌跳过。注意判断依据是 _indexed_names 不是
             # _meta_by_name：后者只说明"知道这首歌"，不代表歌词已入库，
             # 用它会把关键词文件漏掉的那几百首一并放过。
@@ -500,11 +516,13 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             name = str(song.get("name") or "").strip()
             if not name:
                 continue
+            lines = _as_lines(song.get("lyrics"))
+            self._lyrics_by_name[_clean(name)] = lines
             self._index_song(
                 name,
                 str(song.get("singers") or ""),
                 str(song.get("uploader") or ""),
-                _as_lines(song.get("lyrics")),
+                lines,
             )
             loaded += 1
         return loaded
@@ -567,11 +585,13 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             song = by_name.get(result.song_name)
             if not song:
                 continue
+            lines = _as_lines(song.get("lyrics"))
+            self._lyrics_by_name[_clean(result.song_name)] = lines
             added = self._index_song(
                 result.song_name,
                 str(song.get("singers") or ""),
                 str(song.get("uploader") or ""),
-                _as_lines(song.get("lyrics")),
+                lines,
             )
             self.ctx.logger.info(
                 "歌词文件已入库: %s -> 《%s》（新增 %d 句）",
@@ -755,6 +775,74 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             return []
         return [h for h in hits if now - h[0] <= cfg.ttl_seconds]
 
+    # 注入时附加的创作信息：键 -> 显示名。顺序即显示顺序。
+    _BASIC_CREDIT_FIELDS = (("year", "年份"), ("lyricist", "作词"),
+                            ("composer", "作曲"), ("arranger", "编曲"))
+    _STAFF_CREDIT_FIELDS = (("tuner", "调教"), ("mixer", "混音"),
+                            ("pv", "PV"), ("illustrator", "曲绘"))
+    _CONTEXT_JOIN = " ／ "
+
+    def _song_record(self, name: str) -> dict:
+        """取歌曲库里的完整记录（年份/STAFF/歌词）。查不到返回空 dict。"""
+        try:
+            record = self.store.get(name)
+        except Exception:  # noqa: BLE001 - 库不可用时不影响注入已有信息
+            return {}
+        return record or {}
+
+    def _lyrics_of(self, name: str) -> list[str]:
+        """取某首歌的完整歌词行：内存缓存优先，其次查歌曲库。"""
+        cached = self._lyrics_by_name.get(_clean(name))
+        if cached:
+            return cached
+        text = str(self._song_record(name).get("lyrics") or "")
+        if not text.strip():
+            return []
+        lines = text.splitlines()
+        self._lyrics_by_name[_clean(name)] = lines
+        return lines
+
+    def _lyric_window(self, song: str, hit: str, span: int) -> str:
+        """命中行的前后各 span 行，命中行本身用「」标出。找不到返回空。
+
+        命中句是从用户消息里切出来的，和库里的行可能差标点/全角空格，所以先按
+        归一化全等找，找不到再退化成包含匹配。
+        """
+        lines = self._lyrics_of(song)
+        if not lines or span <= 0:
+            return ""
+        target = _clean(hit)
+        if not target:
+            return ""
+        idx = next((i for i, ln in enumerate(lines) if _clean(ln) == target), -1)
+        if idx < 0:
+            idx = next(
+                (i for i, ln in enumerate(lines)
+                 if _clean(ln) and (_clean(ln) in target or target in _clean(ln))),
+                -1,
+            )
+        if idx < 0:
+            return ""
+        parts = []
+        for i in range(max(0, idx - span), min(len(lines), idx + span + 1)):
+            text = lines[i].strip()
+            if not text:
+                continue
+            parts.append(f"「{text}」" if i == idx else text)
+        return self._CONTEXT_JOIN.join(parts)
+
+    @staticmethod
+    def _credit_labels(record: dict, fields: tuple[tuple[str, str], ...]) -> list[str]:
+        """把记录里的创作字段拼成「作词：X」这样的标签，空值跳过。"""
+        labels = []
+        for key, label in fields:
+            value = lyrics_import.flatten_names(str(record.get(key) or "").strip())
+            if key == "year":
+                value = str(record.get("year") or "").strip()
+            if value:
+                labels.append(f"{label}：{value}")
+        return labels
+
     def _build_system_text(self, session_id: str) -> str:
         """把 TTL 内的命中整理成注入给 LLM 的 system 文本，无命中返回空。"""
         cfg = self.config.plugin
@@ -764,22 +852,27 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         # 保留时间顺序，歌名去重
         seen: set[str] = set()
         entries: list[str] = []
+        count = 0
         for _, lyric, song in reversed(fresh):  # 最近的在前
             if song in seen:
                 continue
             seen.add(song)
             singers, uploader = self._meta_by_name.get(song, ("", ""))
             singers, uploader = lyrics_import.flatten_names(singers), lyrics_import.flatten_names(uploader)
-            extra = "，".join(
-                label
-                for label in (
-                    f"演唱：{singers}" if singers else "",
-                    f"P主：{uploader}" if uploader else "",
-                )
-                if label
-            )
-            entries.append(f"- 「{lyric}」 出自《{song}》" + (f"（{extra}）" if extra else ""))
-            if len(entries) >= cfg.max_inject:
+            extra = [f"演唱：{singers}" if singers else "",
+                     f"P主：{uploader}" if uploader else ""]
+            record = self._song_record(song) if (cfg.inject_basic_credits or cfg.inject_full_staff) else {}
+            if cfg.inject_basic_credits:
+                extra += self._credit_labels(record, self._BASIC_CREDIT_FIELDS)
+            if cfg.inject_full_staff:
+                extra += self._credit_labels(record, self._STAFF_CREDIT_FIELDS)
+            labels = "，".join(x for x in extra if x)
+            entries.append(f"- 「{lyric}」 出自《{song}》" + (f"（{labels}）" if labels else ""))
+            window = self._lyric_window(song, lyric, int(cfg.inject_context_lines))
+            if window:
+                entries.append(f"  前后歌词：{window}")
+            count += 1
+            if count >= cfg.max_inject:
                 break
         if not entries:
             return ""
@@ -788,7 +881,8 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             f"{INJECT_MARKER}用户最近在会话中发送了以下歌词原文：\n"
             f"{body}\n"
             "用户可能在引歌词、玩歌词接龙或聊这首歌。请在回复中自然地运用这些歌曲信息"
-            "（歌名/歌手/P主），只在话题相关时提及，不要生硬播报。"
+            "（歌名/歌手/P主/创作信息，以及给出的歌词上下文），"
+            "只在话题相关时提及，不要生硬播报。"
         )
 
     @staticmethod

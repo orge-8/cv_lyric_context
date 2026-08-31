@@ -173,8 +173,16 @@ def _template_tail(tpl: str) -> str:
         # 命名参数跳过，一首歌直接解析为空；反过来要求"='紧跟段首"又会漏掉
         # 键名里带 <br /> 的参数，把 STAFF 表当成歌词。
         head = _TAG_RE.sub("", p.split("\n", 1)[0])
-        if "=" in head and len(head.split("=", 1)[0].strip()) <= 40:
-            return True
+        if "=" in head:
+            key, _, value = head.partition("=")
+            key = key.strip()
+            if key.isdigit():
+                # 位置参数 {{color|1=#4a2206|2=歌词}}：值就是正文，去掉 2= 前缀后
+                # 再走下面的样式判断（1=#4a2206 是色值，照旧跳过）
+                p = value.strip()
+            elif key and len(key) <= 40:
+                return True
+            # elif 键名为空或过长：不是命名参数，继续按正文判断
         # 纯色值/样式/数字（不含中文与非样式符号）
         if re.match(r"^[#\w;:,.()\- ]+$", p) and not re.search(r"[\u4e00-\u9fff]", p) \
                 and len(p) <= 80:
@@ -186,8 +194,10 @@ def _template_tail(tpl: str) -> str:
         start += 1
     if start >= len(parts):
         return ""
+    # 位置参数 {{color|1=#4a2206|2=歌词}}：正文前面带 "2="，去掉编号前缀
+    texts = [re.sub(r"^\s*\d+\s*=", "", p) for p in parts[start:]]
     # 正文可能有多段，段间应为换行而不是字面 '|'
-    return "\n".join(parts[start:]).strip(" \n|")
+    return "\n".join(texts).strip(" \n|")
 
 
 def _expand_inline_templates(text: str) -> str:
@@ -352,11 +362,88 @@ def salvage_colored_lines(tail: str) -> str:
     return "\n".join(ln for i, ln in enumerate(lines) if i == 0 or ln != lines[i - 1])
 
 
+def _lyricskai_param(body: str, key: str) -> str:
+    """取 LyricsKai 某个命名参数（如 original / translated）的正文。
+
+    写法很不一致：`|original=`、`|original = `、`|original =` 都有，所以键名两侧
+    都允许空白。行里的 `#NoHover` 是 LyricsKai/hover 的分段标记，不是歌词。
+    """
+    m = re.search(rf"\|\s*{key}\s*=", body)
+    if not m:
+        return ""
+    out: List[str] = []
+    started = False
+    for raw in m.string[m.end():].split("\n"):
+        # 另起一个命名参数（如 |translated= 独占一行）：到此为止
+        if re.match(r"^\s*\|[a-zA-Z]+\s*=", raw):
+            break
+        ln = raw
+        # 与歌词最后一行同行的参数（如 歌词|translated=），行内截断更稳
+        cut = re.search(r"\|[a-zA-Z]+\s*=", ln)
+        if cut:
+            ln = ln[:cut.start()]
+        ln = ln.strip()
+        if ln.startswith("#"):  # LyricsKai/hover 的分段标记
+            continue
+        if not ln:
+            # 参数值开头的空行跳过；段落之间的空行保留（分段用）
+            if started:
+                out.append("")
+            continue
+        out.append(ln)
+        started = True
+    text = _expand_inline_templates("\n".join(out).strip())
+    return text.replace("-{", "").replace("}-", "")
+
+
+def strip_templates(text: str) -> str:
+    """去掉所有 {{...}} 模板（含嵌套），只留模板外的正文。"""
+    out: List[str] = []
+    depth = 0
+    i = 0
+    while i < len(text):
+        if text.startswith("{{", i):
+            depth += 1
+            i += 2
+            continue
+        if text.startswith("}}", i):
+            depth = max(0, depth - 1)
+            i += 2
+            continue
+        if depth == 0:
+            out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def salvage_plain_text(tail: str) -> str:
+    """第二档兜底：歌词直接写在 <div>/<span> 里，一个颜色模板都没有。
+
+    《那个夏天》这类页面整段用 <div style="..."> + <br /> 分行、个别字用 <span>
+    调字号，既没有 <poem> 也没有颜色模板。先去掉模板（STAFF 表随之消失），再把
+    <br> 换换行、去标签，剩下的就是歌词。同样要求 ≥3 行「≥4 汉字」才认——只有
+    STAFF 模板的页面（如《寄生虫》）去完模板什么都不剩。
+    """
+    text = strip_templates(tail)
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</?(?:div|p|span|font|b|i|u|small|big)[^>]*>", "", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("'''", "").replace("''", "")
+    text = re.sub(r"^\s*[*#:;].*$", "", text, flags=re.M)
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if len(re.findall(r"[\u4e00-\u9fff]", ln)) >= 4]
+    if len(lines) < 3:
+        return ""
+    return "\n".join(ln for i, ln in enumerate(lines) if i == 0 or ln != lines[i - 1])
+
+
 def extract_lyricskai(tail: str) -> str:
     """从 {{LyricsKai|...|original=...}} 模板提取歌词。
 
     部分页面（如 九九八十一(乐正绫)）的歌词在 LyricsKai 的 original= 参数里，
-    行内是 {{color|black|-{歌词}-}} 形式。
+    行内是 {{color|black|-{歌词}-}} 形式；初音未来等日文歌还带 |translated= 中文
+    译文，一并收录——用户可能引用原文也可能引用译文。
     """
     m = re.search(r"\{\{LyricsKai\b", tail)
     if not m:
@@ -380,22 +467,13 @@ def extract_lyricskai(tail: str) -> str:
     if depth != 0:
         return ""
     body = tail[m.start() + 2:end]
-    oi = body.find("|original=")
-    if oi < 0:
+    text = _lyricskai_param(body, "original")
+    if not text.strip():
         return ""
-    lines = body[oi + len("|original="):].split("\n")
-    out: List[str] = []
-    for ln in lines:
-        # 后续命名参数（如 |translated=）可能与歌词最后一行同行，行内截断更稳
-        cut = re.search(r"\|[a-zA-Z]+\s*=", ln)
-        if cut:
-            ln = ln[:cut.start()]
-        if out and not ln.strip():
-            break
-        out.append(ln)
-    text = "\n".join(out)
-    text = _expand_inline_templates(text)
-    return text.replace("-{", "").replace("}-", "")
+    translated = _lyricskai_param(body, "translated")
+    if translated.strip():
+        text = f"{text}\n{translated}"
+    return text
 
 
 def parse_lyrics(source: str) -> str:
@@ -428,6 +506,9 @@ def parse_lyrics(source: str) -> str:
         if not text.strip():
             # LyricsKai 也没有：<div>/<br> + 颜色模板 的排版
             text = salvage_colored_lines(tail)
+        if not text.strip():
+            # 连颜色模板都没有：歌词直接写在 <div>/<span> 里
+            text = salvage_plain_text(tail)
     text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
     text = re.sub(r"<ref[^>]*>.*?</ref>", "", text, flags=re.S)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
