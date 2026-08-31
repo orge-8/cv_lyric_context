@@ -63,6 +63,12 @@ INJECT_MARKER = "【歌词识别】"
 # 同一会话内相同文本在这么短的时间内重复到达视为同一次消息（两套监听的重复触发）
 DEDUP_SECONDS = 10
 
+# 一条消息按空白（含全角空格、换行）切段，段与整条消息都作为候选参与匹配。
+# 场景：用户把两行歌词合成一条消息发（"我借你梦想的时间　让你走得足够遥远"），
+# 或歌词句前后带了别的话（"这句好喜欢：xxx"）。整条优先，避免内部带空格的
+# 单句歌词（如中英混排）被切段后反而匹配不上。
+_SEGMENT_SPLIT = re.compile(r"\s+")
+
 # Context Item 快照结构版本，取自 MaiBot 的 CONTEXT_ITEM_SCHEMA_VERSION
 CONTEXT_ITEM_SCHEMA_VERSION = 1
 
@@ -144,6 +150,13 @@ class CrawlerSection(PluginConfigBase):
     allow_sync_command: bool = Field(
         default=True, description="是否允许通过「/歌词 同步」命令触发同步"
     )
+    refill_cooldown_days: float = Field(
+        default=7.0, ge=0.0, le=365.0,
+        description=(
+            "「/歌词 补歌词」跳过多少天内已确认无歌词的条目，"
+            "避免它们堵在队首被反复重抓（0 表示每次都重抓）"
+        ),
+    )
     verify_ssl: bool = Field(
         default=True,
         description="是否校验 SSL 证书。网络出口有中间人代理导致报证书错误时可临时关闭（不安全）",
@@ -179,6 +192,7 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         self._sync_task = None
         self._sync_stats = None
         self._sync_stream = ""
+        self._refetch_stop = False
         # 清洗后的歌词句 -> [歌名, ...]（个别句子属于多首歌）
         self._songs_by_line: dict[str, list[str]] = {}
         # 歌名 -> (歌手, P主)
@@ -191,7 +205,7 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         # 会话 -> 最近命中 [(timestamp, 歌词原文, 歌名), ...]
         self._hits: dict[str, deque[tuple[float, str, str]]] = {}
         # 会话 -> (时间戳, 最近一次登记的文本)，用于两套监听的去重
-        self._last_recorded: dict[str, tuple[float, str]] = {}
+        self._last_recorded: dict[str, tuple[float, frozenset[str]]] = {}
         # 诊断: hook/事件/命令的实际字段名只打一次，避免刷屏
         self._probed_incoming = False
         self._probed_request = False
@@ -416,9 +430,12 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             if name in self._indexed_names:
                 self._db_meta.setdefault(_clean(name), meta)
                 continue
-            self._index_song(name, meta[0], meta[1], str(lyrics or "").splitlines())
+            # 只统计真正贡献了歌词句的歌。_index_song 对「歌词为空」或
+            # 「句太短/无汉字」的歌返回 0 且不标记已索引（留着等重抓补歌词），
+            # 无条件 +1 会让这批歌每次重建都被当成「新增」，数字稳定复现却毫无意义。
+            if self._index_song(name, meta[0], meta[1], str(lyrics or "").splitlines()):
+                added += 1
             self._db_meta.setdefault(_clean(name), meta)
-            added += 1
 
         if added:
             self.ctx.logger.info("外部歌曲库 %s: 新增 %d 首歌", db_path.name, added)
@@ -431,8 +448,10 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
     async def _vcpedia_after_sync(self, stats: SyncStats) -> str:
         """爬完新歌后重建内存歌词索引，否则要重启 MaiBot 才能识别。
 
-        重跑 _load_extra_dbs 是幂等的：已有的歌靠 _meta_by_name 判断会跳过，
-        只有新爬到的会进索引。已有歌词的更新不会重索引（属可接受取舍）。
+        重跑 _load_extra_dbs 是幂等的：已索引过的歌靠 _indexed_names 跳过。
+        之前歌词为空的歌（解析失败的历史数据）不在 _indexed_names 里，
+        重抓补上歌词后这里会自动捞进索引；已有歌词的歌更新歌词不重索引
+        （属可接受取舍）。
         """
         if not (stats.added or stats.updated):
             return ""
@@ -499,8 +518,6 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         """
         old_singers, old_uploader = self._meta_by_name.get(name, ("", ""))
         self._meta_by_name[name] = (singers or old_singers, uploader or old_uploader)
-        # 歌名一旦进过索引就记下来，后续来源（外部库/补漏）不必再处理
-        self._indexed_names.add(name)
         added = 0
         for line in lines:
             key = _clean(line)
@@ -509,6 +526,10 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
                 if name not in bucket:
                     bucket.insert(0, name)
                     added += 1
+        # 只有真正贡献过歌词句才标记"已索引"。歌词为空的歌（如历史上解析
+        # 失败的词条）保持未标记，这样重抓补上歌词后重建索引能把它捞进来。
+        if added:
+            self._indexed_names.add(name)
         return added
 
     # ---------- 歌词文件收件箱 ----------
@@ -651,27 +672,43 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         return str(session_id or ""), str(text or "").strip()
 
     def record_hit(self, session_id: str, text: str) -> list[str]:
-        """清洗文本后查关键词表，命中则登记并返回歌名列表。"""
+        """清洗文本后查关键词表，命中则登记并返回歌名列表。
+
+        候选 = 整条消息 + 按空白切出的各段。任一候选命中即登记，
+        同一条消息里命中多句歌词会全部登记。
+        """
         cfg = self.config.plugin
-        key = _clean(text)
-        if len(key) < cfg.min_line_len:
-            return []
-        songs = self._songs_by_line.get(key)
-        if not songs:
+        hits: list[tuple[str, str, list[str]]] = []  # (原句, 清洗键, 歌名列表)
+        seen_keys: set[str] = set()
+        for candidate in [text, *_SEGMENT_SPLIT.split(text)]:
+            key = _clean(candidate)
+            if len(key) < cfg.min_line_len or key in seen_keys:
+                continue
+            songs = self._songs_by_line.get(key)
+            if songs:
+                seen_keys.add(key)
+                hits.append((candidate, key, songs))
+        if not hits:
             return []
 
-        # 去重: 同一会话内短时间内收到的相同文本只登记一次
+        # 去重: 同一会话内短时间内收到的相同一组句子只登记一次
         now = time.time()
+        keys = frozenset(key for _, key, _ in hits)
         last = self._last_recorded.get(session_id)
-        if last and now - last[0] <= DEDUP_SECONDS and last[1] == key:
-            return songs
-        self._last_recorded[session_id] = (now, key)
+        if not (last and now - last[0] <= DEDUP_SECONDS and last[1] == keys):
+            self._last_recorded[session_id] = (now, keys)
+            for seg, _, songs in hits:
+                self._hits.setdefault(session_id, deque(maxlen=20)).append((now, seg, songs[0]))
+                self.ctx.logger.info(
+                    "歌词命中: 「%s」-> 《%s》 (会话=%s)", seg[:30], songs[0], session_id
+                )
 
-        self._hits.setdefault(session_id, deque(maxlen=20)).append((now, text, songs[0]))
-        self.ctx.logger.info(
-            "歌词命中: 「%s」-> 《%s》 (会话=%s)", text[:30], songs[0], session_id
-        )
-        return songs
+        matched: list[str] = []
+        for _, _, songs in hits:
+            for song in songs:
+                if song not in matched:
+                    matched.append(song)
+        return matched
 
     @HookHandler(
         "chat.receive.after_process",

@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS songs (
     introduction TEXT NOT NULL DEFAULT '',
     lyrics       TEXT NOT NULL DEFAULT '',
     categories   TEXT NOT NULL DEFAULT '',
-    fetched_at   REAL NOT NULL DEFAULT 0
+    fetched_at   REAL NOT NULL DEFAULT 0,
+    lyrics_checked_at REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_songs_name ON songs(name);
 CREATE TABLE IF NOT EXISTS sync_meta (
@@ -60,6 +61,17 @@ class SongStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """给老库补列。
+
+        CREATE TABLE IF NOT EXISTS 对已存在的表不做任何事，老库（v2.3.4 之前
+        建的）没有 lyrics_checked_at，靠这里 ALTER 补上。
+        """
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(songs)")}
+        if "lyrics_checked_at" not in columns:
+            conn.execute("ALTER TABLE songs ADD COLUMN lyrics_checked_at REAL NOT NULL DEFAULT 0")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30)
@@ -103,7 +115,7 @@ class SongStore:
                 "UPDATE songs SET name = ?, " + ", ".join(f"{f} = ?" for f in _CREDIT_FIELDS)
                 + ", year = ?, introduction = ?, lyrics = ?, categories = ?, fetched_at = ? "
                 "WHERE safe_name = ?",
-                [*values[2:], safe],
+                [name, *values[2:], safe],
             )
             return False
 
@@ -128,6 +140,55 @@ class SongStore:
     def count(self) -> int:
         with self._connect() as conn:
             return int(conn.execute("SELECT COUNT(*) FROM songs").fetchone()[0])
+
+    def count_empty_lyrics(self, skip_checked_within: float = 0) -> int:
+        """歌词为空的条目数（解析失败，或词条本来就没有歌词章节）。
+
+        解析器修好后，用它可以估出「历史解析失败」的存量有多少。
+        传 skip_checked_within 则只数「近期还没确认过」的待补条目。
+        """
+        sql, params = self._empty_lyrics_clause(skip_checked_within)
+        with self._connect() as conn:
+            return int(conn.execute(f"SELECT COUNT(*) FROM songs WHERE {sql}", params).fetchone()[0])
+
+    def empty_lyric_names(self, limit: int = 50, skip_checked_within: float = 0) -> List[str]:
+        """取出待补的歌词为空条目名（按 id 升序），供批量重抓回填。
+
+        limit<=0 视为不限制（慎用，可能上千首）。
+        skip_checked_within>0 时跳过「多少秒内已确认无歌词」的条目：批量补歌词
+        会给它们打上 lyrics_checked_at，否则它们永远排在队首、每批都被重抓。
+        """
+        where, params = self._empty_lyrics_clause(skip_checked_within)
+        sql = f"SELECT name FROM songs WHERE {where} ORDER BY id"
+        if limit and limit > 0:
+            sql += " LIMIT ?"
+            params = [*params, limit]
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [str(r["name"]) for r in rows]
+
+    @staticmethod
+    def _empty_lyrics_clause(skip_checked_within: float) -> tuple[str, list]:
+        sql = "lyrics IS NULL OR TRIM(lyrics) = ''"
+        if skip_checked_within > 0:
+            return f"({sql}) AND lyrics_checked_at < ?", [time.time() - skip_checked_within]
+        return f"({sql})", []
+
+    def mark_lyrics_checked(self, names: Iterable[str], checked_at: Optional[float] = None) -> int:
+        """给「已确认无歌词」的条目打时间戳，返回更新行数。
+
+        只用于抓取成功、但确认没有歌词的情况；网络失败的不打，下次仍会重试。
+        """
+        stamp = time.time() if checked_at is None else checked_at
+        keys = [(stamp, safe_song_name(str(n))) for n in names if str(n or "").strip()]
+        keys = [(stamp, safe) for stamp, safe in keys if safe]
+        if not keys:
+            return 0
+        with self._connect() as conn:
+            cur = conn.executemany(
+                "UPDATE songs SET lyrics_checked_at = ? WHERE safe_name = ?", keys
+            )
+            return int(cur.rowcount)
 
     def get(self, name: str) -> Optional[Dict[str, Any]]:
         """按歌名精确查（先精确匹配，再归一化匹配）。"""
