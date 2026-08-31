@@ -5,9 +5,11 @@
 
 VCPedia 词条形态要点：
 - 创作人员写在 {{信息|演唱=...}} 或 |作词=... 表格行里，键名常带 <br/> 复合；
-- 歌词章节标题不统一（== 歌词 == / == 普通的歌词 ==），正文多用 <poem> 包裹，
-  行内嵌 {{color|样式|歌词}} / {{交叉颜色|c1=|c2=|歌词}} 等模板；
+- 歌词章节标题不统一（== 歌词 == / == 普通的歌词 ==，还有用繁体「歌詞」的），
+  正文多用 <poem> 包裹，行内嵌 {{color|样式|歌词}} / {{交叉颜色|c1=|c2=|歌词}} 等模板；
 - 少数页面用 {{LyricsKai|...|original=歌词}} 模板；
+- 还有不用 <poem> 的排版：整段 <div> + <br> 分行、每行一个 {{color|...}}，
+  或把歌词塞在 {{Lyrics}} 的 lb-textN 参数里（见 salvage_colored_lines）；
 - 歌词章节必须截到下一个同级标题为止——「二次创作」章节会收录几十首翻唱词。
 """
 
@@ -15,6 +17,13 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List
+
+_TAG_RE = re.compile(r"<[^>]*>")  # 判断命名参数前先抹掉标签（如 <ref name="一">）
+
+# 兜底排版里承载歌词的行内颜色模板（见 salvage_colored_lines）
+_COLOR_TPL_RE = re.compile(
+    r"\{\{\s*(?:color|coloredlink|crosscolor|交叉颜色|shadowcolor|lj)\s*\|", re.I
+)
 
 # STAFF 表 / 信息行常见的键别名（按顺序匹配）
 CREDIT_ALIASES: Dict[str, List[str]] = {
@@ -117,6 +126,12 @@ def _template_tail(tpl: str) -> str:
     只把**模板外层**的 '|' 当参数/正文分段，正文内部嵌套模板的 '|' 保持原样，
     由 _expand_inline_templates 递归展开。
     """
+    # 调用方可能把模板前的换行/空白一起带进来（如 <poem> 后紧跟空行再起模板），
+    # 不 strip 的话 tpl[2:-2] 切掉的是空白而不是 '{{'，body 里会残留 '{{'，
+    # 后续深度扫描从 1 起再也回不到 0，整个模板被当成单个参数跳过 -> 解析为空。
+    tpl = tpl.strip()
+    if len(tpl) < 4:
+        return ""
     body = tpl[2:-2]  # 去掉 {{ }}
     if body.lstrip().startswith("LyricsKai"):
         return extract_lyricskai(tpl)
@@ -152,7 +167,13 @@ def _template_tail(tpl: str) -> str:
         # 含嵌套模板的段是正文容器，即使其中含 c1=/c2= 也不能按命名参数跳过
         if "{{" in p:
             return False
-        if "=" in p:
+        # 命名参数（ltcolor = #fff / 段落=1 / 策划<br />作词 = [[xxx]]）：
+        # '=' 出现在第一个换行之前、且去掉标签后的键名不长。
+        # 只判断"含 =" 会误伤正文里内嵌的 <ref name="一">——整段歌词会被当成
+        # 命名参数跳过，一首歌直接解析为空；反过来要求"='紧跟段首"又会漏掉
+        # 键名里带 <br /> 的参数，把 STAFF 表当成歌词。
+        head = _TAG_RE.sub("", p.split("\n", 1)[0])
+        if "=" in head and len(head.split("=", 1)[0].strip()) <= 40:
             return True
         # 纯色值/样式/数字（不含中文与非样式符号）
         if re.match(r"^[#\w;:,.()\- ]+$", p) and not re.search(r"[\u4e00-\u9fff]", p) \
@@ -190,6 +211,9 @@ def _expand_inline_templates(text: str) -> str:
                 else:
                     j += 1
             if depth != 0:
+                # 模板没闭合（如章节截断把收尾的 }} 切掉）：视为在文本末尾闭合，
+                # 取出正文，而不是整行丢弃（丢弃会吞掉歌词的第一句）。
+                out.append(_template_tail(text[i:] + "}}"))
                 break
             out.append(_template_tail(text[i:j]))
             i = j
@@ -239,9 +263,11 @@ def _unwrap_poem(inner: str) -> str:
     while i < len(inner):
         if inner.startswith("{{", i):
             # 模板开始：先把模板前已累积的正文独立成段，避免块级模板
-            # （如 {{LyricsKai...}}）与前面的歌词混在同一 buf
-            if depth == 0 and buf.strip():
-                out.append(buf)
+            # （如 {{LyricsKai...}}）与前面的歌词混在同一 buf。
+            # 模板前的空白一律丢弃——留着会让 _template_tail 的切片下标错位。
+            if depth == 0:
+                if buf.strip():
+                    out.append(buf)
                 buf = ""
             depth += 1
             buf += "{{"
@@ -281,6 +307,49 @@ def _unwrap_poem(inner: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
+
+
+def salvage_colored_lines(tail: str) -> str:
+    """兜底排版：既没有 <poem> 也不用 LyricsKai 的页面。
+
+    《八重回归》《传说史册》《Atlantis》《九生相》这类页面不用 <poem>：歌词直接
+    放在 {{color|样式|歌词}}（或 crosscolor / 交叉颜色 / shadowcolor / lj）里，
+    用 <br> 或模板边界分行，外层是 <div> 或 {{Lyrics}} 容器。
+
+    这里**只取颜色类模板的正文**，不整段展开——整段展开会把 STAFF 模板的参数
+    （ltcolor = #fff、group1 = 策划）也一起当成歌词。正文里 <br> 换换行、去标签
+    与 wiki 标记，且每行至少 4 个汉字才算歌词（挡掉颜色图例里的「紫色字」之类）。
+
+    最后要求至少 3 行合格，否则返回空：只有 STAFF 模板的页面（如《寄生虫》的
+    歌词章节其实没有词）不该被塞进一堆模板残渣。
+    """
+    lines: List[str] = []
+    for m in _COLOR_TPL_RE.finditer(tail):
+        start = m.start()
+        depth, j = 0, start
+        while j < len(tail):
+            if tail.startswith("{{", j):
+                depth += 1
+                j += 2
+            elif tail.startswith("}}", j):
+                depth -= 1
+                j += 2
+                if depth == 0:
+                    break
+            else:
+                j += 1
+        chunk = _fully_expand_templates(tail[start:j])
+        chunk = re.sub(r"<br\s*/?>", "\n", chunk, flags=re.I)
+        chunk = re.sub(r"<[^>]+>", "", chunk)
+        chunk = chunk.replace("'''", "").replace("''", "")
+        for ln in chunk.splitlines():
+            ln = ln.strip()
+            if ln and len(re.findall(r"[\u4e00-\u9fff]", ln)) >= 4:
+                lines.append(ln)
+    if len(lines) < 3:
+        return ""
+    # 嵌套模板会让同一句被展开两次（如 shadowcolor>textHover>color）
+    return "\n".join(ln for i, ln in enumerate(lines) if i == 0 or ln != lines[i - 1])
 
 
 def extract_lyricskai(tail: str) -> str:
@@ -335,7 +404,8 @@ def parse_lyrics(source: str) -> str:
     只截取到下一个同级标题为止——「二次创作」章节收录了所有衍生作品歌词，
     若一并抓取会把几十首翻唱词灌进原曲。
     """
-    m = re.search(r"^={2,4}\s*[^=\n]*歌词[^=\n]*\s*={2,4}\s*$", source, re.M)
+    # 歌詞/歌词 两种写法都有页面在用（如 If You Want Me 用的是「歌詞」）
+    m = re.search(r"^={2,4}\s*[^=\n]*歌[词詞][^=\n]*\s*={2,4}\s*$", source, re.M)
     if not m:
         return ""
     level = len(m.group(0)) - len(m.group(0).lstrip("="))
@@ -348,8 +418,16 @@ def parse_lyrics(source: str) -> str:
     if poems:
         texts = [_unwrap_poem(pm.group(1)) for pm in poems]
         text = "\n\n".join(t for t in texts if t.strip())
+    elif re.search(r"<poem\b", tail):
+        # <poem> 没闭合（如《山遥路远》）。MediaWiki 渲染时会自动闭合到页面/章节末尾，
+        # 但正则要求成对的 </poem>，匹配不到就整个落空。取 <poem> 之后到章节末尾。
+        m_open = re.search(r"<poem[^>]*>(.*)$", tail, re.S)
+        text = _unwrap_poem(m_open.group(1)) if m_open else ""
     else:
         text = extract_lyricskai(tail)
+        if not text.strip():
+            # LyricsKai 也没有：<div>/<br> + 颜色模板 的排版
+            text = salvage_colored_lines(tail)
     text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
     text = re.sub(r"<ref[^>]*>.*?</ref>", "", text, flags=re.S)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)

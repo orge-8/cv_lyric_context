@@ -14,17 +14,55 @@
 import asyncio
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from maibot_sdk import Command, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 from vcpedia_client import USER_AGENT, VCPediaClient, VCPediaError
 from vcpedia_store import SongStore
-from vcpedia_sync import SyncStats, VCPediaSyncer
+from vcpedia_sync import SyncStats, VCPediaSyncer, build_record
+from vcpedia_wikitext_parser import parse_wikitext
 
 DB_FILE = "vcpedia_songs.db"
 COOKIE_FILE = "anubis_cookies.txt"
+
+# 解析器自检样例：(wikitext 源码, 解出歌词里必须包含的文本)
+# 1) 《山遥路远》形态：<poem> 未闭合 + 首个 {{color|#色值| 跨行未闭合
+# 2) 常规形态：成对 <poem>，多段歌词
+_PARSER_SELFCHECK_CASES = (
+    (
+        "== 歌词 ==\n<poem>\n{{color|#572f58|我借你梦想的时间　让你走得足够遥远\n"
+        "我让你心中的山川　跋涉去不用归还\n",
+        "我借你梦想的时间",
+    ),
+    (
+        "== 歌词 ==\n<poem>\n{{color|black|第一行歌词内容}}\n{{color|black|第二行歌词内容}}\n</poem>\n",
+        "第一行歌词内容",
+    ),
+)
+
+
+def parser_selfcheck() -> tuple[bool, str]:
+    """用固定样例检测**当前进程内**已加载的解析器能否解出歌词。
+
+    走行为检测而非读源码文本：只有样例真的被解出，才说明进程里装的是新解析器。
+    WebUI 里禁用/启用插件会重执行 plugin.py，但依赖模块（vcpedia_*）可能仍
+    命中 sys.modules 缓存——那时新命令能跑、旧解析器照旧返回空歌词。
+    """
+    from vcpedia_wikitext_parser import parse_lyrics
+
+    for index, (source, expect) in enumerate(_PARSER_SELFCHECK_CASES, start=1):
+        try:
+            text = parse_lyrics(source) or ""
+        except Exception as exc:  # noqa: BLE001 - 自检本身不能把插件拖挂
+            return False, f"自检样例 {index} 抛异常: {exc}"
+        if expect not in text:
+            if index == 1:
+                return False, "旧版：未闭合 <poem> 解不出歌词"
+            return False, f"自检样例 {index} 未解出，解析器异常"
+    # 文案不写版本号：版本号会随迭代漂移，写死反而误导
+    return True, "新版：未闭合 <poem> 可正常解析"
 
 
 class VCPediaMixin:
@@ -37,6 +75,7 @@ class VCPediaMixin:
     _sync_task: Optional[asyncio.Task]
     _sync_stats: Optional[SyncStats]
     _sync_stream: str
+    _refetch_stop: bool
 
     # ---------- 生命周期（由宿主调用） ----------
 
@@ -58,9 +97,19 @@ class VCPediaMixin:
                 "歌词库为空，发送「/歌词 同步 100」开始首次同步"
                 "（全量耗时较长，可先设 crawler.sync_batch_limit 小批量试跑）"
             )
+        ok, note = parser_selfcheck()
+        if ok:
+            self.ctx.logger.info("歌词库: 解析器自检通过（%s）", note)
+        else:
+            self.ctx.logger.warning(
+                "歌词库: 解析器自检失败——%s。磁盘上的文件可能是新的，但进程里"
+                "装的还是旧模块；请完整重启 MaiBot（WebUI 禁用/启用不够）。", note
+            )
+        self._refetch_stop = False
 
     async def _vcpedia_shutdown(self) -> None:
         """停止后台同步并释放资源。宿主的 on_unload 调用。"""
+        self._refetch_stop = True
         if self._syncer:
             self._syncer.stop()
         if self._sync_task and not self._sync_task.done():
@@ -210,9 +259,11 @@ class VCPediaMixin:
             "歌词库用法：\n"
             "/歌词 状态 — 查看本地歌曲数量与同步进度\n"
             "/歌词 同步 [数量] — 从 VCPedia 增量同步（可限定本次抓取数量）\n"
+            "/歌词 重抓 <歌名> — 重新抓取单个词条，刷新歌词/简介\n"
+            "/歌词 补歌词 [数量] — 批量补全空歌词的条目（后台执行）\n"
             "/歌词 搜索 <关键词> — 按歌名/歌手/UP主搜索\n"
             "/歌词 歌曲 <歌名> — 查看歌曲详情与歌词\n"
-            "/歌词 取消 — 中止正在进行的同步\n"
+            "/歌词 取消 — 中止正在进行的同步或补歌词\n"
             "/加歌 — 导入收件箱里的歌词文件\n"
             "也可以在聊天里直接问，我会自动查询歌曲库。"
         )
@@ -255,6 +306,27 @@ class VCPediaMixin:
             lines.append("同步进行中：正在枚举词条…")
         if count == 0:
             lines.append("歌曲库为空，发送「/歌词 同步 100」先小批量试跑。")
+        else:
+            # 解析失败或词条本身没歌词章节的存量。解析器修好后，这个数可以
+            # 直接看出还有多少首值得重抓。
+            empty = self.store.count_empty_lyrics()
+            if empty:
+                cooldown = self._refill_cooldown()
+                pending = self.store.count_empty_lyrics(cooldown) if cooldown > 0 else empty
+                if cooldown > 0 and pending < empty:
+                    lines.append(
+                        f"歌词为空：{empty} 首（待补 {pending}，另 {empty - pending} 首近期已确认无歌词）"
+                    )
+                else:
+                    lines.append(f"歌词为空：{empty} 首（「/歌词 重抓 歌名」单首补，或「/歌词 补歌词 50」批量补）")
+
+        # 解析器自检：WebUI 禁用/启用会重跑 plugin.py，但依赖模块可能仍是
+        # sys.modules 里的旧版。把结果摆在这里，用户一条命令就能判断要不要重启。
+        ok, note = parser_selfcheck()
+        if ok:
+            lines.append(f"解析器自检：通过（{note}）")
+        else:
+            lines.append(f"解析器自检：不通过——{note}。请完整重启 MaiBot。")
 
         text = "\n".join(lines)
         return await self._reply(stream_id, text)
@@ -278,26 +350,203 @@ class VCPediaMixin:
         self._sync_stream = stream_id or ""
         self._sync_stats = SyncStats()
         self._sync_task = asyncio.create_task(self._run_sync(limit))
+        # 回显分类：WebUI 改配置只写文件、不推给插件运行器，改完没重启的话
+        # 同步跑的还是旧分类。把分类说出来，用户当场就能发现没生效。
         reply = (
             f"已开始同步（{'全量' if limit == 0 else f'最多 {limit} 首'}），"
+            f"分类：{'、'.join(self._categories())}。"
             "完成后会回报结果；发送「/歌词 状态」可查看进度。"
         )
         return await self._reply(stream_id, reply)
 
     @Command(
+        "lyrics_refetch",
+        description="重新抓取单个词条并刷新入库（常规同步不更新已入库的歌）",
+        pattern=r"^\s*[/／]\s*歌词\s+(?:重抓|重取|refetch)\s+(?P<name>\S.*?)\s*$",
+    )
+    async def cmd_refetch(
+        self, stream_id: str = "", text: str = "", **kwargs: Any
+    ) -> tuple[bool, str, int]:
+        if not self.config.plugin.enabled:
+            return False, "插件已禁用", 2
+        if not self.config.crawler.allow_sync_command:
+            return False, "同步命令已在配置中关闭", 2
+        if self._sync_task and not self._sync_task.done():
+            return False, "同步进行中，等它跑完再重抓单个词条", 2
+        name = self._matched_text(kwargs, "name", text, 2)
+        if not name:
+            return False, "用法：/歌词 重抓 歌名", 2
+
+        try:
+            result = await asyncio.to_thread(self._refetch_one, name)
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.error("歌词库: 重抓 %s 失败: %s", name, exc, exc_info=True)
+            return await self._reply(stream_id, f"重抓「{name}」失败：{exc}")
+
+        if result is None:
+            return await self._reply(stream_id, f"「{name}」不是歌曲页（无简介也无歌词），未入库")
+        display, lyric_lines = result
+        lines = [f"「{display}」重抓完成，歌词 {lyric_lines} 行"]
+        if lyric_lines:
+            # 重抓可能补上了此前为空的歌词；重建索引让新歌词立刻可被识别
+            stats = SyncStats()
+            stats.updated = 1
+            note = await self._vcpedia_after_sync(stats)
+            if note:
+                lines.append(note)
+            else:
+                lines.append("（若歌词是新补的，已重建识别词库；基础词库已有的不重复索引）")
+        else:
+            ok, note = parser_selfcheck()
+            if ok:
+                lines.append(
+                    "（解析器自检通过，说明这个页面结构特殊，"
+                    "用 check_lyrics_parse.py 抓原始源码排查）"
+                )
+            else:
+                lines.append(
+                    f"（解析器自检不通过：{note}。磁盘文件可能已更新，但进程里还是旧模块，"
+                    "请完整重启 MaiBot 再重抓一次）"
+                )
+        return await self._reply(stream_id, "\n".join(lines))
+
+    def _refetch_one(self, name: str) -> Optional[tuple[str, int]]:
+        """抓取单个词条并入库（在线程里跑）。返回 (歌名, 歌词行数)；非歌曲页返回 None。"""
+        source = self._get_client().fetch_wikitext(name)
+        if not source:
+            raise VCPediaError(f"拉取词条「{name}」失败")
+        parsed = parse_wikitext(name, source)
+        if not (parsed.get("introduction") or parsed.get("lyrics")):
+            return None
+        old = self.store.get(name) or {}
+        record = build_record(name, parsed, str(old.get("categories") or ""))
+        self.store.upsert(record)
+        lyric_lines = len(str(record.get("lyrics") or "").splitlines())
+        return str(record.get("name") or name), lyric_lines
+
+    @Command(
+        "lyrics_refetch_batch",
+        description="批量重抓歌词为空的词条，回填历史解析失败项（非歌曲页自动跳过）",
+        pattern=r"^\s*[/／]\s*歌词\s+(?:补歌词|补歌|refetch_batch)(?:\s+(?P<limit>\d+))?\s*$",
+    )
+    async def cmd_refetch_batch(
+        self, stream_id: str = "", text: str = "", **kwargs: Any
+    ) -> tuple[bool, str, int]:
+        if not self.config.plugin.enabled:
+            return False, "插件已禁用", 2
+        if not self.config.crawler.allow_sync_command:
+            return False, "同步命令已在配置中关闭", 2
+        if self._sync_task and not self._sync_task.done():
+            return False, "已有同步/补歌词任务在跑，发送「/歌词 取消」可中止", 2
+        limit = self._matched_int(kwargs, "limit", text, 2)
+        limit = limit or int(self.config.crawler.sync_batch_limit)
+        self._refetch_stop = False
+        self._sync_stream = stream_id or ""
+        self._sync_stats = SyncStats()
+        self._sync_task = asyncio.create_task(self._run_refetch_batch(limit))
+        return await self._reply(
+            stream_id,
+            f"已开始批量补歌词（最多 {limit} 首空歌词条目）… 完成后回报结果；"
+            "发送「/歌词 取消」可中止。",
+        )
+
+    def _refill_cooldown(self) -> float:
+        """补歌词的跳过窗口（秒）。配置单位是天，这里换算并做类型兜底。"""
+        try:
+            days = float(self.config.crawler.refill_cooldown_days)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, days) * 86400.0
+
+    async def _run_refetch_batch(self, limit: int) -> None:
+        """后台批量重抓空歌词条目。结果通过 _sync_stream 回报。"""
+        cooldown = self._refill_cooldown()
+        try:
+            names = self.store.empty_lyric_names(limit, cooldown)
+        except RuntimeError as exc:
+            if self._sync_stream:
+                await self.ctx.send.text(f"歌曲库不可用：{exc}", self._sync_stream)
+            self._sync_stream = ""
+            return
+        if not names:
+            if self._sync_stream:
+                total = self.store.count_empty_lyrics()
+                if cooldown > 0 and total:
+                    await self.ctx.send.text(
+                        f"空歌词条目共 {total} 首，但近期都已确认无歌词"
+                        f"（{self.config.crawler.refill_cooldown_days:g} 天内跳过），暂无需重抓。"
+                        "把 crawler.refill_cooldown_days 调小或设为 0 可强制重抓。",
+                        self._sync_stream,
+                    )
+                else:
+                    await self.ctx.send.text("没有需要补的空歌词条目。", self._sync_stream)
+            self._sync_stream = ""
+            return
+        # 网络抓取整体丢到线程，避免阻塞事件循环；索引重建仍在事件循环线程做。
+        result = await asyncio.to_thread(self._refetch_batch_worker, names)
+        self._refetch_stop = False
+        stats = SyncStats()
+        stats.updated = result["refilled"]
+        note = await self._vcpedia_after_sync(stats)
+        parts = [
+            f"批量补歌词完成：检查 {result['tried']} 首，补回歌词 {result['refilled']} 首，"
+            f"确无歌词（非歌曲页/无歌词章节）{result['no_lyrics']} 首",
+        ]
+        if result["errors"]:
+            parts[0] += f"，失败 {result['errors']} 首"
+        if result["stopped"]:
+            parts[0] += "（已手动中止，未处理完的条目下次仍可重抓）"
+        if note:
+            parts.append(note)
+        if self._sync_stream:
+            await self.ctx.send.text("\n".join(parts), self._sync_stream)
+        self._sync_stream = ""
+
+    def _refetch_batch_worker(self, names: List[str]) -> dict:
+        """线程内逐个重抓（与单首 _refetch_one 同一套逻辑）。返回统计。"""
+        tried = refilled = no_lyrics = errors = 0
+        for name in names:
+            if self._refetch_stop:
+                break
+            tried += 1
+            if tried % 10 == 0:
+                self.ctx.logger.info("补歌词进度: %d/%d", tried, len(names))
+            try:
+                res = self._refetch_one(name)
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.warning("补歌词 %s 失败: %s", name, exc)
+                errors += 1
+                continue
+            if res is None or res[1] == 0:
+                # 非歌曲页，或重抓回来仍无歌词（结构特殊/本来就没歌词）。
+                # 打上检查时间戳，否则它永远排在队首、每批都被重抓一遍。
+                no_lyrics += 1
+                self.store.mark_lyrics_checked([name])
+            else:
+                refilled += 1
+        return {
+            "tried": tried,
+            "refilled": refilled,
+            "no_lyrics": no_lyrics,
+            "errors": errors,
+            "stopped": self._refetch_stop,
+        }
+
+    @Command(
         "lyrics_cancel",
-        description="中止正在进行的歌词库同步",
+        description="中止正在进行的歌词库同步或批量补歌词",
         pattern=r"^\s*[/／]\s*歌词\s+(?:取消|cancel)\s*$",
     )
     async def cmd_cancel(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
         del kwargs
         if not self._sync_task or self._sync_task.done():
-            reply = "当前没有正在进行的同步"
+            reply = "当前没有正在进行的同步/补歌词"
         else:
             if self._syncer:
                 self._syncer.stop()
+            self._refetch_stop = True
             self._sync_task.cancel()
-            reply = "已请求中止同步"
+            reply = "已请求中止同步/补歌词"
         return await self._reply(stream_id, reply)
 
     @Command(
