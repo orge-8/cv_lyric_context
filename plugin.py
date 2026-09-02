@@ -63,6 +63,13 @@ INJECT_MARKER = "【歌词识别】"
 # 同一会话内相同文本在这么短的时间内重复到达视为同一次消息（两套监听的重复触发）
 DEDUP_SECONDS = 10
 
+# 会话状态清理参数：TTL 只在读取时过滤，_hits / _last_recorded 的键不会自己
+# 消失，多群长驻下每个说过歌词的会话都会留一条记录，需要主动清扫。
+_SESSION_SWEEP_SECONDS = 300  # 清扫限频：最快每 5 分钟扫一次
+# 按需从歌曲库补查歌词的缓存上限（首/尾淘汰）。启动时预载的基础词库不走这条
+# 路径、不受影响；只有库里查到才进这个缓存，防长驻下无上限增长。
+_MAX_LYRICS_LRU = 200
+
 # 一条消息按空白（含全角空格、换行）切段，段与整条消息都作为候选参与匹配。
 # 场景：用户把两行歌词合成一条消息发（"我借你梦想的时间　让你走得足够遥远"），
 # 或歌词句前后带了别的话（"这句好喜欢：xxx"）。整条优先，避免内部带空格的
@@ -207,6 +214,11 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         self._songs_by_line: dict[str, list[str]] = {}
         # 歌名 -> (歌手, P主)
         self._meta_by_name: dict[str, tuple[str, str]] = {}
+        # 按需从歌曲库补查的歌词缓存（有界，见 _MAX_LYRICS_LRU）。
+        # 启动时已预载进 _lyrics_by_name 的歌不经过这里。
+        self._lyrics_lru: dict[str, list[str]] = {}
+        # 上次会话状态清理的时间戳
+        self._last_sweep = 0.0
         # 归一化歌名 -> (歌手, P主)，只来自 knowledge_db.db，供歌词文件导入时反查
         self._db_meta: dict[str, tuple[str, str]] = {}
         # 归一化歌名 -> 完整歌词行。注入「命中行的前后歌词」时用；VCPedia 库太大不常驻，
@@ -249,6 +261,7 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         await self._vcpedia_shutdown()
         self._hits.clear()
         self._last_recorded.clear()
+        self._lyrics_lru.clear()
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         if scope == "self":
@@ -691,12 +704,42 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         )
         return str(session_id or ""), str(text or "").strip()
 
+    def _sweep_stale_sessions(self) -> None:
+        """清理过期的会话状态，防止 _hits / _last_recorded 无上限增长。
+
+        判断依据是每个会话**最新一条**记录的时间：整条 deque 都过了 TTL
+        （或超过去重窗口）就整条移除。限频执行，不逐条消息全表扫描。
+        """
+        now = time.time()
+        if now - self._last_sweep < _SESSION_SWEEP_SECONDS:
+            return
+        self._last_sweep = now
+        ttl = self.config.plugin.ttl_seconds
+        dead_hits = [
+            sid for sid, hits in self._hits.items()
+            if not hits or now - hits[-1][0] > ttl
+        ]
+        for sid in dead_hits:
+            del self._hits[sid]
+        dead_dedup = [
+            sid for sid, (ts, _) in self._last_recorded.items()
+            if now - ts > DEDUP_SECONDS
+        ]
+        for sid in dead_dedup:
+            del self._last_recorded[sid]
+        if dead_hits or dead_dedup:
+            self.ctx.logger.info(
+                "歌词状态清理: 移除 %d 个过期会话的命中记录",
+                max(len(dead_hits), len(dead_dedup)),
+            )
+
     def record_hit(self, session_id: str, text: str) -> list[str]:
         """清洗文本后查关键词表，命中则登记并返回歌名列表。
 
         候选 = 整条消息 + 按空白切出的各段。任一候选命中即登记，
         同一条消息里命中多句歌词会全部登记。
         """
+        self._sweep_stale_sessions()
         cfg = self.config.plugin
         hits: list[tuple[str, str, list[str]]] = []  # (原句, 清洗键, 歌名列表)
         seen_keys: set[str] = set()
@@ -791,15 +834,26 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         return record or {}
 
     def _lyrics_of(self, name: str) -> list[str]:
-        """取某首歌的完整歌词行：内存缓存优先，其次查歌曲库。"""
-        cached = self._lyrics_by_name.get(_clean(name))
+        """取某首歌的完整歌词行：内存缓存优先，其次查歌曲库。
+
+        启动时预载进 _lyrics_by_name 的歌直接命中；没预载到的歌查库后进
+        _lyrics_lru（有容量上限，最旧的先出），避免长驻下缓存无限增长。
+        """
+        key = _clean(name)
+        cached = self._lyrics_by_name.get(key)
+        if cached:
+            return cached
+        cached = self._lyrics_lru.get(key)
         if cached:
             return cached
         text = str(self._song_record(name).get("lyrics") or "")
         if not text.strip():
             return []
         lines = text.splitlines()
-        self._lyrics_by_name[_clean(name)] = lines
+        self._lyrics_lru[key] = lines
+        if len(self._lyrics_lru) > _MAX_LYRICS_LRU:
+            # dict 保持插入序，弹出最早进入的一条
+            self._lyrics_lru.pop(next(iter(self._lyrics_lru)))
         return lines
 
     def _lyric_window(self, song: str, hit: str, span: int) -> str:
