@@ -90,7 +90,8 @@ def parse_credits(lines: List[str]) -> Dict[str, str]:
     """从 wikitext 逐行解析创作人员与年份，返回 {标准键: 值}。
 
     兼容两种形态：{{信息|演唱=洛天依|作词=...}} 一行内多次赋值，
-    以及 "|作词=青柠" 这类表格行。每行只取第一个命中键，防止串扰。
+    以及 "|作词=青柠" 这类表格行。同一行内逐 token 取所有命中键
+    （已存在的键不覆盖，防止串扰）。
     """
     credits: Dict[str, str] = {}
     for line in lines:
@@ -110,7 +111,9 @@ def parse_credits(lines: List[str]) -> Dict[str, str]:
                     val = _clean_credit_values(val_raw)
                     if val and len(val) < 200:
                         credits[key] = val
-                        break
+                        # 继续处理同一行内其余 token，避免单行多赋值 infobox
+                        # （{{信息|演唱=…|UP主=…|作词=…}}）只取到第一个字段
+                        continue
         if "year" not in credits:
             m = re.search(r"(20\d{2})\s*年", line)
             if m:
