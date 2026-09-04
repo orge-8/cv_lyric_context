@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS songs (
     introduction TEXT NOT NULL DEFAULT '',
     lyrics       TEXT NOT NULL DEFAULT '',
     categories   TEXT NOT NULL DEFAULT '',
+    emotion      TEXT NOT NULL DEFAULT '',
+    emotion_annotated_at REAL NOT NULL DEFAULT 0,
     fetched_at   REAL NOT NULL DEFAULT 0,
     lyrics_checked_at REAL NOT NULL DEFAULT 0
 );
@@ -44,6 +46,9 @@ _CREDIT_FIELDS = (
     "uploader", "singers", "lyricist", "composer", "arranger",
     "mixer", "tuner", "mastering", "pv", "illustrator",
 )
+
+# 情绪标签白名单（固定 7 个，见 annotate_emotions.py 的标注 prompt）
+EMOTION_TAGS = ("甜美", "温柔", "积极", "帅气", "搞怪", "伤感", "愤怒")
 
 
 def safe_song_name(name: str) -> str:
@@ -68,10 +73,15 @@ class SongStore:
 
         CREATE TABLE IF NOT EXISTS 对已存在的表不做任何事，老库（v2.3.4 之前
         建的）没有 lyrics_checked_at，靠这里 ALTER 补上。
+        v2.5.0 起补 emotion / emotion_annotated_at（情绪标签推荐）。
         """
         columns = {row[1] for row in conn.execute("PRAGMA table_info(songs)")}
         if "lyrics_checked_at" not in columns:
             conn.execute("ALTER TABLE songs ADD COLUMN lyrics_checked_at REAL NOT NULL DEFAULT 0")
+        if "emotion" not in columns:
+            conn.execute("ALTER TABLE songs ADD COLUMN emotion TEXT NOT NULL DEFAULT ''")
+        if "emotion_annotated_at" not in columns:
+            conn.execute("ALTER TABLE songs ADD COLUMN emotion_annotated_at REAL NOT NULL DEFAULT 0")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30)
@@ -224,6 +234,108 @@ class SongStore:
                 (f"%{kw}%", limit),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── 情绪标签（v2.5.0 氛围选歌）──────────────────────────────
+
+    EMOTION_SEPARATOR = "|"
+
+    @staticmethod
+    def parse_emotion(raw: str) -> List[str]:
+        """把 emotion 列的管道分隔字符串拆成标签列表。"""
+        return [t.strip() for t in str(raw or "").split("|") if t.strip()]
+
+    @staticmethod
+    def join_emotion(tags: Iterable[str]) -> str:
+        """把标签列表合并为管道分隔字符串（去重、保序）。"""
+        seen: List[str] = []
+        for t in tags:
+            t = str(t or "").strip()
+            if t and t not in seen:
+                seen.append(t)
+        return SongStore.EMOTION_SEPARATOR.join(seen)
+
+    def search_by_emotion(self, tags: Iterable[str], limit: int = 200) -> List[Dict[str, Any]]:
+        """按情绪标签查歌：任一标签命中即算匹配，命中标签数多者在前。
+
+        limit<=0 视为不限制。
+        """
+        wanted = [t for t in (str(x or "").strip() for x in tags) if t]
+        if not wanted:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM songs WHERE emotion != '' AND lyrics != ''"
+            ).fetchall()
+        tagset = set(wanted)
+        scored: List[tuple[int, Dict[str, Any]]] = []
+        for r in rows:
+            song = dict(r)
+            hit = tagset & set(self.parse_emotion(song.get("emotion")))
+            if hit:
+                scored.append((len(hit), song))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        result = [song for _, song in scored]
+        if limit and int(limit) > 0:
+            result = result[: int(limit)]
+        return result
+
+    def all_annotated_songs(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """已标注歌曲全量（无标签过滤，供无匹配回退时随机选歌）。"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM songs WHERE lyrics != '' ORDER BY id LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_emotion(self, safe_name: str, tags: Iterable[str]) -> bool:
+        """写入一首歌的情绪标签与标注时间戳。tags 为空视为清空（重标）。"""
+        safe = safe_song_name(safe_name)
+        if not safe:
+            return False
+        joined = self.join_emotion(tags)
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE songs SET emotion = ?, emotion_annotated_at = ? WHERE safe_name = ?",
+                (joined, time.time() if joined else 0.0, safe),
+            )
+            return int(cur.rowcount) > 0
+
+    def pending_emotions(
+        self, limit: int = 50, newest_first: bool = False
+    ) -> List[Dict[str, Any]]:
+        """待标注队列：emotion 为空且歌词非空（没歌词没法定整体情绪）。
+
+        失败的歌不写 emotion，下轮仍会进队列，天然断点续跑。
+        newest_first=True 时按 id 倒序（新歌优先）——同步后自动标注用它，
+        保证刚爬到的歌先被标上；离线脚本保持默认的 id 正序，慢慢排空存量。
+        """
+        order = "id DESC" if newest_first else "id ASC"
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT name, safe_name, lyrics, singers FROM songs "
+                "WHERE (emotion IS NULL OR emotion = '') AND TRIM(lyrics) != '' "
+                "ORDER BY " + order + " LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def emotion_stats(self) -> Dict[str, int]:
+        """情绪标签覆盖统计：总数 / 已标注 / 各标签命中数。"""
+        stats = {"total": 0, "annotated": 0}
+        with self._connect() as conn:
+            stats["total"] = int(
+                conn.execute("SELECT COUNT(*) FROM songs").fetchone()[0]
+            )
+            stats["annotated"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM songs WHERE emotion != ''"
+                ).fetchone()[0]
+            )
+            for row in conn.execute("SELECT emotion FROM songs WHERE emotion != ''"):
+                for t in self.parse_emotion(row["emotion"]):
+                    stats[t] = stats.get(t, 0) + 1
+        return stats
 
     # ── 同步元信息 ──────────────────────────────────────────────
 

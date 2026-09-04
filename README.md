@@ -59,12 +59,17 @@
    │                        在 57227 句关键词表中 O(1) 精确匹配
    │                        命中 -> 按会话登记 (时间戳, 歌词, 歌名)
    │
-   └─ HookHandler (maisaka.replyer.before_model_request, BLOCKING)
-                            LLM 请求前，把 TTL 内的命中整理成 system 内容注入：
-                            · 新版运行时传 items  -> 追加 SystemMessageItem 快照
-                              （Context Item schema v1）
-                            · 旧版运行时传 messages -> 追加 {"role": "system"}
-                            两条路径同时给出，运行时只读取自己认识的那个键
+   └─ HookHandler (maisaka.planner.before_request + maisaka.replyer.before_model_request,
+                   均 BLOCKING)
+                            把 TTL 内的命中同时注入到规划器与回复器两条 LLM 链路：
+                            · 规划器: 决定调用哪些工具前先看到歌词语境
+                              （优先推荐/检索用户正在聊的歌），prompt/messages/
+                              items 三种载荷结构都能追加
+                            · 回复器: LLM 请求前，把命中整理成 system 内容注入
+                              · 新版运行时传 items  -> 追加 SystemMessageItem 快照
+                                （Context Item schema v1）
+                              · 旧版运行时传 messages -> 追加 {"role": "system"}
+                            两条链路各自幂等（含【歌词识别】标记就不重复叠加）
 
 歌词文件 "某歌.txt"  ->  放进 assets/lyrics_inbox/
    │                     （/加歌 命令或插件加载时自动扫描）
@@ -340,6 +345,106 @@ extra_song_dbs = "data/我的歌库.db"
 | `crawler.refill_cooldown_days` | 7 | `/歌词 补歌词` 跳过多少天内已确认无歌词的条目，`0` 表示每次都重抓 |
 | `crawler.verify_ssl` | true | 是否校验 SSL 证书（见下） |
 | `crawler.ca_bundle` | 空 | CA 证书文件路径（PEM），用于有 TLS 中间人的网络 |
+| `recommend.recommend_enabled` | true | 是否启用 `recommend_cv_song` 推荐工具 |
+| `recommend.target_singers` | 洛天依 | 目标歌手白名单（英文逗号分隔），推荐优先返回他们演唱的歌 |
+| `recommend.known_virtual_singers` | 洛天依,言和,… | 已知虚拟歌手名单；候选歌歌手列表里出现「名单中非目标歌手」即被过滤 |
+| `recommend.allow_unknown_singer` | true | 歌手字段为空的歌是否允许推荐（放行但标注「歌手未知」） |
+| `recommend.recommend_count` | 3 | LLM 未指定数量时默认推荐几首 |
+| `recommend.soft_exclude_size` | 10 | 最近推荐软排除窗口，窗口内不重复推荐（0 = 不去重） |
+| `emotion.annotate_on_sync` | true | 同步完成后自动为待标注的歌打情绪标签（新歌优先） |
+| `emotion.annotate_on_sync_limit` | 30 | 每轮同步后最多标注多少首（防打爆 LLM 配额） |
+| `emotion.llm_task` | utils | 标注用的模型任务名/模型标识（utils / planner / replyer / 具体模型名）；留空走默认路由，若未配好会 fallback 向量模型报 400 |
+| `emotion.annotate_timeout_ms` | 20000 | 标注单首歌的 LLM 超时（毫秒） |
+| `emotion.annotate_budget_seconds` | 180 | 每轮标注总时间预算（秒），超时即停下轮继续 |
+
+## 氛围选歌（v2.5.0）
+
+给曲库加了**情绪标签**层后，bot 可以根据聊天氛围主动推歌：
+
+- 标签固定 7 个：**甜美、温柔、积极、帅气、搞怪、伤感、愤怒**（一首歌可多标签）。
+- LLM 对话中判断用户想听歌/氛围合适时，会自己调用 `recommend_cv_song` 工具
+  （传入情绪标签），工具内完成：标签匹配 → 随机抽取 → **最近推荐去重**
+  （默认 10 首窗口内不重复）→ **歌手归属校验**（合唱、含其他虚拟歌手的歌
+  不进推荐池；歌手字段为空的放行但标注「歌手未知」）。
+- 歌词识别注入行为完全不受影响——校验只作用于推荐环节。
+
+### 同步后自动标注（v2.6.0，默认开启）
+
+`/歌词 同步` 的结果消息发出后，插件会**自动**给待标注的歌打情绪标签：
+
+- **新歌优先**：按 id 倒序取队列，刚同步进来的歌先标，标完立刻能被 `recommend_cv_song` 推荐
+- 每轮最多 `emotion.annotate_on_sync_limit`（默认 30）首，总预算 180 秒，超时剩下的下轮继续
+- **任何失败都不影响同步**：单首失败只记 warning；连续 3 次失败熔断本轮，
+  日志会直接给出三选一处置（配 model_config / 改 llm_task / 关开关）
+- 同步回执之外会单独补一条「（顺带完成 N/M 首情绪标注）」
+- 关闭：`emotion.annotate_on_sync = false`，热重载立即生效
+
+**llm_task 怎么填**：默认 `utils`；若真机日志出现
+`plugin.org.mai-mai.cv-lyric-context ... embedding ... 400 Field required: input.contents`，
+说明该任务被路由到了向量模型——三选一：① model_config.toml 给任务
+`plugin.org.mai-mai.cv-lyric-context` 配文本模型（根治）；② `emotion.llm_task` 改
+`planner` / `replyer` 或具体模型名；③ 关掉 `annotate_on_sync`。
+
+**与离线脚本的分工**：同步自动标注走**新歌优先**，负责让新歌即插即用；
+离线脚本 `annotate_emotions.py` 走**从老到新**，负责慢慢排空历史存量（约 4000 首）。
+两条路径写同一张表，互不冲突：标过的自动出队，失败的留在队列里下轮重试。
+
+### 批量标注情绪标签（真机执行，一次性）
+
+标注用独立脚本 `annotate_emotions.py`，**不进 MaiBot 运行时**，key 不落插件配置。
+
+**最省事的方式：双击 `run_annotate.bat`**（不用开 PowerShell、不用敲命令）。
+右键用记事本打开它，改这 4 行一次即可：
+
+```bat
+set "PYTHON=python"                                  :: python 不在 PATH 就填完整路径
+set "API_KEY=PASTE_YOUR_API_KEY_HERE"                :: 你的 key
+set "DB=E:\mai\maibot\data\plugins\org.mai-mai.cv-lyric-context\vcpedia_songs.db"
+set "BASE_URL=https://ark.cn-beijing.volces.com/api/v3"
+set "MODEL=REPLACE_WITH_YOUR_MODEL_ID"               :: 方舟 Model ID
+```
+
+双击运行后先干跑 3 首（不写库），问你是否全量跑，回 `y` 就开始。
+想提速就给 `set "EXTRA=--concurrency 4"`。
+
+**曲库在 MaiBot 分配给插件的持久化目录**（默认 `data/plugins/<plugin_id>/vcpedia_songs.db`，
+相对 MaiBot 根目录），不在插件源码目录的 `data/`——脚本必须用 `--db` 显式指向它
+（或写进 `annotate_config.json` 的 `db` 字段，就不用每次带参数了）：
+
+```powershell
+# 0. 找到真机运行时曲库（PowerShell，MaiBot 根目录下）
+Get-ChildItem E:\mai\maibot\data -Recurse -Filter vcpedia_songs.db |
+  Select-Object FullName, Length
+# 认准大的那个（几 MB 级 = 有歌的；28KB = 空壳）
+
+cd E:\mai\maibot\plugins\cv_lyric_context
+$DB = "E:\mai\maibot\data\plugins\cv_lyric_context\vcpedia_songs.db"  # 按上面结果改
+
+# 1. 配置 key（环境变量）
+$env:MAIBOT_ANNOTATE_API_KEY = "sk-xxx"        # 或 OPENAI_API_KEY
+# 端点/模型默认 OpenAI 官方 + deepseek-chat；自建/中转写 annotate_config.json：
+#   {"base_url": "https://api.xxx.com/v1", "model": "deepseek-chat"}
+# （该文件已 gitignore，不入库）
+
+# 2. 先试 3 首看质量（--dry-run 只打印不写库）
+python annotate_emotions.py --db $DB --limit 3 --dry-run
+
+# 3. 全量跑：约 4000 首（有歌词的），1.5~2 小时
+#    断点续跑：失败/中断的歌不写标签，下轮自动重试；Ctrl+C 随时安全退出
+python annotate_emotions.py --db $DB
+
+# 查看覆盖情况（标签分布统计）
+python -c "import sys; from vcpedia_store import SongStore; print(SongStore(sys.argv[1]).emotion_stats())" $DB
+
+# 某首标得不准？清掉重标：
+#   sqlite3 $DB "UPDATE songs SET emotion='' WHERE name='歌名'"
+```
+
+标注依据是**整首歌的歌词**（超长歌词保留开头/结尾各 1500 字），
+prompt 要求「不要因为单句歌词而改变整体判断」，temperature 0.2。
+
+无歌词的条目不参与标注，也不会被推荐。建议跑标注时停掉 MaiBot，避免 SQLite 写锁偶发冲突
+（就算冲突也不丢数据：失败的歌不写列，重跑自动补）。
 
 ### 公司网络 / 安全软件导致证书错误
 
@@ -422,9 +527,12 @@ verify_ssl = false
 | `收到歌词导入命令: raw=… stream_id=…` | 命令已触发；`stream_id=<空>` 说明取不到会话，回复发不出去 |
 | `歌词导入结果已回复: sent=True/False` | 结果是否发出去；False 时插件会退回让 bot 自己接话 |
 | `命令载荷里没有 stream_id，无法回复结果` | 命令触发了但回不了话，把字段列表反馈给开发者 |
-| `[诊断] before_model_request 字段: [...]` | 注入 hook 的实际字段名 |
-| `已向 LLM 上下文注入歌曲信息（items）` | 注入成功 |
-| `歌词命中但请求载荷中没有 items/messages` | 运行时既不给 items 也不给 messages，把字段名反馈给开发者 |
+| `[诊断] before_model_request 字段: [...]` | 回复器注入 hook 的实际字段名 |
+| `[诊断] planner.before_request 字段: [...]` | 规划器注入 hook 的实际字段名 |
+| `已向 LLM 上下文注入歌曲信息（items）` | 回复器注入成功 |
+| `已向规划器注入歌曲信息（prompt/messages/items）` | 规划器注入成功 |
+| `歌词命中但请求载荷中没有 items/messages` | 回复器侧既无 items 也无 messages，把字段名反馈给开发者 |
+| `歌词命中但 planner 请求载荷中没有 prompt/messages/items` | 规划器侧无可用载荷，把字段名反馈给开发者 |
 | `歌词收件箱导入: 成功 N 个 / 失败 M 个` | 本次加载扫过收件箱的结果 |
 | `歌词文件已入库: xxx.txt -> 《歌名》（新增 N 句）` | 某个歌词文件导入成功 |
 | `歌词收件箱导入失败: …` | 扫描/写盘异常，看完整堆栈 |
@@ -469,7 +577,10 @@ python test_context.py           # 全流程模拟测试（189 项断言）
 | `vcpedia_sync.py` | 同步流程：分类枚举、词条解析、入库、熔断 |
 | `vcpedia_wikitext_parser.py` | wikitext -> 结构化创作信息 |
 | `vcpedia_text_clean.py` | wiki 标记清洗（`{{color}}`、`{{ruby}}`、`<ref>`、`[[链接\|文本]]`） |
-| `vcpedia_store.py` | 歌曲库 SQLite 读写 |
+| `vcpedia_store.py` | 歌曲库 SQLite 读写（含情绪标签列与方法） |
+| `singer_check.py` | 歌手归属校验纯函数（推荐池过滤用，可独立单测） |
+| `emotion_annotate.py` | 情绪标注纯函数件：prompt 构造 + 标签解析（离线脚本与插件内同步标注共用） |
+| `annotate_emotions.py` | 离线批量标注情绪标签脚本（真机跑，`--db` 指向运行时曲库，不走 MaiBot 运行时） |
 | `find_root_ca.py` | 诊断脚本：有 TLS 中间人时，查出该信任哪张根证书（不是插件的一部分，单独跑） |
 
 `VCPediaMixin` 以多继承混入主类（`class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin)`），
@@ -481,6 +592,10 @@ python test_context.py           # 全流程模拟测试（189 项断言）
   `ON_MESSAGE` 事件；若该事件在版本里也未派发，则无法识别入站消息，需要换用对应
   版本的消息 hook（可看日志里打印的字段名确认）。
 - 幂等保护：同一请求中若已注入过（内容含 `【歌词识别】` 标记），重试时不会重复叠加。
+  规划器与回复器两条链路各自独立判重，互不影响。
+- 注入覆盖两条链路：规划器（`maisaka.planner.before_request`，影响工具调用决策）
+  与回复器（`maisaka.replyer.before_model_request`，影响最终回复）。若某条链路
+  没有日志出现，说明该版本 MaiBot 未触发对应 hook 点。
 - 同一会话内相同文本 10 秒内重复到达只登记一次，避免两套监听重复计数。
 - 同步是增量且可中止的：已入库的歌会跳过，`/歌词 取消` 可随时停。
 

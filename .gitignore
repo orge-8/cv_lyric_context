@@ -2,5 +2,6 @@ __pycache__/
 *.pyc
 data/
 /config.toml
+/annotate_config.json
 assets/lyrics_inbox/
 assets/user_songs.json
