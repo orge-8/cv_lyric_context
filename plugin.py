@@ -184,11 +184,79 @@ class CrawlerSection(PluginConfigBase):
     )
 
 
+class RecommendSection(PluginConfigBase):
+    """氛围选歌（recommend_cv_song 工具）设置。"""
+
+    __ui_label__ = "氛围选歌"
+    __ui_icon__ = "music-note"
+    __ui_order__ = 2
+
+    recommend_enabled: bool = Field(
+        default=True, description="是否启用 recommend_cv_song 推荐工具（关闭后 LLM 无法调用）"
+    )
+    target_singers: str = Field(
+        default="洛天依",
+        description="目标歌手白名单，英文逗号分隔。推荐时优先返回这些人演唱的歌",
+    )
+    known_virtual_singers: str = Field(
+        default="洛天依,言和,乐正绫,乐正龙牙,星尘,诗岸,心华,墨清弦,徵羽摩柯,海伊,苍穹,赤羽",
+        description=(
+            "已知虚拟歌手名单，英文逗号分隔。候选歌的歌手列表里出现"
+            "「名单中非目标歌手」时会被过滤（合唱/其他歌手的歌不进推荐池）"
+        ),
+    )
+    allow_unknown_singer: bool = Field(
+        default=True,
+        description="库中歌手字段为空的歌是否允许推荐（true=放行但标注「歌手未知」）",
+    )
+    recommend_count: int = Field(
+        default=3, ge=1, le=10, description="LLM 未指定数量时默认推荐几首"
+    )
+    soft_exclude_size: int = Field(
+        default=10, ge=0, le=50,
+        description="最近推荐软排除窗口：这么多首之内不重复推荐（0 表示不去重）",
+    )
+
+
+class EmotionSection(PluginConfigBase):
+    """情绪标签标注设置（同步后自动标注 + 离线脚本共用标签体系）。"""
+
+    __ui_label__ = "情绪标注"
+    __ui_icon__ = "tag"
+    __ui_order__ = 3
+
+    annotate_on_sync: bool = Field(
+        default=True,
+        description="同步完成后自动为待标注的歌打情绪标签（新歌优先）。关闭即完全不调用 LLM",
+    )
+    annotate_on_sync_limit: int = Field(
+        default=30, ge=1, le=200,
+        description="每轮同步后最多标注多少首（防止一次同步打爆 LLM 配额）",
+    )
+    llm_task: str = Field(
+        default="utils",
+        description=(
+            "标注用的模型任务名或模型标识（utils / planner / replyer / tool_use，"
+            "也可填具体模型名）。留空走 Host 默认路由——若未给本插件任务配模型，"
+            "会 fallback 到向量模型报 400（见 README「插件 LLM 被路由到 embedding 模型」）"
+        ),
+    )
+    annotate_timeout_ms: int = Field(
+        default=20000, ge=1000, le=120000, description="标注单首歌的 LLM 超时（毫秒）"
+    )
+    annotate_budget_seconds: int = Field(
+        default=180, ge=10, le=1800,
+        description="每轮标注的总时间预算（秒），超时即停，剩下的下轮继续",
+    )
+
+
 class CVLyricContextConfig(PluginConfigBase):
     """插件完整配置。"""
 
     plugin: PluginSection = Field(default_factory=PluginSection)
     crawler: CrawlerSection = Field(default_factory=CrawlerSection)
+    recommend: RecommendSection = Field(default_factory=RecommendSection)
+    emotion: EmotionSection = Field(default_factory=EmotionSection)
 
 
 class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
@@ -210,6 +278,8 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         self._sync_stats = None
         self._sync_stream = ""
         self._refetch_stop = False
+        # 氛围选歌：最近推荐过的歌名（软排除队列，长度由 recommend.soft_exclude_size 控制）
+        self._recent_recommends = deque()
         # 清洗后的歌词句 -> [歌名, ...]（个别句子属于多首歌）
         self._songs_by_line: dict[str, list[str]] = {}
         # 歌名 -> (歌手, P主)
@@ -234,6 +304,7 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         # 诊断: hook/事件/命令的实际字段名只打一次，避免刷屏
         self._probed_incoming = False
         self._probed_request = False
+        self._probed_planner = False
         self._probed_command = False
 
     # ---------- 生命周期 ----------
@@ -939,6 +1010,40 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             "只在话题相关时提及，不要生硬播报。"
         )
 
+    def _build_planner_text(self, session_id: str) -> str:
+        """给规划器的注入文本：重点帮助它做工具调用决策，语气与 replyer 版不同。
+
+        planner 决定「要不要调用 recommend_cv_song / cv_song_search 等工具、
+        怎么填参数」，所以这里只给歌名与语境，不塞创作信息（那些留给 replyer）。
+        """
+        cfg = self.config.plugin
+        fresh = self._session_hits(session_id)
+        if not fresh:
+            return ""
+        seen: set[str] = set()
+        songs: list[str] = []
+        snippets: list[str] = []
+        for _, lyric, song in reversed(fresh):  # 最近的在前
+            if song in seen:
+                continue
+            seen.add(song)
+            songs.append(song)
+            snippets.append(f"- 「{lyric}」≈《{song}》")
+            if len(songs) >= cfg.max_inject:
+                break
+        if not songs:
+            return ""
+        body = "\n".join(snippets)
+        return (
+            f"{INJECT_MARKER}当前会话中用户最近发送过以下歌词，已识别出对应歌曲：\n"
+            f"{body}\n"
+            "这说明用户很可能正在聊这些歌。若你打算调用与歌曲相关的工具"
+            "（如氛围选歌 recommend_cv_song、歌曲搜索 cv_song_search），"
+            "请结合上述歌曲选择参数（如目标歌手、搜索关键词），"
+            "优先推荐或检索用户正在听/正在聊的歌手的作品；"
+            "若无需调用工具，直接忽略本段即可。"
+        )
+
     @staticmethod
     def _build_system_item(text: str) -> dict[str, Any]:
         """构造一个 SystemMessageItem 快照（Context Item schema v1）。"""
@@ -965,6 +1070,75 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             if isinstance(item.get("content"), str):
                 chunks.append(item["content"])
         return "\n".join(chunks)
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="cv_lyric_planner_injector",
+        mode=HookMode.BLOCKING,  # BLOCKING 才能返回 modified_kwargs 改写 planner 请求
+        order=HookOrder.EARLY,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def inject_planner_context(self, **kwargs: Any):
+        """把歌词识别结果同步注入规划器，让 planner 的工具决策感知歌词语境。"""
+        if not self.config.plugin.enabled:
+            return {"action": "continue"}
+
+        if not self._probed_planner:
+            self._probed_planner = True
+            self.ctx.logger.info(
+                "[诊断] planner.before_request 字段: %s", sorted(kwargs.keys())
+            )
+
+        session_id = str(kwargs.get("session_id") or kwargs.get("chat_id") or "")
+        if not session_id:
+            return {"action": "continue"}
+
+        planner_text = self._build_planner_text(session_id)
+        if not planner_text:
+            return {"action": "continue"}
+
+        modified: dict[str, Any] = {}
+
+        # 方式 1: planner 请求带 prompt 字段 → 在 prompt 末尾追加（最常见）
+        prompt = kwargs.get("prompt")
+        if isinstance(prompt, str):
+            if INJECT_MARKER in prompt:
+                return {"action": "continue"}
+            modified["prompt"] = f"{prompt}\n\n{planner_text}"
+
+        # 方式 2: planner 请求带 messages → 追加一条 system
+        messages = kwargs.get("messages")
+        if isinstance(messages, list):
+            if any(
+                isinstance(m, dict) and INJECT_MARKER in str(m.get("content") or "")
+                for m in messages
+            ):
+                return {"action": "continue"}
+            modified["messages"] = list(messages) + [
+                {"role": "system", "content": planner_text}
+            ]
+
+        # 方式 3: planner 请求带 items（Context Item schema v1）
+        items = kwargs.get("items")
+        if isinstance(items, list):
+            if INJECT_MARKER in self._item_texts(items):
+                return {"action": "continue"}
+            modified["items"] = list(items) + [self._build_system_item(planner_text)]
+            modified["item_schema_version"] = kwargs.get(
+                "item_schema_version", CONTEXT_ITEM_SCHEMA_VERSION
+            )
+
+        if not modified:
+            self.ctx.logger.info(
+                "歌词命中但 planner 请求载荷中没有 prompt/messages/items（字段=%s），未注入",
+                sorted(kwargs.keys()),
+            )
+            return {"action": "continue"}
+
+        self.ctx.logger.info(
+            "已向规划器注入歌曲信息（%s）", "/".join(sorted(modified))
+        )
+        return {"action": "continue", "modified_kwargs": modified}
 
     @HookHandler(
         "maisaka.replyer.before_model_request",

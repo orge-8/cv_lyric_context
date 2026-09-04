@@ -12,6 +12,7 @@
 """
 
 import asyncio
+import random
 import time
 from pathlib import Path
 from typing import Any, List, Optional
@@ -19,8 +20,10 @@ from typing import Any, List, Optional
 from maibot_sdk import Command, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
+from emotion_annotate import build_prompt, extract_llm_text, parse_tags
+from singer_check import check_singer
 from vcpedia_client import USER_AGENT, VCPediaClient, VCPediaError
-from vcpedia_store import SongStore
+from vcpedia_store import EMOTION_TAGS, SongStore
 from vcpedia_sync import SyncStats, VCPediaSyncer, build_record
 from vcpedia_wikitext_parser import parse_wikitext
 
@@ -626,12 +629,16 @@ class VCPediaMixin:
             if self._sync_stream:
                 await self.ctx.send.text(f"同步异常：{exc}", self._sync_stream)
             return
-        if self._sync_stream:
+        stream = self._sync_stream
+        self._sync_stream = ""
+        if stream:
             text = stats.summary()
             if note:
                 text = f"{text}\n{note}"
-            await self.ctx.send.text(text, self._sync_stream)
-        self._sync_stream = ""
+            await self.ctx.send.text(text, stream)
+            # 同步结果先发出去，标注再慢慢跑：就算 LLM 卡住/报错，
+            # 用户也已经拿到同步结果（抓取有 PoW 成本，结果可见性优先）
+            await self._annotate_after_sync_report(stream)
 
     async def _vcpedia_after_sync(self, stats: SyncStats) -> str:
         """同步成功后的收尾钩子，宿主可覆盖。
@@ -640,6 +647,107 @@ class VCPediaMixin:
         宿主在这里重建内存歌词索引——否则新爬的歌要等重启 MaiBot 才能被识别。
         """
         return ""
+
+    # ---------- 同步后自动标注情绪标签 ----------
+
+    def _annotate_config(self) -> Any:
+        """取情绪标注配置；老配置缺 emotion 段时回退到内置默认值。"""
+        cfg = getattr(self.config, "emotion", None)
+        if cfg is None:  # 配置未热重载到新段时兜底，避免同步直接炸
+            from types import SimpleNamespace
+
+            return SimpleNamespace(
+                annotate_on_sync=False,
+                annotate_on_sync_limit=30,
+                llm_task="utils",
+                annotate_timeout_ms=20000,
+                annotate_budget_seconds=180,
+            )
+        return cfg
+
+    async def _annotate_pending_emotions(self, limit: int) -> tuple[int, int]:
+        """给待标注的歌打情绪标签，返回 (成功数, 尝试数)。
+
+        新歌优先（id 倒序），保证刚同步进来的歌先被标上；历史存量交给离线脚本。
+        任何失败都只在内部消化：绝不向外抛异常，绝不影响同步结果。
+        """
+        cfg = self._annotate_config()
+        try:
+            songs = await asyncio.to_thread(
+                self.store.pending_emotions, max(1, int(limit)), True
+            )
+        except Exception as exc:  # noqa: BLE001 - 取队列失败不应影响同步
+            self.ctx.logger.warning("情绪标注: 取待标注队列失败: %s", exc)
+            return 0, 0
+        if not songs:
+            return 0, 0
+
+        done = fails = 0
+        deadline = time.monotonic() + max(1, int(cfg.annotate_budget_seconds))
+        timeout_s = max(0.5, int(cfg.annotate_timeout_ms) / 1000.0)
+        task = str(getattr(cfg, "llm_task", "") or "").strip()
+
+        for song in songs:
+            if fails >= 3:  # 熔断：连续失败多半是模型路由/鉴权问题，别空转
+                break
+            if time.monotonic() > deadline:  # 总预算：超时剩下的下轮继续
+                self.ctx.logger.info(
+                    "情绪标注: 本轮时间预算用尽，已标 %d 首，剩余下轮继续", done
+                )
+                break
+            name = str(song.get("name") or "")
+            try:
+                raw = await asyncio.wait_for(
+                    self.ctx.llm.generate(
+                        build_prompt(name, song.get("lyrics")),
+                        model=task,
+                        temperature=0.2,
+                    ),
+                    timeout=timeout_s,
+                )
+                tags = parse_tags(extract_llm_text(raw))
+                if not tags:
+                    raise ValueError("LLM 未返回有效标签")
+                await asyncio.to_thread(self.store.mark_emotion, song["safe_name"], tags)
+                done += 1
+                fails = 0
+            except Exception as exc:  # noqa: BLE001 - 单首失败只记录，继续下一首
+                fails += 1
+                self.ctx.logger.warning("情绪标注: 《%s》失败: %s", name, exc)
+
+        if fails >= 3:
+            self.ctx.logger.error(
+                "情绪标注连续失败 3 次，本轮中止。处置三选一："
+                "① 在 model_config.toml 给任务 plugin.%s 配一个文本生成模型；"
+                "② 插件配置 emotion.llm_task 改成 planner / replyer 或具体模型名；"
+                "③ 不需要就把 emotion.annotate_on_sync 设为 false。",
+                self._plugin_id_for_log(),
+            )
+        return done, len(songs)
+
+    def _plugin_id_for_log(self) -> str:
+        """日志里回显插件 id，方便直接照抄去 model_config.toml 配置。"""
+        try:
+            return str(getattr(self, "plugin_id", "") or "org.mai-mai.cv-lyric-context")
+        except Exception:  # noqa: BLE001
+            return "org.mai-mai.cv-lyric-context"
+
+    async def _annotate_after_sync_report(self, stream: str) -> None:
+        """同步结果发出后再补一条标注回执。异常一律吞掉。"""
+        cfg = self._annotate_config()
+        if not bool(getattr(cfg, "annotate_on_sync", False)):
+            return
+        try:
+            done, tried = await self._annotate_pending_emotions(
+                int(getattr(cfg, "annotate_on_sync_limit", 30))
+            )
+        except Exception as exc:  # noqa: BLE001 - 双重保险，绝不影响同步
+            self.ctx.logger.warning(
+                "同步后情绪标注异常（不影响入库）: %s", exc, exc_info=True
+            )
+            return
+        if tried:
+            await self.ctx.send.text(f"（顺带完成 {done}/{tried} 首情绪标注）", stream)
 
     # ---------- Tool ----------
 
@@ -748,3 +856,125 @@ class VCPediaMixin:
         if not lyrics:
             return {"content": f"{header}\n（该词条暂无歌词）"}
         return {"content": f"{header}\n歌词：\n{lyrics}"}
+
+    # ---------- 氛围选歌（v2.5.0）----------
+
+    @Tool(
+        "recommend_cv_song",
+        description=(
+            "从本地中V歌曲库里按情绪氛围推荐歌曲。曲库歌曲都带有情绪标签"
+            "（甜美/温柔/积极/帅气/搞怪/伤感/愤怒），工具会按标签匹配、"
+            "排除最近刚推荐过的歌，并优先返回目标歌手（默认洛天依）演唱的歌曲。"
+            "当用户想听歌、让你点歌/推歌、聊天氛围适合安利一首歌，"
+            "或你想用一首歌回应对方情绪时使用。"
+            "调用前先根据当前对话氛围从 7 个标签里挑 1~2 个最贴切的传入。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="emotion_tags",
+                param_type=ToolParamType.STRING,
+                description=(
+                    "目标情绪标签，从「甜美、温柔、积极、帅气、搞怪、伤感、愤怒」中选，"
+                    "多个用「、」分隔。对话低落压抑时优先温柔/积极/甜美，"
+                    "避免继续压低气氛。"
+                ),
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="count",
+                param_type=ToolParamType.STRING,
+                description="推荐数量，1-10 的数字，默认 3",
+                required=False,
+            ),
+        ],
+    )
+    async def tool_recommend_song(
+        self, emotion_tags: str = "", count: str = "", **kwargs: Any
+    ) -> dict[str, str]:
+        del kwargs
+        rec = self.config.recommend
+        if not rec.recommend_enabled:
+            return {"content": "歌曲推荐功能当前已关闭。"}
+        if not self.config.plugin.enabled:
+            return {"content": "歌词库当前已禁用。"}
+
+        # 1) 解析标签：与白名单取交集，顺序按白名单（提示词展示稳定）
+        wanted = [t.strip() for t in str(emotion_tags or "").replace("，", "、").split("、")]
+        hits = [t for t in EMOTION_TAGS if t in wanted]
+        if not hits:
+            return {
+                "content": (
+                    "未识别到有效的情绪标签。请从「甜美、温柔、积极、帅气、搞怪、"
+                    "伤感、愤怒」中选择后再调用。"
+                )
+            }
+        try:
+            n = max(1, min(10, int(str(count or "").strip() or rec.recommend_count)))
+        except ValueError:
+            n = int(rec.recommend_count)
+
+        # 2) 候选：按标签匹配；库里没标注或全部未命中时回退到已标注全集
+        try:
+            candidates = self.store.search_by_emotion(hits, limit=200)
+            if not candidates:
+                candidates = self.store.all_annotated_songs(limit=200)
+        except RuntimeError as exc:
+            return {"content": f"歌曲库不可用：{exc}"}
+        if not candidates:
+            return {
+                "content": (
+                    "曲库还没有可推荐的数据。可以让用户发送「/歌词 同步」同步歌曲，"
+                    "并在开发机运行 annotate_emotions.py 批量标注情绪标签。"
+                )
+            }
+
+        targets = [t.strip() for t in rec.target_singers.split(",") if t.strip()]
+        known = [k.strip() for k in rec.known_virtual_singers.split(",") if k.strip()]
+        recent = getattr(self, "_recent_recommends", None)
+        maxlen = max(1, int(rec.soft_exclude_size))
+
+        random.shuffle(candidates)
+        picks: List[tuple[Any, str]] = []
+        picked_names: List[str] = []
+        for song in candidates:
+            name = str(song.get("name") or "")
+            if name in (recent or ()):  # 软排除最近推荐过的
+                continue
+            ok, note = check_singer(
+                str(song.get("singers") or ""), targets, known,
+                allow_unknown=bool(rec.allow_unknown_singer),
+            )
+            if not ok:
+                continue
+            picks.append((song, note))
+            picked_names.append(name)
+            if len(picks) >= n:
+                break
+
+        if not picks:
+            # 回退也全军覆没（比如目标歌手的歌全都推荐过了）→ 不动队列
+            return {
+                "content": (
+                    "曲库里暂时没有符合这个氛围、且歌手合适的歌可以推荐，"
+                    "可以换个标签描述，或过一会儿再试。"
+                )
+            }
+
+        # 3) 只在成功返回候选后更新软排除队列，失败不污染
+        if recent is not None:
+            recent.extend(picked_names)
+            while len(recent) > maxlen:
+                recent.popleft()
+
+        lines = [f"按「{'、'.join(hits)}」氛围从曲库挑了 {len(picks)} 首："]
+        for song, note in picks:
+            intro = (song.get("introduction") or "").strip().replace("\n", " ")
+            line = f"《{song['name']}》｜{note or '歌手未知'}"
+            song_tags = self.store.parse_emotion(song.get("emotion"))
+            if song_tags:
+                line += f"｜{'、'.join(song_tags)}"
+            if intro:
+                line += f"｜{intro[:80]}"
+            lines.append(line)
+        lines.append("请结合当前对话，用你自己的口吻把歌安利出去，不要罗列以上原始信息。")
+        return {"content": "\n".join(lines)}
