@@ -521,15 +521,40 @@ def parse_lyrics(source: str) -> str:
     return text
 
 
+# 标题行判定。旧写法是 ^\s*={2,4}\s*[^=\n]*\s*={2,4}\s*$ —— \s* 与 [^=\n]* 都能吃掉
+# 空格，匹配失败时三段互相回溯，复杂度 O(n^3)：一行「==」加 2000 个空格就要十几秒
+# （实测 500/1000/2000 空格 = 0.2s/1.5s/11.7s）。VCPedia 任何人可编辑，恶意或手滑
+# 写出这种行就会卡住解析线程；解析跑在 to_thread 里，「/歌词 取消」杀不掉线程。
+# 这里先按长度闸门截断，再用 fullmatch 线性匹配。
+_HEADING_RE = re.compile(r"(={2,4})([^=]*)(={2,4})")
+_MAX_HEADING_CHARS = 200
+
+
+def _heading_title(line: str) -> str:
+    """是 wikitext 标题行则返回标题文本，否则返回空串。复杂度与行长线性相关。"""
+    s = line.strip()
+    if not (4 <= len(s) <= _MAX_HEADING_CHARS):
+        return ""
+    m = _HEADING_RE.fullmatch(s)
+    if not m or m.group(1) != m.group(3):
+        return ""
+    return m.group(2).strip()
+
+
 def parse_introduction(source: str) -> str:
     """从 wikitext 提取简介（「简介」章节，样式化标题也能命中）。"""
-    m = re.search(r"^={2,4}\s*[^=\n]*简介[^=\n]*\s*={2,4}\s*$", source, re.M)
-    if not m:
+    lines = source.splitlines()
+    start = -1
+    for index, line in enumerate(lines):
+        title = _heading_title(line)
+        if title and "简介" in title:
+            start = index + 1
+            break
+    if start < 0:
         return ""
-    tail = source[m.end():]
-    lines: List[str] = []
-    for line in tail.splitlines():
-        if re.match(r"^\s*={2,4}\s*[^=\n]*\s*={2,4}\s*$", line):
+    result: List[str] = []
+    for line in lines[start:]:
+        if _heading_title(line):
             break
         s = line.strip()
         if not s or s.startswith("{{"):
@@ -537,8 +562,8 @@ def parse_introduction(source: str) -> str:
         s = re.sub(r"<ref[^>]*>.*?</ref>", "", s, flags=re.S)
         s = re.sub(r"<[^>]+>", "", s)
         s = s.replace("[[", "").replace("]]", "").replace("\u3000", " ")
-        lines.append(s)
-    return " ".join(lines).strip()[:500]
+        result.append(s)
+    return " ".join(result).strip()[:500]
 
 
 def parse_wikitext(name: str, source: str) -> Dict[str, Any]:

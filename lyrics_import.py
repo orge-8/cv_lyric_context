@@ -57,6 +57,10 @@ _GENERIC_STEMS = {
 
 _ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "big5")
 
+# 单文件读取上限。收件箱里的文件可能来自任何人，一个几百 MB 的"歌词文件"
+# 会在导入时把整个进程内存顶满；正常歌词文件都在几十 KB 量级。
+_MAX_FILE_BYTES = 5 * 1024 * 1024
+
 # 默认单曲歌词行上限，防止超大文件把词库撑爆
 DEFAULT_MAX_LINES = 2000
 
@@ -128,11 +132,23 @@ def _source_label(source: str) -> str:
 
 
 def read_text(path: Path) -> str | None:
-    """按 utf-8-sig / utf-8 / gb18030 / big5 顺序尝试解码，失败返回 None。"""
-    data = path.read_bytes()
+    """按 utf-8-sig / utf-8 / gb18030 / big5 顺序尝试解码，失败返回 None。
+
+    超过 _MAX_FILE_BYTES 的文件只读前 _MAX_FILE_BYTES 字节（尾部按编码边界
+    截断，解不出的尾巴直接丢）——正常歌词文件远小于此，只有异常大文件才会被截。
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    if size > _MAX_FILE_BYTES:
+        with path.open("rb") as handle:
+            data = handle.read(_MAX_FILE_BYTES)
+    else:
+        data = path.read_bytes()
     for enc in _ENCODINGS:
         try:
-            return data.decode(enc)
+            return data.decode(enc, errors="ignore") if size > _MAX_FILE_BYTES else data.decode(enc)
         except (UnicodeDecodeError, LookupError):
             continue
     return None
@@ -196,9 +212,19 @@ def parse_stem(stem: str) -> StemParts:
     return StemParts(name=name, singers=singers, uploader=uploader)
 
 
+def _has_min_cjk(text: str, minimum: int = MIN_CJK_CHARS) -> bool:
+    """汉字/假名是否至少有 minimum 个（提前退出，不物化整个匹配列表）。"""
+    count = 0
+    for _ in _CJK.finditer(text):
+        count += 1
+        if count >= minimum:
+            return True
+    return False
+
+
 def is_keep_line(line: str, min_line_len: int) -> bool:
     """噪声过滤: 汉字太少（纯数字/纯英文）或过短的句子不入库。"""
-    return len(line) >= min_line_len and len(_CJK.findall(line)) >= MIN_CJK_CHARS
+    return len(line) >= min_line_len and _has_min_cjk(line)
 
 
 def _safe_lookup(

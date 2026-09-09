@@ -5,3 +5,5 @@ data/
 /annotate_config.json
 assets/lyrics_inbox/
 assets/user_songs.json
+config_back/
+/source_dump.txt

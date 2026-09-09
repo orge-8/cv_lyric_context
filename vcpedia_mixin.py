@@ -30,6 +30,17 @@ from vcpedia_wikitext_parser import parse_wikitext
 DB_FILE = "vcpedia_songs.db"
 COOKIE_FILE = "anubis_cookies.txt"
 
+# 同步/补歌词是重任务（成百上千次外部请求），而命令在群里任何人都能发。
+# 显式指定的条数一律夹到这个上限，避免一句「/歌词 同步 999999」跑上一整天。
+_MAX_SYNC_LIMIT = 500
+
+# 入站命令里承载「发送者 QQ」的字段名在不同 MaiBot 版本里不一致，
+# 逐个试探；一个都取不到时按放行处理（保持旧行为，不误伤正常使用）。
+_SENDER_ID_FIELDS = (
+    "user_id", "sender_id", "sender_user_id", "from_id",
+    "user_id_str", "sender_id_str", "qq", "qq_id",
+)
+
 # 解析器自检样例：(wikitext 源码, 解出歌词里必须包含的文本)
 # 1) 《山遥路远》形态：<poem> 未闭合 + 首个 {{color|#色值| 跨行未闭合
 # 2) 常规形态：成对 <poem>，多段歌词
@@ -153,10 +164,74 @@ class VCPediaMixin:
         return parts[index].strip() if len(parts) > index else ""
 
     @staticmethod
-    def _matched_int(kwargs: dict, key: str, text: str, index: int) -> int:
-        """同上，但取整数（取不到或非数字时返回 0）。"""
+    def _matched_int(kwargs: dict, key: str, text: str, index: int,
+                     maximum: int = 0) -> int:
+        """同上，但取整数（取不到或非数字时返回 0）。
+
+        maximum>0 时把结果夹到 [0, maximum]：命令是群内任何人都能发的，
+        不设上限时一句「/歌词 同步 999999」就能让后台任务跑上一整天。
+        """
         raw = VCPediaMixin._matched_text(kwargs, key, text, index)
-        return int(raw) if raw.isdigit() else 0
+        if not raw.isdigit():
+            return 0
+        value = int(raw)
+        return min(value, maximum) if maximum > 0 else value
+
+    def _clip_lyrics(self, lyrics: str) -> str:
+        """给工具返回用的歌词限长。
+
+        工具返回值会整个进 LLM 上下文，不加限制时一个超长（或被恶意写长）
+        的词条就能一次灌进几十 KB，白白吃掉大量 token。
+        """
+        text = (lyrics or "").strip()
+        if not text:
+            return ""
+        limit = int(getattr(self.config.plugin, "lyric_preview_chars", 120) or 0) * 4
+        if limit <= 0 or len(text) <= limit:
+            return text
+        lines = text.splitlines()
+        kept: list[str] = []
+        used = 0
+        for line in lines:
+            if used + len(line) + 1 > limit:
+                break
+            kept.append(line)
+            used += len(line) + 1
+        head = "\n".join(kept)
+        total = len(lines)
+        return f"{head}\n…（已截断，共 {total} 行）"
+
+    def _sync_denied(self, kwargs: dict) -> str:
+        """重任务命令的管理员校验。返回非空表示拒绝，并直接作为回复文案。
+
+        只在配置了 crawler.sync_admin_ids 时生效；取不到发送者标识时放行，
+        避免因为字段名对不上把正常用法也一起挡掉。
+        """
+        raw = str(getattr(self.config.crawler, "sync_admin_ids", "") or "").strip()
+        if not raw:
+            return ""
+        admins = {x.strip() for x in raw.split(",") if x.strip()}
+        if not admins:
+            return ""
+        sender = ""
+        for field in _SENDER_ID_FIELDS:
+            value = kwargs.get(field)
+            if value not in (None, ""):
+                sender = str(value).strip()
+                break
+        if not sender:
+            # 首次触发时把可用字段打出来，方便真机上确认该填哪个字段名
+            if not self._probed_command:
+                self._probed_command = True
+                self.ctx.logger.info(
+                    "[诊断] 同步命令未能识别发送者字段（可用字段=%s）。"
+                    "sync_admin_ids 已配置但取不到 QQ 号，本次放行",
+                    sorted(kwargs.keys()),
+                )
+            return ""
+        if sender in admins:
+            return ""
+        return "这个命令只有插件配置里指定的管理员能触发（crawler.sync_admin_ids）。"
 
     async def _reply(self, stream_id: str, text: str) -> tuple[bool, str, int]:
         """统一回复：确实发出去才返回拦截级别 2，否则返回 0 让 bot 接一句话。
@@ -241,8 +316,9 @@ class VCPediaMixin:
         if lyric_lines > 0:
             lyrics = (song.get("lyrics") or "").strip()
             if lyrics:
-                shown = "\n".join(lyrics.splitlines()[:lyric_lines])
-                total = len(lyrics.splitlines())
+                lyric_rows = lyrics.splitlines()
+                shown = "\n".join(lyric_rows[:lyric_lines])
+                total = len(lyric_rows)
                 suffix = f"\n…（共 {total} 行）" if total > lyric_lines else ""
                 lines.append(f"歌词：\n{shown}{suffix}")
         if page_url:
@@ -344,11 +420,17 @@ class VCPediaMixin:
             return False, "插件已禁用", 2
         if not self.config.crawler.allow_sync_command:
             return False, "同步命令已在配置中关闭", 2
+        denied = self._sync_denied(kwargs)
+        if denied:
+            return False, denied, 2
         if self._sync_task and not self._sync_task.done():
             return False, "已有同步任务在跑，发送「/歌词 取消」可中止", 2
 
         limit = self._matched_int(kwargs, "limit", text, 2)
         limit = limit or int(self.config.crawler.sync_batch_limit)
+        # 命令在群里谁都能发，显式条数夹到上限，避免一次排上跑不完的任务
+        if limit > _MAX_SYNC_LIMIT:
+            limit = _MAX_SYNC_LIMIT
 
         self._sync_stream = stream_id or ""
         self._sync_stats = SyncStats()
@@ -374,6 +456,9 @@ class VCPediaMixin:
             return False, "插件已禁用", 2
         if not self.config.crawler.allow_sync_command:
             return False, "同步命令已在配置中关闭", 2
+        denied = self._sync_denied(kwargs)
+        if denied:
+            return False, denied, 2
         if self._sync_task and not self._sync_task.done():
             return False, "同步进行中，等它跑完再重抓单个词条", 2
         name = self._matched_text(kwargs, "name", text, 2)
@@ -439,10 +524,16 @@ class VCPediaMixin:
             return False, "插件已禁用", 2
         if not self.config.crawler.allow_sync_command:
             return False, "同步命令已在配置中关闭", 2
+        denied = self._sync_denied(kwargs)
+        if denied:
+            return False, denied, 2
         if self._sync_task and not self._sync_task.done():
             return False, "已有同步/补歌词任务在跑，发送「/歌词 取消」可中止", 2
         limit = self._matched_int(kwargs, "limit", text, 2)
         limit = limit or int(self.config.crawler.sync_batch_limit)
+        # 命令在群里谁都能发，显式条数夹到上限，避免一次排上跑不完的任务
+        if limit > _MAX_SYNC_LIMIT:
+            limit = _MAX_SYNC_LIMIT
         self._refetch_stop = False
         self._sync_stream = stream_id or ""
         self._sync_stats = SyncStats()
@@ -486,7 +577,15 @@ class VCPediaMixin:
             self._sync_stream = ""
             return
         # 网络抓取整体丢到线程，避免阻塞事件循环；索引重建仍在事件循环线程做。
-        result = await asyncio.to_thread(self._refetch_batch_worker, names)
+        try:
+            result = await asyncio.to_thread(self._refetch_batch_worker, names)
+        except Exception as exc:  # noqa: BLE001 - 补歌词失败要回报，不能静默
+            self.ctx.logger.exception("VCPedia: 批量补歌词异常: %s", exc)
+            if self._sync_stream:
+                await self.ctx.send.text(f"批量补歌词异常：{exc}", self._sync_stream)
+            self._sync_stream = ""
+            self._refetch_stop = False
+            return
         self._refetch_stop = False
         stats = SyncStats()
         stats.updated = result["refilled"]
@@ -608,9 +707,11 @@ class VCPediaMixin:
     # ---------- 后台同步 ----------
 
     async def _run_sync(self, limit: int) -> None:
-        syncer = self._get_syncer()
-        categories = self._categories()
+        # syncer 的构造必须在 try 内：客户端/cookie 文件异常时若逃出任务，
+        # 用户只看到「已开始同步」就再无回音，异常也没人 retrieve。
         try:
+            syncer = self._get_syncer()
+            categories = self._categories()
             stats = await asyncio.to_thread(
                 syncer.run, categories, int(self.config.crawler.category_depth), limit, False
             )
@@ -843,7 +944,8 @@ class VCPediaMixin:
                     head = f"找到多首可能的歌曲：{names}\n以下为《{song['name']}》的歌词：\n\n"
                     lyrics = (song.get("lyrics") or "").strip()
                     return {
-                        "content": head + (lyrics if lyrics else "（该词条暂无歌词）")
+                        "content": head + (self._clip_lyrics(lyrics)
+                                           if lyrics else "（该词条暂无歌词）")
                     }
         except RuntimeError as exc:
             return {"content": f"歌曲库不可用：{exc}"}
@@ -855,7 +957,8 @@ class VCPediaMixin:
             header += "\n" + "\n".join(credits)
         if not lyrics:
             return {"content": f"{header}\n（该词条暂无歌词）"}
-        return {"content": f"{header}\n歌词：\n{lyrics}"}
+        clipped = self._clip_lyrics(lyrics)
+        return {"content": f"{header}\n歌词：\n{clipped}"}
 
     # ---------- 氛围选歌（v2.5.0）----------
 

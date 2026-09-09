@@ -44,6 +44,9 @@ _PASS_CHALLENGE_PATH = "/.within.website/x/cmd/anubis/api/pass-challenge"
 # PoW 搜索上限：difficulty=4 约 6 万次（毫秒级），difficulty=6 约 1600 万次。
 # 超过上限直接放弃，避免把 CPU 打满。
 _POW_MAX_TRIES = 20_000_000
+# difficulty 取自远端响应：站点一旦返回异常大的值，本地就要做上亿次纯 Python
+# sha256。正常站点在 4~5，这里夹到 6（最坏十秒级）后交回 _solve_pow 兜底。
+_POW_MAX_DIFFICULTY = 6
 
 _DEFAULT_LOGGER = logging.getLogger("vcpedia_client")
 
@@ -60,10 +63,15 @@ def _solve_pow(random_data: str, difficulty: int, max_tries: int = _POW_MAX_TRIE
     """找 nonce 使 sha256(randomData + nonce) 的 hex 前 difficulty 位为 0。
 
     返回 (nonce, hash)。与 Anubis 前端 sha256 worker 的判定一致。
+    前缀 hasher 复用：每轮只增量哈希 nonce 本身，不再重复编码并哈希固定前缀
+    （difficulty=6 约 1600 万次迭代，省掉每轮一次字符串拼接与前缀哈希）。
     """
     target = "0" * difficulty
+    prefix = hashlib.sha256(random_data.encode("utf-8"))
     for nonce in range(1, max_tries + 1):
-        digest = hashlib.sha256((random_data + str(nonce)).encode("utf-8")).hexdigest()
+        hasher = prefix.copy()
+        hasher.update(str(nonce).encode("utf-8"))
+        digest = hasher.hexdigest()
         if digest.startswith(target):
             return nonce, digest
     raise AnubisError(f"Anubis PoW 未能在 {max_tries} 次内解出（difficulty={difficulty}）")
@@ -245,7 +253,10 @@ class VCPediaClient:
         return {
             "id": str(cid),
             "randomData": str(random_data),
-            "difficulty": int(rules.get("difficulty") or challenge.get("difficulty") or 4),
+            "difficulty": min(
+                int(rules.get("difficulty") or challenge.get("difficulty") or 4),
+                _POW_MAX_DIFFICULTY,
+            ),
         }
 
     def solve_challenge(self) -> bool:

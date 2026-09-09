@@ -77,12 +77,41 @@ def call_llm(
     ssl_ctx: ssl.SSLContext,
     timeout: float = 60.0,
 ) -> str:
-    """调 OpenAI 兼容 /chat/completions，返回回复文本。网络异常直接抛出。"""
+    """调 OpenAI 兼容 /chat/completions，返回回复文本。网络异常直接抛出。
+
+    两个安全处理：
+    1. 只允许 https —— 明文 http 会把 Bearer token 直接暴露在链路上；
+    2. 自定义 redirect handler —— urllib 默认跟随重定向时**会带上 Authorization 头**，
+       一旦服务端返回 302 指向第三方域名，API key 就泄漏给了那个域名。
+    """
+    if not base_url.lower().startswith("https://"):
+        raise ValueError(
+            f"--base-url 必须使用 https（当前为 {base_url}），"
+            "明文 http 会让 API key 在链路上裸奔"
+        )
     payload = json.dumps({
         "model": model,
         "temperature": temperature,
         "messages": [{"role": "user", "content": prompt}],
     }).encode("utf-8")
+
+    class _NoAuthRedirect(urllib.request.HTTPRedirectHandler):
+        """重定向时剥掉 Authorization，避免把 key 交给跳转目标。"""
+
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not newurl.lower().startswith("https://"):
+                raise urllib.error.URLError(f"拒绝重定向到非 https 地址: {newurl}")
+            new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+            if new_req is not None:
+                for key in list(new_req.headers):
+                    if key.lower() == "authorization":
+                        del new_req.headers[key]
+                new_req.unredirected_hdrs.pop("Authorization", None)
+            return new_req
+
+    opener = urllib.request.build_opener(
+        _NoAuthRedirect, urllib.request.HTTPSHandler(context=ssl_ctx)
+    )
     req = urllib.request.Request(
         base_url.rstrip("/") + "/chat/completions",
         data=payload,
@@ -92,7 +121,7 @@ def call_llm(
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
+    with opener.open(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return str(data["choices"][0]["message"]["content"] or "")
 

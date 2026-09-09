@@ -58,6 +58,20 @@ def safe_song_name(name: str) -> str:
     ).strip()
 
 
+def _escape_like(text: str) -> str:
+    """转义 LIKE 通配符，配合 SQL 里的 ESCAPE '\\' 使用。
+
+    搜索关键词直接来自聊天消息：不转义时 `%` 匹配任意串、`_` 匹配任意单字，
+    「/歌词 搜索 %」会一次捞出整个曲库。
+    """
+    return (
+        str(text or "")
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
 class SongStore:
     """歌曲库读写。"""
 
@@ -90,8 +104,12 @@ class SongStore:
 
     # ── 写入 ────────────────────────────────────────────────────
 
-    def upsert(self, record: Dict[str, Any]) -> bool:
-        """写入/更新一首歌，返回 True 表示新增（False 表示已存在并更新）。"""
+    def upsert(self, record: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> bool:
+        """写入/更新一首歌，返回 True 表示新增（False 表示已存在并更新）。
+
+        传入 conn 时复用调用方的连接（批量同步用，见 open_writer），仍逐首提交，
+        与逐次开连接的语义一致；不传则自开连接（默认）。
+        """
         name = str(record.get("name") or "").strip()
         if not name:
             return False
@@ -109,25 +127,41 @@ class SongStore:
             str(record.get("categories") or ""),
             time.time(),
         ]
-        with self._connect() as conn:
-            existing = conn.execute(
-                "SELECT id FROM songs WHERE safe_name = ?", (safe,)
-            ).fetchone()
-            if existing is None:
-                conn.execute(
-                    "INSERT INTO songs (name, safe_name, " + ", ".join(_CREDIT_FIELDS)
-                    + ", year, introduction, lyrics, categories, fetched_at) "
-                    "VALUES (?, ?, " + ", ".join("?" * len(_CREDIT_FIELDS))
-                    + ", ?, ?, ?, ?, ?)", values,
-                )
-                return True
+        if conn is not None:
+            result = self._upsert_row(conn, name, safe, values)
+            conn.commit()
+            return result
+        with self._connect() as own:
+            return self._upsert_row(own, name, safe, values)
+
+    @staticmethod
+    def _upsert_row(conn: sqlite3.Connection, name: str, safe: str, values: list) -> bool:
+        existing = conn.execute(
+            "SELECT id FROM songs WHERE safe_name = ?", (safe,)
+        ).fetchone()
+        if existing is None:
             conn.execute(
-                "UPDATE songs SET name = ?, " + ", ".join(f"{f} = ?" for f in _CREDIT_FIELDS)
-                + ", year = ?, introduction = ?, lyrics = ?, categories = ?, fetched_at = ? "
-                "WHERE safe_name = ?",
-                [name, *values[2:], safe],
+                "INSERT INTO songs (name, safe_name, " + ", ".join(_CREDIT_FIELDS)
+                + ", year, introduction, lyrics, categories, fetched_at) "
+                "VALUES (?, ?, " + ", ".join("?" * len(_CREDIT_FIELDS))
+                + ", ?, ?, ?, ?, ?)", values,
             )
-            return False
+            return True
+        conn.execute(
+            "UPDATE songs SET name = ?, " + ", ".join(f"{f} = ?" for f in _CREDIT_FIELDS)
+            + ", year = ?, introduction = ?, lyrics = ?, categories = ?, fetched_at = ? "
+            "WHERE safe_name = ?",
+            [name, *values[2:], safe],
+        )
+        return False
+
+    def open_writer(self) -> sqlite3.Connection:
+        """给批量同步复用的写入连接（调用方负责 close）。
+
+        同步几千首时避免逐首 connect/close；提交仍在 upsert 内逐首进行，
+        /歌词 状态 里 count() 依旧能实时看到增长。
+        """
+        return self._connect()
 
     def bulk_exists(self, safe_names: Iterable[str]) -> set[str]:
         """批量判断哪些归一化歌名已在库中。"""
@@ -214,10 +248,13 @@ class SongStore:
         kw = (keyword or "").strip()
         if not kw:
             return []
-        like = f"%{kw}%"
+        # 关键词来自用户输入，% 和 _ 在 LIKE 里是通配符：不转义时
+        # 「/歌词 搜索 %」会匹配到全库任何一条记录。
+        like = f"%{_escape_like(kw)}%"
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM songs WHERE name LIKE ? OR singers LIKE ? OR uploader LIKE ? "
+                "SELECT * FROM songs WHERE name LIKE ? ESCAPE '\\' "
+                "OR singers LIKE ? ESCAPE '\\' OR uploader LIKE ? ESCAPE '\\' "
                 "ORDER BY (name = ?) DESC, LENGTH(name) ASC, id LIMIT ?",
                 (like, like, like, kw, limit),
             ).fetchall()
@@ -230,8 +267,9 @@ class SongStore:
             return []
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM songs WHERE lyrics LIKE ? ORDER BY LENGTH(name) LIMIT ?",
-                (f"%{kw}%", limit),
+                "SELECT * FROM songs WHERE lyrics LIKE ? ESCAPE '\\' "
+                "ORDER BY LENGTH(name) LIMIT ?",
+                (f"%{_escape_like(kw)}%", limit),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -262,9 +300,15 @@ class SongStore:
         wanted = [t for t in (str(x or "").strip() for x in tags) if t]
         if not wanted:
             return []
+        # 标签白名单互不包含子串，LIKE 预筛安全；精确交集仍在下面 Python 侧计分。
+        # 只取推荐要用的列，不把整段歌词等大字段一起拉进内存。
+        where = " OR ".join("emotion LIKE ?" for _ in wanted)
+        params = [f"%{t}%" for t in wanted]
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM songs WHERE emotion != '' AND lyrics != ''"
+                "SELECT name, singers, emotion, introduction FROM songs "
+                f"WHERE emotion != '' AND lyrics != '' AND ({where})",
+                params,
             ).fetchall()
         tagset = set(wanted)
         scored: List[tuple[int, Dict[str, Any]]] = []
@@ -283,7 +327,8 @@ class SongStore:
         """已标注歌曲全量（无标签过滤，供无匹配回退时随机选歌）。"""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM songs WHERE lyrics != '' ORDER BY id LIMIT ?",
+                "SELECT name, singers, emotion, introduction FROM songs "
+                "WHERE lyrics != '' ORDER BY id LIMIT ?",
                 (max(1, int(limit)),),
             ).fetchall()
         return [dict(r) for r in rows]

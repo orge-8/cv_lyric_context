@@ -159,46 +159,53 @@ class VCPediaSyncer:
             self.progress_cb(stats)
 
         consecutive_failures = 0
-        for index, title in enumerate(pending, start=1):
-            if self._stop:
-                self.logger.info("VCPedia: 同步被中止（已处理 %d/%d）", index - 1, stats.total)
-                break
-            try:
-                source = self.client.fetch_wikitext(title)
-                if not source:
-                    raise ValueError("未取到 wikitext")
-                parsed = parse_wikitext(title, source)
-                if not (parsed.get("introduction") or parsed.get("lyrics")):
-                    raise NotSongPage("词条无简介也无歌词，可能不是歌曲页")
-            except NotSongPage as exc:
-                # 内容判定失败：跳过即可，不累加 consecutive_failures
-                stats.notsong += 1
-                self.logger.info("VCPedia: 跳过非歌曲页 %s: %s", title, exc)
-                continue
-            except Exception as exc:  # noqa: BLE001 - 单首失败不影响整体
-                consecutive_failures += 1
-                stats.failed += 1
-                if len(stats.failures) < 10:
-                    stats.failures.append(title)
-                self.logger.warning("VCPedia: 抓取失败 %s: %s", title, exc)
-                if consecutive_failures >= self.max_fail:
-                    self.logger.warning("VCPedia: 连续失败 %d 次，提前停止", consecutive_failures)
+        # 复用一个写入连接，避免几千次 connect/close（upsert 内仍逐首提交，
+        # /歌词 状态 的 count() 依旧能实时看到增长）
+        write_conn = self.store.open_writer()
+        # 循环体里的 progress_cb / logger 抛异常时会绕过末尾的 close()，
+        # 泄漏一个持有写锁的连接（下次同步再 open_writer 可能被锁住）。
+        try:
+            for index, title in enumerate(pending, start=1):
+                if self._stop:
+                    self.logger.info("VCPedia: 同步被中止（已处理 %d/%d）", index - 1, stats.total)
                     break
-                continue
+                try:
+                    source = self.client.fetch_wikitext(title)
+                    if not source:
+                        raise ValueError("未取到 wikitext")
+                    parsed = parse_wikitext(title, source)
+                    if not (parsed.get("introduction") or parsed.get("lyrics")):
+                        raise NotSongPage("词条无简介也无歌词，可能不是歌曲页")
+                except NotSongPage as exc:
+                    # 内容判定失败：跳过即可，不累加 consecutive_failures
+                    stats.notsong += 1
+                    self.logger.info("VCPedia: 跳过非歌曲页 %s: %s", title, exc)
+                    continue
+                except Exception as exc:  # noqa: BLE001 - 单首失败不影响整体
+                    consecutive_failures += 1
+                    stats.failed += 1
+                    if len(stats.failures) < 10:
+                        stats.failures.append(title)
+                    self.logger.warning("VCPedia: 抓取失败 %s: %s", title, exc)
+                    if consecutive_failures >= self.max_fail:
+                        self.logger.warning("VCPedia: 连续失败 %d 次，提前停止", consecutive_failures)
+                        break
+                    continue
 
-            consecutive_failures = 0
-            try:
-                if self.store.upsert(build_record(title, parsed, ",".join(categories[:3]))):
-                    stats.added += 1
-                else:
-                    stats.updated += 1
-            except Exception as exc:  # noqa: BLE001
-                stats.failed += 1
-                self.logger.warning("VCPedia: 入库失败 %s: %s", title, exc)
+                consecutive_failures = 0
+                try:
+                    if self.store.upsert(build_record(title, parsed, ",".join(categories[:3])), conn=write_conn):
+                        stats.added += 1
+                    else:
+                        stats.updated += 1
+                except Exception as exc:  # noqa: BLE001
+                    stats.failed += 1
+                    self.logger.warning("VCPedia: 入库失败 %s: %s", title, exc)
 
-            if self.progress_cb and index % self.progress_every == 0:
-                self.progress_cb(stats)
-
+                if self.progress_cb and index % self.progress_every == 0:
+                    self.progress_cb(stats)
+        finally:
+            write_conn.close()
         stats.finished_at = time.time()
         self.store.meta_set("last_sync_at", str(stats.finished_at))
         self.store.meta_set("last_sync_added", str(stats.added))
