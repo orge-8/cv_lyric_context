@@ -357,6 +357,40 @@ extra_song_dbs = "data/我的歌库.db"
 | `emotion.llm_task` | utils | 标注用的模型任务名/模型标识（utils / planner / replyer / 具体模型名）；留空走默认路由，若未配好会 fallback 向量模型报 400 |
 | `emotion.annotate_timeout_ms` | 20000 | 标注单首歌的 LLM 超时（毫秒） |
 | `emotion.annotate_budget_seconds` | 180 | 每轮标注总时间预算（秒），超时即停下轮继续 |
+| `integration.play_tool_enabled` | true | 在规划器注入里提示可用的点歌工具（见下节） |
+| `integration.play_tool_name` | `search_and_play_music` | 点歌工具名；留空则只给「可点播查询」串、不指定工具，便于换用其它点歌插件 |
+| `integration.play_tool_hint` | 空 | 追加在点歌提示末尾的自定义说明（如本群点歌限额） |
+| `integration.max_play_candidates` | 2 | 注入里最多给出几条可点播的「歌名 歌手」查询串 |
+
+## 点歌联动（v2.7.0）
+
+配合点歌插件 [github.cateye.music-request]（`search_and_play_music` 工具）使用。
+链路是**经 LLM 规划器**的松耦合，不硬依赖：
+
+```text
+用户在群里贴歌词
+  → 本插件识别出歌名/歌手
+  → maisaka.planner.before_request 注入：歌名 + 「可点播查询：歌名 歌手」
+  → 用户说「放一下」
+  → 规划器调用 search_and_play_music(query="歌名 歌手")
+  → 点歌插件把歌发到当前会话
+```
+
+为什么必须由本插件给出**「歌名 歌手」**：只给歌名时点歌插件容易搜到翻唱或同名曲；
+歌词本身也不能直接当 query（搜不到）。所以注入里为前 `max_play_candidates` 首歌
+各生成一条查询串，并明确告诉规划器「query 填这一整串，不要只填一句歌词、不要自己另猜歌名」。
+
+行为约束（写进注入文案）：**只在用户明确想听时调用**，不主动放歌、不为同一首歌连续调用。
+若不想参与联动，把 `integration.play_tool_enabled` 设为 `false` 即可，
+注入会退回原来的形态（只提示 `recommend_cv_song` / `cv_song_search`）。
+
+排障：
+
+| 现象 | 处置 |
+|---|---|
+| 贴了歌词但 bot 不放歌 | 先确认注入是否命中：真机日志里应有 `已向规划器注入歌曲信息（prompt/items）` |
+| 注入有了但仍不放歌 | 规划器可能没选中该工具。点歌工具默认在 deferred 池，注入文案已提示先 `tool_search` 检索；也可把 `integration.play_tool_name` 留空并依赖模型自行判断 |
+| 播了但放错歌 | 检查歌曲库里的歌手字段是否为空（`/歌词 歌曲` 看「演唱」）；歌手为空时查询串只有歌名，命中率自然下降 |
 
 ## 氛围选歌（v2.5.0）
 
