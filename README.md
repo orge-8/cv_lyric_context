@@ -471,8 +471,10 @@ python annotate_emotions.py --db $DB
 # 查看覆盖情况（标签分布统计）
 python -c "import sys; from vcpedia_store import SongStore; print(SongStore(sys.argv[1]).emotion_stats())" $DB
 
-# 某首标得不准？清掉重标：
-#   sqlite3 $DB "UPDATE songs SET emotion='' WHERE name='歌名'"
+# 某首标得不准？清掉重标（v2.8.0 起情绪存于标签表，用 CLI 而不是 UPDATE songs 裸 SQL）：
+python migrate_knowledge_db.py $DB --clear-emotion "歌名"
+# 手动打标签
+python migrate_knowledge_db.py $DB --set-emotion "歌名" "温柔|积极"
 ```
 
 标注依据是**整首歌的歌词**（超长歌词保留开头/结尾各 1500 字），
@@ -611,16 +613,92 @@ verify_ssl = false
 | 想抽查剩下那些空歌词条目 | `python list_empty_lyrics.py 30` 列出名字（会标出哪些还没确认过），挑几首跑 `python check_lyrics_parse.py <歌名>` 看是真的没歌词还是解析漏了 |
 | 命令发完没反应 | 见「`/歌词` 没反应怎么办」 |
 
+## 知识库结构（v2.8.0 起）
+
+v2.8.0 之前，曲库是一张 21 列的宽表 `songs`：创作者被平铺成 `lyricist` /
+`composer` / `arranger` / `mixer` / `tuner` / `mastering` / `pv` / `illustrator`
+八个文本列，歌姬、分类、情绪各是一个分隔串。这种结构表达不了
+「一人兼多角色」「一个角色多人」「角色未知」，也没法回答「这位 P 主还写过什么」。
+
+现在改为规范化实体 + 一个同名兼容视图（思路参考中V档案馆 CVSA 的关系模型）：
+
+| 表 | 作用 |
+|---|---|
+| `song` | 歌曲主体：名称、年份、时长、B站 aid/bvid、派生曲 `original_song_id`、软删除 |
+| `credit_role` | 角色字典：UP主 / 作词 / 作曲 / 编曲 / 混音 / 调校 / 母带 / PV / 曲绘 |
+| `artist` | 创作者档案（去重，带 `aliases` 别名） |
+| `song_credit` | **(歌曲, 创作者, 角色)** 三元关系 —— 取代原来 8 个平铺列 |
+| `singer` / `song_singer` | 歌姬档案与演唱关系；`engine` / `voicebank` 允许为空（只知道谁唱、不知道用什么声库是常态） |
+| `lyrics` | 歌词多版本：`language` + `plain_text` + 预留 `ttml`（逐字时间轴）/ `lrc` + `is_translated` |
+| `tag` / `song_tag` | 分类与情绪统一为标签（`kind` 区分，`position` 保序），分类支持 `parent_id` 成树 |
+| `song_external_link` | 网易云 / B站 / VOCADB 等多平台外链 |
+| `song_annotation` | 情绪标注时间戳 |
+| `song_revision` | 元信息修订记录（歌名 / 年份 / 简介变更时可回溯） |
+
+**兼容视图**：`songs` 这个名字仍然可用，列名与顺序与旧 21 列完全一致，
+所以 `SELECT * FROM songs WHERE singers LIKE ?` 这类既有语句无需改动。
+视图用相关标量子查询实现（不是 GROUP BY 派生表），这样 `WHERE id = ?` 能下推到
+基表索引 —— 实测单行读取 0.5ms，比派生表写法快约 30 倍。
+
+**视图只读**：写入一律走 `SongStore`。若让 `UPDATE songs` 反写关系表，重建
+`song_singer` 时会把单独存放的 `engine` 抹掉，所以不提供写代理。
+
+### 迁移
+
+旧库在插件启动时会**自动迁移**（首次打开 `SongStore` 时完成），旧表改名为
+`songs_legacy_v1` 保留以备回退。也可以手工执行，先预览再正式迁移：
+
+```bash
+cd <插件目录>
+
+# 预览：复制到临时文件试跑，报告统计与逐字段校验，不改动原库
+python migrate_knowledge_db.py data/vcpedia_songs.db
+
+# 正式迁移：先做文件级备份，再迁移，并自动校验零丢失
+python migrate_knowledge_db.py data/vcpedia_songs.db --apply
+
+# 确认无误后回收旧表空间
+python migrate_knowledge_db.py data/vcpedia_songs.db --apply --drop-legacy
+
+# 体检：各表规模、各角色覆盖比例、情绪标签分布
+python migrate_knowledge_db.py data/vcpedia_songs.db --stats
+```
+
+迁移已实测：3412 首旧库逐字段零丢失，耗时约 1.7s，库体积仅增约 4%。
+
+> 真机部署时迁移会在首次启动自动发生。稳妥起见可先在真机执行一次
+> `--apply`（会自动备份）再重启 MaiBot。
+
+### 结构升级后新开的能力
+
+除了原有方法，`SongStore` 新增了几个关系型查询：
+
+| 方法 | 用途 |
+|---|---|
+| `credits_of(歌名)` | 取某首歌的分工：`{"lyricist": ["词作A"], "composer": ["曲作B"], ...}` |
+| `singers_of(歌名)` | 取演唱者及其引擎/声库（未知为 `None`） |
+| `songs_by_singer(歌姬)` | 反查某位歌姬唱过的歌 |
+| `songs_by_artist(创作者, 角色)` | 反查某位创作者参与的歌，可限定角色 |
+| `tags_of(歌名, kind)` | 取分类或情绪标签（保序） |
+| `role_breakdown()` / `stats()` | 数据完整度体检 |
+
 ## 本地测试
 
 ```bash
-cd MaiBot插件开发
-python check_plugin.py plugins/cv_lyric_context
+# 知识库结构回归（103 项断言，纯标准库，不依赖 MaiBot SDK）
+python test_vcpedia_schema.py
+
+# 放到 MaiBot 插件工作区里时也可以指定其它副本
+python test_vcpedia_schema.py /path/to/cv_lyric_context
 ```
 
-> 注意：本仓库**不含** `test_context.py`，也没有任何 `test_*.py` / unittest /
-> pytest 用例——「189 项断言」是历史遗留描述，当前版本零自动化测试。
-> 改动核心逻辑（词库索引、上下文注入、内存治理）后请手工回归。
+覆盖：三种历史老库形态（7/18/21 列）的自动迁移、逐字段零丢失、公开 API 语义、
+情绪标签排序、关系型查询，以及新版存储层独有能力（`upsert(conn=)` 连接复用、
+`open_writer`、LIKE 通配符转义、情绪查询只返回 4 列）。
+
+> 注意：本仓库除 `test_vcpedia_schema.py` 外没有更上层的 `test_context.py`
+> 全流程模拟测试——那个夹具在插件开发工作区里。改动核心逻辑（词库索引、
+> 上下文注入、内存治理）后仍建议在开发工作区跑一轮全流程回归。
 
 ## 代码结构
 
@@ -633,7 +711,10 @@ python check_plugin.py plugins/cv_lyric_context
 | `vcpedia_sync.py` | 同步流程：分类枚举、词条解析、入库、熔断 |
 | `vcpedia_wikitext_parser.py` | wikitext -> 结构化创作信息 |
 | `vcpedia_text_clean.py` | wiki 标记清洗（`{{color}}`、`{{ruby}}`、`<ref>`、`[[链接\|文本]]`） |
-| `vcpedia_store.py` | 歌曲库 SQLite 读写（含情绪标签列与方法） |
+| `vcpedia_schema.py` | 知识库结构：规范化实体表 + 角色字典 + `songs` 兼容视图 + 老库自动迁移 |
+| `vcpedia_store.py` | 歌曲库 SQLite 读写（对外 API 不变，内部写规范化表；含关系型查询） |
+| `migrate_knowledge_db.py` | 库迁移与维护 CLI：预览 / 正式迁移 / 校验 / 回收旧表 / 改情绪标签 |
+| `test_vcpedia_schema.py` | 知识库结构回归测试（103 项断言，纯标准库） |
 | `singer_check.py` | 歌手归属校验纯函数（推荐池过滤用，可独立单测） |
 | `emotion_annotate.py` | 情绪标注纯函数件：prompt 构造 + 标签解析（离线脚本与插件内同步标注共用） |
 | `annotate_emotions.py` | 离线批量标注情绪标签脚本（真机跑，`--db` 指向运行时曲库，不走 MaiBot 运行时） |

@@ -1,7 +1,7 @@
 """离线批量标注歌曲情绪标签（v2.5.0 氛围选歌的数据准备）。
 
-对库里「emotion 为空且歌词非空」的歌，取完整歌词调 LLM 打情绪标签，
-写回 songs.emotion（管道分隔，如 甜美|温柔）。断点续跑：标注失败不写列，
+对库里「没有情绪标签且歌词非空」的歌，取完整歌词调 LLM 打情绪标签，
+写入情绪标签（管道分隔，如 甜美|温柔）。断点续跑：标注失败不写标签，
 下轮仍会进队列。纯标准库实现，与 MaiBot 运行时完全解耦——在开发机上跑，
 不占 bot 资源。
 
@@ -18,8 +18,8 @@
     # 3. 全量跑（4000 首约 1.5~2 小时，随时 Ctrl+C，下轮续跑）
     python annotate_emotions.py
 
-    # 重标某首歌：直接清空后重跑
-    #   sqlite3 data/vcpedia_songs.db "UPDATE songs SET emotion='' WHERE name='xx'"
+    # 重标某首歌（v2.8.0 起情绪存于标签表，用 CLI 而不是 UPDATE songs 裸 SQL）
+    python migrate_knowledge_db.py data/vcpedia_songs.db --clear-emotion "歌名"
 
 标签集固定 7 个：甜美、温柔、积极、帅气、搞怪、伤感、愤怒。
 LLM 返回与白名单取交集，交集为空视为失败（下轮重试）。
