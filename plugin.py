@@ -624,9 +624,18 @@ class EmotionSection(PluginConfigBase):
     llm_task: str = Field(
         default="utils",
         description=(
-            "标注用的模型任务名或模型标识（utils / planner / replyer / tool_use，"
-            "也可填具体模型名）。留空走 Host 默认路由——若未给本插件任务配模型，"
-            "会 fallback 到向量模型报 400（见 README「插件 LLM 被路由到 embedding 模型」）"
+            "标注用的模型任务名（MaiBot 1.2.5+：model_task_config 的键，如 utils / planner / replyer）。"
+            "留空则不显式指定，走 SDK 默认任务 utils。"
+            "注意与 llm_model 的区别：任务名指向一套模型配置，模型名指向某个具体模型，"
+            "1.2.5 起两者是不同参数，混用会报「找不到名为 X 的模型」。"
+            "若未给本插件任务配模型，会 fallback 到向量模型报 400（见 README「插件 LLM 被路由到 embedding 模型」）"
+        ),
+    )
+    llm_model: str = Field(
+        default="",
+        description=(
+            "标注用的具体模型名（可选）。留空则使用 llm_task 对应任务所配置的模型；"
+            "需要绕开任务路由、直连某个具体模型时才填"
         ),
     )
     annotate_timeout_ms: int = Field(

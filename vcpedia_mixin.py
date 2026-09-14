@@ -761,6 +761,7 @@ class VCPediaMixin:
                 annotate_on_sync=False,
                 annotate_on_sync_limit=30,
                 llm_task="utils",
+                llm_model="",
                 annotate_timeout_ms=20000,
                 annotate_budget_seconds=180,
             )
@@ -786,7 +787,15 @@ class VCPediaMixin:
         done = fails = 0
         deadline = time.monotonic() + max(1, int(cfg.annotate_budget_seconds))
         timeout_s = max(0.5, int(cfg.annotate_timeout_ms) / 1000.0)
-        task = str(getattr(cfg, "llm_task", "") or "").strip()
+        # MaiBot 1.2.5 起「模型任务名」与「具体模型名」是两个参数（详见 runtime-gotchas §47）：
+        # 旧写法把任务名塞进 model=，升级后会变成「找不到名为 utils 的模型」而整条标注链路失效。
+        llm_kwargs: dict = {}
+        _task = str(getattr(cfg, "llm_task", "") or "").strip()
+        _model = str(getattr(cfg, "llm_model", "") or "").strip()
+        if _task:
+            llm_kwargs["task_name"] = _task
+        if _model:
+            llm_kwargs["model"] = _model
 
         for song in songs:
             if fails >= 3:  # 熔断：连续失败多半是模型路由/鉴权问题，别空转
@@ -801,8 +810,8 @@ class VCPediaMixin:
                 raw = await asyncio.wait_for(
                     self.ctx.llm.generate(
                         build_prompt(name, song.get("lyrics")),
-                        model=task,
                         temperature=0.2,
+                        **llm_kwargs,
                     ),
                     timeout=timeout_s,
                 )
@@ -818,10 +827,13 @@ class VCPediaMixin:
 
         if fails >= 3:
             self.ctx.logger.error(
-                "情绪标注连续失败 3 次，本轮中止。处置三选一："
+                "情绪标注连续失败 3 次，本轮中止（本次 task_name=%r model=%r）。处置三选一："
                 "① 在 model_config.toml 给任务 plugin.%s 配一个文本生成模型；"
-                "② 插件配置 emotion.llm_task 改成 planner / replyer 或具体模型名；"
+                "② 插件配置 emotion.llm_task 填任务名（如 planner / replyer），"
+                "要直连某个具体模型则填 emotion.llm_model；"
                 "③ 不需要就把 emotion.annotate_on_sync 设为 false。",
+                _task,
+                _model,
                 self._plugin_id_for_log(),
             )
         return done, len(songs)
