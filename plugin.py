@@ -79,6 +79,12 @@ _MAX_LYRICS_LRU = 200
 # 单句歌词（如中英混排）被切段后反而匹配不上。
 _SEGMENT_SPLIT = re.compile(r"\s+")
 
+# 增补候选：按常见标点（中英文逗号句号顿号等）切句。场景：歌词句内部带空格时
+# （"坠入深空 追逐自由"），空白切段会把一句歌词切成两半，两半都不在关键词表里
+# （表内 key 是去空格的整句），导致漏检。按标点切出的"句"以标点为界、不受句内
+# 空白影响，清洗后恰好等于表内 key。实测该消息形态下 6 句全部命中。
+_SENTENCE_SPLIT = re.compile(r"[，,。.!！?？；;、\n\r]+")
+
 # Context Item 快照结构版本，取自 MaiBot 的 CONTEXT_ITEM_SCHEMA_VERSION
 CONTEXT_ITEM_SCHEMA_VERSION = 1
 
@@ -1051,14 +1057,14 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
     def record_hit(self, session_id: str, text: str) -> list[str]:
         """清洗文本后查关键词表，命中则登记并返回歌名列表。
 
-        候选 = 整条消息 + 按空白切出的各段。任一候选命中即登记，
-        同一条消息里命中多句歌词会全部登记。
+        候选 = 整条消息 + 按空白切出的各段 + 按标点切出的各句。
+        任一候选命中即登记，同一条消息里命中多句歌词会全部登记。
         """
         self._sweep_stale_sessions()
         cfg = self.config.plugin
         hits: list[tuple[str, str, list[str]]] = []  # (原句, 清洗键, 歌名列表)
         seen_keys: set[str] = set()
-        for candidate in [text, *_SEGMENT_SPLIT.split(text)]:
+        for candidate in [text, *_SEGMENT_SPLIT.split(text), *_SENTENCE_SPLIT.split(text)]:
             key = _clean(candidate)
             if len(key) < cfg.min_line_len or key in seen_keys:
                 continue
