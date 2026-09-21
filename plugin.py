@@ -10,17 +10,21 @@
    - 旧版运行时传 messages，返回 {"role": "system", "content": ...}。
    两条路径同时给出，运行时只会读取自己认识的那个键，互不干扰。
 
-3. 歌词文件收件箱: 把 .txt / .lrc 歌词文件丢进 assets/lyrics_inbox/，
-   插件加载时或收到「/加歌」命令时自动解析入库（写进 assets/user_songs.json），
-   成功后文件归档到 lyrics_inbox/imported/。
+3. 歌词文件收件箱: 把 .txt / .lrc 歌词文件丢进**插件数据目录**下的 lyrics_inbox/，
+   插件加载时或收到「/加歌」命令时自动解析入库（写进同目录的 user_songs.json），
+   成功后文件归档到 lyrics_inbox/imported/、失败的进 lyrics_inbox/failed/。
 
-数据: assets/knowledge_db.db (中文 VOCALOID 歌曲元数据) +
-      assets/song_lyric_keywords.txt (歌词句 -> 歌名 关键词表) +
-      assets/user_songs.json (自定义/导入的歌曲)
+数据: 只读素材在插件目录 assets/ ——
+      assets/knowledge_db.db (中文 VOCALOID 歌曲元数据) +
+      assets/song_lyric_keywords.txt (歌词句 -> 歌名 关键词表)
+      用户数据一律在宿主分配的插件数据目录 (ctx.paths.data_dir) ——
+      user_songs.json (自定义/导入的歌曲)、lyrics_inbox/、vcpedia_songs.db、cookie
+      （源码目录会被更新/重装覆盖，不能放用户数据）
 """
 import asyncio
 import json
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -43,6 +47,8 @@ from lyrics_import import ImportReport
 from vcpedia_mixin import DB_FILE as VCPEDIA_DB_FILE, VCPediaMixin
 from vcpedia_sync import SyncStats
 
+# 随包分发的**只读**素材（曲库元数据 + 关键词表）。用户数据不放这里，
+# 一律走 ctx.paths.data_dir，否则插件更新/重装会覆盖或弄脏用户的歌单。
 ASSET_DIR = Path(__file__).parent / "assets"
 
 _LYRIC_TAIL = re.compile(r"是《(.+)》的歌词\s*$")
@@ -340,13 +346,13 @@ def _load_song_db_into(db_path: Path, index: _AssetIndex,
         conn.close()
 
 
-def _load_user_songs_into(index: _AssetIndex) -> tuple[int, Optional[str]]:
-    """加载 assets/user_songs.json 里的自定义歌曲，返回 (成功加载数, 错误信息)。
+def _load_user_songs_into(index: _AssetIndex, user_dir: Path) -> tuple[int, Optional[str]]:
+    """加载用户数据目录下的 user_songs.json，返回 (成功加载数, 错误信息)。
 
     自定义歌曲优先于基础词库（同名歌词句以自定义歌为准）。
     格式见 README 的"添加新歌"一节。
     """
-    path = ASSET_DIR / "user_songs.json"
+    path = Path(user_dir) / lyrics_import.SONGS_FILE_NAME
     if not path.exists():
         return 0, None
     try:
@@ -379,6 +385,91 @@ def _load_user_songs_into(index: _AssetIndex) -> tuple[int, Optional[str]]:
     return loaded, None
 
 
+def _migrate_legacy_user_data(data_dir: str) -> list[tuple[str, str]]:
+    """把旧版落在插件源码目录里的用户数据搬到插件数据目录（一次性，幂等）。
+
+    2.8.2 及以前，收件箱与自定义歌单写在 `assets/` 下；那里会随插件整目录替换
+    被覆盖或弄脏，所以 2.8.3 起统一挪到 `ctx.paths.data_dir`。这里负责搬迁存量：
+
+    - 数据目录里**已经有**同名内容时不覆盖（用户可能已在新位置改过）；
+    - 搬不动的（插件目录只读 / 权限不足）只记日志，不阻断加载；
+    - 旧目录搬空后删掉，免得下次更新又冒出来。
+
+    返回 [(级别, 文案)]，与 _build_asset_index 的日志同格式。
+    """
+    logs: list[tuple[str, str]] = []
+    try:
+        base = Path(data_dir)
+    except (TypeError, ValueError):
+        return logs
+    try:
+        if base.resolve() == ASSET_DIR.resolve():
+            return logs  # 数据目录就是插件目录，没有可搬的
+    except OSError:
+        pass
+
+    # 1) 自定义歌单
+    old_songs = ASSET_DIR / lyrics_import.SONGS_FILE_NAME
+    new_songs = base / lyrics_import.SONGS_FILE_NAME
+    if old_songs.is_file() and not new_songs.exists():
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(old_songs), str(new_songs))
+            except OSError:
+                # 插件目录只读时 move 删不掉源文件，退化为复制（源留着，不阻断）
+                shutil.copy2(str(old_songs), str(new_songs))
+            logs.append((
+                "info",
+                f"用户数据迁移: 自定义歌单 {old_songs} → {new_songs}"
+                "（旧版把它放在插件目录里，更新插件会丢，已搬到数据目录）",
+            ))
+        except OSError as exc:
+            logs.append((
+                "warning",
+                f"自定义歌单迁移失败（{exc}），仍从旧位置 {old_songs} 读取；"
+                f"建议手动移到 {new_songs}",
+            ))
+
+    # 2) 收件箱（含 imported/ failed/ 归档）
+    old_inbox = ASSET_DIR / lyrics_import.INBOX_DIR_NAME
+    new_inbox = base / lyrics_import.INBOX_DIR_NAME
+    if old_inbox.is_dir():
+        moved: list[str] = []
+        stuck: list[str] = []
+        try:
+            new_inbox.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return logs + [("warning", f"收件箱迁移失败（{exc}），仍使用旧位置 {old_inbox}")]
+        for entry in sorted(old_inbox.iterdir()):
+            target = new_inbox / entry.name
+            if target.exists():
+                stuck.append(entry.name)  # 新位置已有同名内容，不覆盖
+                continue
+            try:
+                shutil.move(str(entry), str(target))
+                moved.append(entry.name)
+            except OSError:
+                stuck.append(entry.name)
+        if moved:
+            logs.append((
+                "info",
+                f"用户数据迁移: 收件箱 {old_inbox} → {new_inbox}（{len(moved)} 项）",
+            ))
+        if stuck:
+            logs.append((
+                "warning",
+                f"收件箱里这些项未迁移（新位置已有同名或权限不足），仍留在 {old_inbox}: "
+                + ", ".join(stuck[:5]),
+            ))
+        else:
+            try:
+                old_inbox.rmdir()  # 搬空了就把旧目录收掉
+            except OSError:
+                pass
+    return logs
+
+
 def _build_asset_index(raw_extra_dbs: str, data_dir: str) -> tuple[_AssetIndex, list[tuple[str, str]]]:
     """构建歌词识别索引快照（knowledge_db + 关键词文件 + 自定义歌单 + 外部库）。
 
@@ -391,6 +482,9 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str) -> tuple[_AssetIndex, 
     index = _AssetIndex()
     logs: list[tuple[str, str]] = []
     intern: dict[str, str] = {}
+
+    # 旧版把用户数据放在插件目录里，先搬走再读（幂等，无存量时只是一次 exists 判断）
+    logs.extend(_migrate_legacy_user_data(data_dir))
 
     db_path = ASSET_DIR / "knowledge_db.db"
     txt_path = ASSET_DIR / "song_lyric_keywords.txt"
@@ -451,7 +545,7 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str) -> tuple[_AssetIndex, 
         elif filled:
             logs.append(("info", f"基础词库歌词补漏: {filled} 首歌的歌词已补进索引"))
 
-    user_count, err = _load_user_songs_into(index)
+    user_count, err = _load_user_songs_into(index, Path(data_dir))
     if err:
         logs.append(("warning", err))
     elif user_count:
@@ -501,7 +595,7 @@ class PluginSection(PluginConfigBase):
     )
     auto_import_inbox: bool = Field(
         default=True,
-        description="插件加载时自动导入 assets/lyrics_inbox 里的歌词文件",
+        description="插件加载时自动导入插件数据目录下 lyrics_inbox/ 里的歌词文件",
     )
     max_lines_per_song: int = Field(
         default=lyrics_import.DEFAULT_MAX_LINES,
@@ -891,12 +985,16 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         return self._db_meta.get(_clean(song_name), ("", ""))
 
     def _run_import(self) -> Optional[ImportReport]:
-        """扫描 assets/lyrics_inbox 并导入，失败时返回 None（已记日志）。"""
-        inbox = ASSET_DIR / lyrics_import.INBOX_DIR_NAME
+        """扫描插件数据目录下的 lyrics_inbox 并导入，失败时返回 None（已记日志）。"""
+        user_dir = Path(self.ctx.paths.data_dir)
+        # 幂等：加载期已经搬过的话这次只是一次 exists 判断
+        for level, message in _migrate_legacy_user_data(str(user_dir)):
+            (self.ctx.logger.warning if level == "warning" else self.ctx.logger.info)(message)
+        inbox = user_dir / lyrics_import.INBOX_DIR_NAME
         try:
             inbox.mkdir(parents=True, exist_ok=True)
             report = lyrics_import.run_import(
-                ASSET_DIR,
+                user_dir,
                 min_line_len=self.config.plugin.min_line_len,
                 max_lines=self.config.plugin.max_lines_per_song,
                 meta_lookup=self._lookup_db_meta,
@@ -952,7 +1050,7 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
 
     @Command(
         "import_lyrics",
-        description="扫描歌词收件箱 assets/lyrics_inbox 并扩充歌曲库",
+        description="扫描歌词收件箱 lyrics_inbox/（在插件数据目录下）并扩充歌曲库",
         pattern=r"^\s*[/／]\s*(?:加歌|导入歌词|扫描歌词|歌词导入)(?:\s.*)?$",
         aliases=["/加歌", "/导入歌词", "/扫描歌词"],
     )
@@ -977,9 +1075,10 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             if report is None:
                 text = "歌词导入失败，请查看插件日志。"
             elif not report.results:
+                inbox = Path(self.ctx.paths.data_dir) / lyrics_import.INBOX_DIR_NAME
                 text = (
                     "收件箱里没有待导入的歌词文件。\n"
-                    f"把 .txt 或 .lrc 歌词文件放进 {lyrics_import.INBOX_DIR_NAME}/ 再试一次。"
+                    f"把 .txt 或 .lrc 歌词文件放进这个目录再试一次：\n{inbox}"
                 )
             else:
                 text = (

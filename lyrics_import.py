@@ -1,8 +1,14 @@
-"""歌词文件收件箱 -> 自定义歌单（assets/user_songs.json）
+"""歌词文件收件箱 -> 自定义歌单（user_songs.json）
 
-用法: 把 .txt / .lrc 歌词文件丢进 assets/lyrics_inbox/，插件加载时或收到
-「/加歌」命令时会自动扫描导入，成功的文件移到 lyrics_inbox/imported/，
-失败的移到 lyrics_inbox/failed/（同一文件不会反复重试）。
+**路径一律由一个「用户数据目录」推导**（插件运行时传 `ctx.paths.data_dir`，
+不在插件源码目录里落任何用户数据——那样更新 / 重装插件会覆盖或弄脏数据）：
+
+- `<user_dir>/lyrics_inbox/`            收件箱，丢 .txt / .lrc 进去
+- `<user_dir>/lyrics_inbox/imported/`   导入成功的归档
+- `<user_dir>/lyrics_inbox/failed/`     导入失败的归档（同一文件不会反复重试）
+- `<user_dir>/user_songs.json`          自定义歌单
+
+用法: 把歌词文件丢进收件箱，插件加载时或收到「/加歌」命令时自动扫描导入。
 
 歌名取值顺序:
 1. 文件名（去掉扩展名与 " (1)" 之类的副本后缀）；
@@ -340,9 +346,9 @@ def parse_lyrics_file(
     ), ""
 
 
-def load_songs(asset_dir: Path) -> list[dict[str, Any]]:
-    """读取 assets/user_songs.json，格式异常时当作空歌单。"""
-    path = asset_dir / SONGS_FILE_NAME
+def load_songs(user_dir: Path) -> list[dict[str, Any]]:
+    """读取用户数据目录下的 user_songs.json，格式异常时当作空歌单。"""
+    path = user_dir / SONGS_FILE_NAME
     if not path.exists():
         return []
     try:
@@ -352,10 +358,10 @@ def load_songs(asset_dir: Path) -> list[dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
-def save_songs(asset_dir: Path, songs: list[dict[str, Any]]) -> None:
+def save_songs(user_dir: Path, songs: list[dict[str, Any]]) -> None:
     """原子写回 user_songs.json（先写临时文件再替换）。"""
-    asset_dir.mkdir(parents=True, exist_ok=True)
-    path = asset_dir / SONGS_FILE_NAME
+    user_dir.mkdir(parents=True, exist_ok=True)
+    path = user_dir / SONGS_FILE_NAME
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(
         json.dumps(songs, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -426,25 +432,27 @@ def flatten_names(value: str) -> str:
 
 
 def run_import(
-    asset_dir: Path,
+    user_dir: Path,
     min_line_len: int = 4,
     max_lines: int = DEFAULT_MAX_LINES,
     meta_lookup: Callable[[str], tuple[str, str]] | None = None,
 ) -> ImportReport:
     """扫描收件箱 -> 解析 -> 合并进 user_songs.json -> 归档文件。
 
+    user_dir: 用户数据目录（插件运行时传 ctx.paths.data_dir）。收件箱与歌单
+    都在它下面，插件源码目录里不留任何用户数据。
     meta_lookup: 按歌名查 (歌手, P主) 的回调，用于给库里已有的歌自动补元数据。
     """
-    asset_dir = Path(asset_dir)
-    inbox = asset_dir / INBOX_DIR_NAME
+    user_dir = Path(user_dir)
+    inbox = user_dir / INBOX_DIR_NAME
     imported_dir = inbox / IMPORTED_DIR_NAME
     failed_dir = inbox / FAILED_DIR_NAME
 
     files = scan_inbox(inbox)
     if not files:
-        return ImportReport(songs=load_songs(asset_dir))
+        return ImportReport(songs=load_songs(user_dir))
 
-    songs = load_songs(asset_dir)
+    songs = load_songs(user_dir)
     results: list[FileResult] = []
 
     for path in files:
@@ -473,7 +481,7 @@ def run_import(
         _archive(path, imported_dir)
 
     if any(r.ok for r in results):
-        save_songs(asset_dir, songs)
+        save_songs(user_dir, songs)
     return ImportReport(results=results, songs=songs)
 
 

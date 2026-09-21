@@ -3,7 +3,10 @@ __pycache__/
 data/
 /config.toml
 /annotate_config.json
-assets/lyrics_inbox/
-assets/user_songs.json
 config_back/
 /source_dump.txt
+
+# 用户数据现在落在插件数据目录（ctx.paths.data_dir），不再写进源码目录。
+# 下面两行保留给 2.8.2 及以前的旧位置，防止回滚到老版本时误提交：
+assets/lyrics_inbox/
+assets/user_songs.json

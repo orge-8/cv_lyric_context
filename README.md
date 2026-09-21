@@ -14,7 +14,7 @@
 |---|---|---|
 | 内置基础库 | 3412 首旧快照，57227 句歌词 | 自带 |
 | VCPedia 同步 | 4000+ 首，含完整创作信息与歌词 | `/歌词 同步`（后台爬取） |
-| 歌词文件 | 你自己放的歌 | 丢进 `assets/lyrics_inbox/`，`/加歌` |
+| 歌词文件 | 你自己放的歌 | 丢进 `lyrics_inbox/`（插件数据目录下），`/加歌` |
 
 ## 快速开始
 
@@ -79,12 +79,12 @@
                               · 旧版运行时传 messages -> 追加 {"role": "system"}
                             两条链路各自幂等（含【歌词识别】标记就不重复叠加）
 
-歌词文件 "某歌.txt"  ->  放进 assets/lyrics_inbox/
+歌词文件 "某歌.txt"  ->  放进 lyrics_inbox/（插件数据目录下）
    │                     （/加歌 命令或插件加载时自动扫描）
    ├─ 解析: 去 LRC 时间轴与元数据标签行，歌名取文件名 / [ti:] / 首行
    ├─ 过滤: 含汉字少于 2 个的句子丢弃
    ├─ 补元数据: 文件写了用文件的，没写就反查基础库与 VCPedia 库
-   ├─ 合并写入 assets/user_songs.json（同名歌合并歌词）
+   ├─ 合并写入同目录的 user_songs.json（同名歌合并歌词）
    ├─ 立即并入内存词库（不用重载插件）
    └─ 归档: 成功 -> imported/，失败 -> failed/
 
@@ -116,33 +116,53 @@
 
 ## 数据
 
+**只读素材**（随仓库分发，在插件目录 `assets/` 下；插件只会读它，不会写）
+
 | 文件 | 说明 |
 |---|---|
 | `assets/knowledge_db.db` | 内置基础库，3412 首中V歌曲（歌名、P主、歌手） |
 | `assets/song_lyric_keywords.txt` | 歌词句 -> 歌名 关键词表，57227 句（匹配源） |
-| `assets/user_songs.json` | 歌词文件收件箱导入的歌 |
-| `data/vcpedia_songs.db` | VCPedia 同步下来的歌（SQLite，`songs` + `sync_meta` 表） |
-| `data/anubis_cookies.txt` | 反爬 cookie，失效自动重解，可安全删除 |
+
+**用户数据**（全部落在宿主分配给本插件的**插件数据目录**，即 `ctx.paths.data_dir`）
+
+| 路径 | 说明 |
+|---|---|
+| `lyrics_inbox/` | 歌词文件收件箱，含 `imported/` `failed/` 两个归档子目录 |
+| `user_songs.json` | 歌词文件收件箱导入的自定义歌单 |
+| `vcpedia_songs.db` | VCPedia 同步下来的歌（SQLite，`songs` + `sync_meta` 表） |
+| `anubis_cookies.txt` | 反爬 cookie，失效自动重解，可安全删除 |
+
+> **为什么用户数据不在插件目录里**：整目录更新或重装插件会把 `assets/` 覆盖掉，
+> 用户的歌单和收件箱会一起丢。所以这些路径全部由数据目录推导，插件源码目录保持只读。
+> 实际路径可在 WebUI 插件详情页看到；本文档里 `lyrics_inbox/` 之类的相对路径都指它。
+>
+> 2.8.2 及以前放在 `assets/lyrics_inbox/`、`assets/user_songs.json` 的存量数据，
+> 2.8.3 起在插件加载时**自动搬迁到数据目录**并打日志（数据目录已有同名内容时不覆盖，
+> 搬不动只记 warning 不阻断加载），不需要手工处理。
 
 `song_lyric_keywords.txt` 加载时会过滤含汉字少于 2 个的句子（纯数字/纯英文），
 避免圆周率类歌曲的数字串误命中。
 
-`data/` 目录已在 `.gitignore` 中排除，不会入库。
+旧位置（`assets/lyrics_inbox/`、`assets/user_songs.json`）仍保留在 `.gitignore` 里，
+以防回滚到老版本时被误提交。
 
 ## 添加新歌：丢歌词文件进收件箱
 
-**只需要一个歌词文件**，`.txt` 或 `.lrc` 都行，放进 `assets/lyrics_inbox/`：
+**只需要一个歌词文件**，`.txt` 或 `.lrc` 都行，放进插件数据目录下的 `lyrics_inbox/`：
 
 ```
-assets/lyrics_inbox/
-  ├── 普通朋友.txt          <- 放这里
-  ├── 千本樱.lrc            <- LRC 也行
-  ├── imported/             <- 导入成功后自动归档到这里
-  └── failed/               <- 导入失败的文件放这里，不会反复重试
+<插件数据目录>/
+  └── lyrics_inbox/
+      ├── 普通朋友.txt          <- 放这里
+      ├── 千本樱.lrc            <- LRC 也行
+      ├── imported/             <- 导入成功后自动归档到这里
+      └── failed/               <- 导入失败的文件放这里，不会反复重试
 ```
+
+找不到数据目录时，在 QQ 里发一次 `/加歌`——收件箱为空时插件会把**完整路径**回给你。
 
 然后在 QQ 里发 **`/加歌`**（`/导入歌词`、`/扫描歌词` 同义），插件扫描收件箱、
-把歌写进 `assets/user_songs.json`，并回复导入结果：
+把歌写进同目录的 `user_songs.json`，并回复导入结果：
 
 ```
 歌词导入完成：成功 2 个，失败 0 个。
@@ -173,8 +193,8 @@ assets/lyrics_inbox/
 会有 `歌词文件已入库: …`），只是结果没发出来；此时插件会退回让 bot 自己接一句话，
 不会让你完全看不到反馈。
 
-不依赖命令的退路：歌词文件放进 `assets/lyrics_inbox/` 后**重载插件或重启 MaiBot**，
-加载时会自动导入，日志里会有 `歌词文件已入库: …`。
+不依赖命令的退路：歌词文件放进 `lyrics_inbox/`（插件数据目录下）后**重载插件或重启
+MaiBot**，加载时会自动导入，日志里会有 `歌词文件已入库: …`。
 
 ### 歌名怎么来的
 
@@ -226,7 +246,7 @@ assets/lyrics_inbox/
 - 库里的歌手可能带换行（如 `言和\n洛天依`），注入时会压成「演唱：言和、洛天依」
 - 库里没有的歌就留空，注入时不加空括号
 
-想改已经导入过的歌，直接编辑 `assets/user_songs.json` 的 `singers` / `uploader` 字段。
+想改已经导入过的歌，直接编辑数据目录下 `user_songs.json` 的 `singers` / `uploader` 字段。
 
 ### 歌词文件怎么处理
 
@@ -240,7 +260,7 @@ assets/lyrics_inbox/
 
 同名歌不会重复添加，新歌词会**合并**进已有条目。
 
-### 也可以直接编辑 `assets/user_songs.json`
+### 也可以直接编辑 `user_songs.json`（在插件数据目录下）
 
 手改、批量改时用这个：
 
@@ -269,10 +289,13 @@ assets/lyrics_inbox/
 | 入站 | 消息正文 | 只在本进程内存里匹配；不写文件、不发网络 |
 | 出站 | 歌名 / 分类名 / 词条名 | 仅在你主动触发同步或使用查询工具时，请求 `crawler.base_url`（默认 <https://vcpedia.cn>，MediaWiki 公开站点）。请求里**不含**聊天记录、QQ 号、群号、图片 |
 | 出站 | 歌名 + 歌词 + 固定 prompt | `emotion.annotate_on_sync` 与 `recommend_cv_song` 走宿主的 `llm.generate` 能力，由**你自己配置的模型服务商**处理；插件不直连任何模型 API、不持有 API key |
-| 本地落盘 | 曲库、cookie 缓存 | 均在宿主给的插件数据目录（`ctx.paths.data_dir`）下；`data/anubis_cookies.txt` 只用于通过 VCPedia 的反爬校验，可随时删除 |
+| 本地落盘 | 收件箱、自定义歌单、曲库、cookie 缓存 | **全部在宿主给的插件数据目录**（`ctx.paths.data_dir`）下；`anubis_cookies.txt` 只用于通过 VCPedia 的反爬校验，可随时删除 |
 
 其余边界：
 
+- **插件源码目录只读**：`assets/` 里只有随包分发的素材（曲库元数据、关键词表），
+  插件不往那儿写任何用户数据——整目录更新/重装插件会覆盖那些文件。
+  用户的收件箱与歌单统一落在插件数据目录，路径由 `ctx.paths.data_dir` 推导。
 - 插件**不读宿主的数据库或日志**，也不读其它插件的文件。`sqlite3` 只用在自己数据目录下的运行时曲库、随仓库分发的只读素材库 `assets/knowledge_db.db`，以及你在 `plugin.extra_song_dbs` 里显式指定的外部曲库上——素材库与外部曲库一律以 `mode=ro` 只读打开。
 - 不修改宿主的任何文件，也不改动其它插件或适配器的组件开关状态；配置读写交给宿主的配置管理层，插件不自己写回 `config.toml`。
 - 仓库内不含任何凭据。离线批量标注脚本（`annotate_emotions.py`）的 key 从**环境变量**读取，`annotate_config.json` 已在 `.gitignore` 中；`config.toml` 由宿主运行时生成，同样不入库。
