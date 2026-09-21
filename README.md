@@ -48,6 +48,14 @@
 
 聊天里直接问也行，LLM 会自动调用 `search_vcpedia_song` / `get_vcpedia_lyrics`。
 
+> **重任务命令默认关闭。** `/歌词 同步`、`/歌词 补歌词`、`/歌词 重抓` 会向 VCPedia
+> 连续发起成百上千次请求，因此要先在插件配置 `crawler.sync_admin_ids` 里填入你的
+> QQ 号才能触发（多个用英文逗号分隔）；没填时这几条命令一律拒绝并提示去配置。
+> 本机控制台（宿主标记 `is_local_operator` 的调用）默认不受限，可用
+> `crawler.allow_local_operator = false` 一并纳入白名单校验。
+> `/歌词`、`/歌词 状态`、`/歌词 搜索`、`/歌词 歌曲`、`/歌词 取消` 都是本地只读操作，
+> 任何人都能用。
+
 ## 工作原理
 
 ```
@@ -252,6 +260,24 @@ assets/lyrics_inbox/
 **生效方式**：插件在 `on_load` 时读取，所以在 MaiBot 里**重载插件**
 （WebUI 关掉再打开）或重启 MaiBot 即可，无需重装。同名歌词句以自定义歌优先。
 
+## 数据流向与隐私
+
+**聊天内容不出本地。** 歌词识别全程在进程内做关键词匹配，不落盘、不上传。
+
+| 方向 | 内容 | 去向与条件 |
+|---|---|---|
+| 入站 | 消息正文 | 只在本进程内存里匹配；不写文件、不发网络 |
+| 出站 | 歌名 / 分类名 / 词条名 | 仅在你主动触发同步或使用查询工具时，请求 `crawler.base_url`（默认 <https://vcpedia.cn>，MediaWiki 公开站点）。请求里**不含**聊天记录、QQ 号、群号、图片 |
+| 出站 | 歌名 + 歌词 + 固定 prompt | `emotion.annotate_on_sync` 与 `recommend_cv_song` 走宿主的 `llm.generate` 能力，由**你自己配置的模型服务商**处理；插件不直连任何模型 API、不持有 API key |
+| 本地落盘 | 曲库、cookie 缓存 | 均在宿主给的插件数据目录（`ctx.paths.data_dir`）下；`data/anubis_cookies.txt` 只用于通过 VCPedia 的反爬校验，可随时删除 |
+
+其余边界：
+
+- 插件**不读宿主的数据库或日志**，也不读其它插件的文件。`sqlite3` 只用在自己数据目录下的运行时曲库、随仓库分发的只读素材库 `assets/knowledge_db.db`，以及你在 `plugin.extra_song_dbs` 里显式指定的外部曲库上——素材库与外部曲库一律以 `mode=ro` 只读打开。
+- 不修改宿主的任何文件，也不改动其它插件或适配器的组件开关状态；配置读写交给宿主的配置管理层，插件不自己写回 `config.toml`。
+- 仓库内不含任何凭据。离线批量标注脚本（`annotate_emotions.py`）的 key 从**环境变量**读取，`annotate_config.json` 已在 `.gitignore` 中；`config.toml` 由宿主运行时生成，同样不入库。
+- `verify_ssl = false` 默认关闭（默认值 `true`）；只有自己搭了中间人代理、又不想配 `ca_bundle` 时才该打开，插件会在打开时打 warning 日志。详见「公司网络 / 安全软件导致证书错误」。
+
 ## VCPedia 同步
 
 ### 同步下来的数据怎么用
@@ -307,15 +333,18 @@ categories = "Category:洛天依歌曲,Category:殿堂曲,Category:传说曲"
 2. **换分类是增量不是替换**。已有的歌不会删，新分类的歌追加进同一个
    `data/vcpedia_songs.db`。想同时保留多个歌手就写成逗号分隔的列表，别来回换。
 
-`plugin.extra_song_dbs` 可以额外接别的 SQLite（相对 MaiBot 根目录，多个用英文逗号分隔）。
+`plugin.extra_song_dbs` 可以额外接别的 SQLite（多个用英文逗号分隔）。
 库里只要有 `songs(name, singers, uploader, lyrics)` 四列就能用（多出的列忽略）：
 
 ```toml
 [plugin]
-extra_song_dbs = "data/我的歌库.db"
+# 相对路径按本插件的数据目录解析（即宿主给这个插件的目录）
+extra_song_dbs = "我的歌库.db"
+# 也可以直接写绝对路径
+# extra_song_dbs = "D:/songlibs/我的歌库.db"
 ```
 
-留空则只加载内置爬虫同步下来的库。手填的路径必须落在 MaiBot 根目录内，
+留空则只加载内置爬虫同步下来的库。相对路径不允许越出插件数据目录，
 写成 `../../` 之类越界的会被拒绝并记日志。
 
 ## 配置（config.toml，Runner 自动生成）
@@ -331,7 +360,7 @@ extra_song_dbs = "data/我的歌库.db"
 | `plugin.inject_full_staff` | true | 注入调教/混音/PV/曲绘等完整 STAFF |
 | `plugin.auto_import_inbox` | true | 插件加载时自动导入 `lyrics_inbox/` 里的歌词文件 |
 | `plugin.max_lines_per_song` | 2000 | 单个歌词文件最多入库的行数 |
-| `plugin.extra_song_dbs` | 空 | 额外的歌曲库（SQLite）路径，留空只用内置爬虫同步下来的库 |
+| `plugin.extra_song_dbs` | 空 | 额外的歌曲库（SQLite）路径（相对插件数据目录或绝对路径），留空只用内置爬虫同步下来的库 |
 | `plugin.max_results` | 5 | 搜索歌曲时最多返回几条 |
 | `plugin.detail_lyric_lines` | 30 | `/歌词 歌曲` 展示的歌词行数（0 = 不展示） |
 | `plugin.lyric_preview_chars` | 120 | 工具返回歌词时的预览字数 |
@@ -343,6 +372,8 @@ extra_song_dbs = "data/我的歌库.db"
 | `crawler.max_fail` | 30 | 连续失败达到该次数时提前中止同步 |
 | `crawler.sync_batch_limit` | 0 | 单次同步最多抓取多少首，`0` 表示不限 |
 | `crawler.allow_sync_command` | true | 是否允许 `/歌词 同步` 触发同步 |
+| `crawler.sync_admin_ids` | 空 | 允许触发 `/歌词 同步` `/歌词 补歌词` `/歌词 重抓` 的 QQ 号（英文逗号分隔）。**留空 = 谁都不能触发**，见「命令」一节 |
+| `crawler.allow_local_operator` | true | 是否放行本机控制台（宿主标记 `is_local_operator` 的调用）；关掉后本机也要走上面的白名单 |
 | `crawler.refill_cooldown_days` | 7 | `/歌词 补歌词` 跳过多少天内已确认无歌词的条目，`0` 表示每次都重抓 |
 | `crawler.verify_ssl` | true | 是否校验 SSL 证书（见下） |
 | `crawler.ca_bundle` | 空 | CA 证书文件路径（PEM），用于有 TLS 中间人的网络 |
@@ -490,32 +521,29 @@ prompt 要求「不要因为单句歌词而改变整体判断」，temperature 0
 
 **第一步：搞清楚是哪张证书**
 
-在**跑 MaiBot 的那台机器**上执行（用 MaiBot 同一个 Python）：
+在**跑 MaiBot 的那台机器**上打开 <https://vcpedia.cn> → 地址栏锁图标 →
+「连接是安全的」→ 证书图标 →「详细信息」/「证书路径」，
+看这条链**最顶层**那张是谁：
+
+- 最顶层是系统内置的公共 CA（`DigiCert`、`ISRG Root X1` 之类）→ 链路正常，
+  证书报错另有原因；
+- 最顶层是代理 / 安全软件 / 公司网关的名字（`TestCorp Proxy Root CA` 之类）→
+  链路里被插了一层，**那张就是你要找的根证书**。
+
+不想开浏览器，可以用 openssl 反查签发者（Git Bash 自带）：
 
 ```bash
-python find_root_ca.py                    # 诊断 vcpedia.cn
-python find_root_ca.py --host baidu.com   # 换别的站确认是不是全局现象
+# 被中间人替换时，这里会显示代理 CA 的名字而不是公共 CA
+openssl s_client -connect vcpedia.cn:443 -servername vcpedia.cn </dev/null 2>/dev/null \
+  | openssl x509 -noout -subject -issuer
 ```
-
-它会连一次站点（不校验证书）并打印：
-
-```
-目标站点 : vcpedia.cn:443
-证书主体 : commonName=vcpedia.cn
-证书签发者: commonName=TestCorp Proxy Root CA, organizationName=TestCorp
-
->>> 这张证书由另一张 CA 签发，说明链路里多了一层。
->>> 要找的是它的【签发者】那张证书。
-```
-
-那个**签发者**就是要找的证书名，脚本会把后面的导出步骤一并打印出来。
 
 **第二步：导出并填进配置**
 
 1. `Win + R` → `certmgr.msc` 回车
 2. 展开「受信任的根证书颁发机构」→「证书」
    （找不到就去「中间证书颁发机构」里再找一遍）
-3. 按「颁发给」排序，搜第一步拿到的签发者名字
+3. 按「颁发给」排序，搜第一步拿到的那个名字
 4. 右键 → 所有任务 → 导出 → 选 **Base64 编码 X.509 (.CER)**
 5. 存好后在 `config.toml` 里填：
 
@@ -526,10 +554,6 @@ ca_bundle = "C:/mai/proxy-root-ca.cer"
 
 `.cer` 和 `.pem` 内容一样（都是 Base64 PEM），改不改后缀都行。
 
-**用浏览器看也行**：在那台机器上打开 <https://vcpedia.cn> → 地址栏锁图标 →
-「连接是安全的」→ 证书图标 →「详细信息」/「证书路径」，最顶层那张就是根，
-可以「导出」或「复制到文件」。
-
 如果代理是本机软件，直接去它那儿拿更快：
 
 | 软件 | 位置 |
@@ -537,7 +561,7 @@ ca_bundle = "C:/mai/proxy-root-ca.cer"
 | Fiddler | Tools → Options → HTTPS → Actions → Export Root Certificate to Desktop |
 | Charles | Help → SSL Proxying → Save Charles Root Certificate |
 | mitmproxy | `~/.mitmproxy/mitmproxy-ca-cert.pem` |
-| Clash Verge | 设置里一般有「系统代理 CA」；找不到就用 `find_root_ca.py` 反查 |
+| Clash Verge | 设置里一般有「系统代理 CA」；找不到就用上面的 `openssl` 命令反查 |
 
 **临时方案：关掉校验**
 
@@ -546,7 +570,7 @@ ca_bundle = "C:/mai/proxy-root-ca.cer"
 verify_ssl = false
 ```
 
-这这会跳过证书链校验，**存在被中间人窃听的风险**。只在确认那个代理是你自己的
+这会跳过证书链校验，**存在被中间人窃听的风险**。只在确认那个代理是你自己的
 （公司网关、本机安全软件）时才用，公网上不要开。插件关闭校验时会打一条 warning 日志。
 
 `ca_bundle` 指向的文件不存在或格式非法时，会自动回退到系统证书并记日志，不会让插件起不来。
@@ -702,23 +726,37 @@ python test_vcpedia_schema.py /path/to/cv_lyric_context
 
 ## 代码结构
 
+**插件运行时**（MaiBot 只加载 `plugin.py`，其余由它 import）
+
 | 文件 | 职责 |
 |---|---|
 | `plugin.py` | 入口：配置模型、生命周期、歌词识别与注入、`/加歌` |
 | `lyrics_import.py` | 歌词文件收件箱的解析与导入（纯标准库，可单独测） |
-| `vcpedia_mixin.py` | VCPedia 歌曲库能力：`/歌词` 系列命令 + 两个 LLM 工具 |
+| `vcpedia_mixin.py` | VCPedia 歌曲库能力：`/歌词` 系列命令 + 三个 LLM 工具（`search_vcpedia_song`、`get_vcpedia_lyrics`、`recommend_cv_song`） |
 | `vcpedia_client.py` | Anubis PoW 解题 + MediaWiki API 取 wikitext |
 | `vcpedia_sync.py` | 同步流程：分类枚举、词条解析、入库、熔断 |
 | `vcpedia_wikitext_parser.py` | wikitext -> 结构化创作信息 |
 | `vcpedia_text_clean.py` | wiki 标记清洗（`{{color}}`、`{{ruby}}`、`<ref>`、`[[链接\|文本]]`） |
 | `vcpedia_schema.py` | 知识库结构：规范化实体表 + 角色字典 + `songs` 兼容视图 + 老库自动迁移 |
 | `vcpedia_store.py` | 歌曲库 SQLite 读写（对外 API 不变，内部写规范化表；含关系型查询） |
+| `assets/knowledge_db.db`<br>`assets/song_lyric_keywords.txt` | 内置歌曲元数据库与歌词关键词表（只读素材） |
+
+**辅助脚本**（不注册任何组件、不参与插件运行，仅在排障或批量维护时手动执行；
+放在仓库根目录是为了能直接 `import` 上面的运行时模块）
+
+| 文件 | 职责 |
+|---|---|
 | `migrate_knowledge_db.py` | 库迁移与维护 CLI：预览 / 正式迁移 / 校验 / 回收旧表 / 改情绪标签 |
+| `check_lyrics_parse.py` | 诊断单个词条的歌词解析过程：`python check_lyrics_parse.py <歌名>` |
+| `list_empty_lyrics.py` | 列出库内「歌词为空」的条目，供人工抽查是「本来没歌词」还是「解析漏了」 |
+| `repro_shanyaoluyuan.py` | 本地复现《山遥路远》那条解析管线的固定用例 |
 | `test_vcpedia_schema.py` | 知识库结构回归测试（103 项断言，纯标准库） |
 | `singer_check.py` | 歌手归属校验纯函数（推荐池过滤用，可独立单测） |
 | `emotion_annotate.py` | 情绪标注纯函数件：prompt 构造 + 标签解析（离线脚本与插件内同步标注共用） |
-| `annotate_emotions.py` | 离线批量标注情绪标签脚本（真机跑，`--db` 指向运行时曲库，不走 MaiBot 运行时） |
-| `find_root_ca.py` | 诊断脚本：有 TLS 中间人时，查出该信任哪张根证书（不是插件的一部分，单独跑） |
+| `annotate_emotions.py` | 离线批量标注情绪标签脚本（读环境变量里的 key，`--db` 指向运行时曲库，不走 MaiBot 运行时） |
+| `run_annotate.bat` | Windows 双击启动器：把 key / 库路径 / 端点填好后调用上面的脚本 |
+
+> 这些脚本都不接受来自聊天消息的输入，也不会被 `plugin.py` 调用。
 
 `VCPediaMixin` 以多继承混入主类（`class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin)`），
 实测 MaiBot SDK 能正确注册继承来的 `@Command` / `@Tool`，不用把代码复制进 `plugin.py`。

@@ -204,15 +204,29 @@ class VCPediaMixin:
     def _sync_denied(self, kwargs: dict) -> str:
         """重任务命令的管理员校验。返回非空表示拒绝，并直接作为回复文案。
 
-        只在配置了 crawler.sync_admin_ids 时生效；取不到发送者标识时放行，
-        避免因为字段名对不上把正常用法也一起挡掉。
+        被判定的命令（`/歌词 同步`、`/歌词 补歌词`、`/歌词 重抓`）会向 VCPedia
+        连发成百上千次请求，所以默认「关闭」而不是默认「人人可用」：
+
+        - 本机控制台（宿主传入 ``is_local_operator``）按 ``allow_local_operator`` 放行；
+        - 配了 ``crawler.sync_admin_ids`` → 只有名单内的 QQ 号能触发；
+        - 没配 → 拒绝，并提示去配置；
+        - 名单配了但取不到发送者 QQ 号 → 同样拒绝（fail-closed），
+          日志里打出可用字段名，方便真机上确认该填哪个字段。
+
+        之所以把「未配置」当拒绝：留空在多数人那里是「没注意到这个开关」，
+        而不是「想让所有人用」，而一次误触就是几千次外部请求。
         """
-        raw = str(getattr(self.config.crawler, "sync_admin_ids", "") or "").strip()
-        if not raw:
+        if self.config.crawler.allow_local_operator and bool(kwargs.get("is_local_operator")):
             return ""
+
+        raw = str(getattr(self.config.crawler, "sync_admin_ids", "") or "").strip()
         admins = {x.strip() for x in raw.split(",") if x.strip()}
         if not admins:
-            return ""
+            return (
+                "重任务命令默认关闭。请在插件配置 crawler.sync_admin_ids 里填入"
+                "允许触发的 QQ 号（多个用英文逗号分隔）后再试。"
+            )
+
         sender = ""
         for field in _SENDER_ID_FIELDS:
             value = kwargs.get(field)
@@ -223,12 +237,12 @@ class VCPediaMixin:
             # 首次触发时把可用字段打出来，方便真机上确认该填哪个字段名
             if not self._probed_command:
                 self._probed_command = True
-                self.ctx.logger.info(
+                self.ctx.logger.warning(
                     "[诊断] 同步命令未能识别发送者字段（可用字段=%s）。"
-                    "sync_admin_ids 已配置但取不到 QQ 号，本次放行",
+                    "sync_admin_ids 已配置但取不到 QQ 号，本次按安全默认拒绝",
                     sorted(kwargs.keys()),
                 )
-            return ""
+            return "未能识别发送者 QQ 号，出于安全考虑已拒绝（详见日志）。"
         if sender in admins:
             return ""
         return "这个命令只有插件配置里指定的管理员能触发（crawler.sync_admin_ids）。"

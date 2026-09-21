@@ -7,7 +7,10 @@ REM ==========================================================
 
 set "PYTHON=python"
 set "API_KEY=PASTE_YOUR_API_KEY_HERE"
-set "DB=E:\mai\maibot\data\plugins\org.mai-mai.cv-lyric-context\vcpedia_songs.db"
+REM Path to the RUNTIME song library of your own MaiBot instance, e.g.
+REM   <MaiBot root>\data\plugins\org.mai-mai.cv-lyric-context\vcpedia_songs.db
+REM (the plugin's data dir, NOT the assets\knowledge_db.db shipped in this repo)
+set "DB=PASTE_PATH_TO_vcpedia_songs.db"
 set "BASE_URL=https://ark.cn-beijing.volces.com/api/v3"
 set "MODEL=REPLACE_WITH_YOUR_MODEL_ID"
 set "EXTRA="

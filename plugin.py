@@ -201,11 +201,6 @@ def _index_song_into(index: _AssetIndex, name: str, singers: str, uploader: str,
     return added
 
 
-def _maibot_root() -> Path:
-    """MaiBot 根目录: 插件目录 plugins/<id> 的上两级。"""
-    return Path(__file__).resolve().parent.parent.parent
-
-
 def _within(path: Path, root: Path) -> bool:
     """路径是否仍在 root 之内（Windows 下忽略盘符大小写）。"""
     try:
@@ -218,34 +213,36 @@ def _within(path: Path, root: Path) -> bool:
 def _resolve_extra_db_paths(raw_cfg: str, data_dir: str) -> tuple[list[Path], list[str]]:
     """待加载的外部歌曲库路径: 配置优先，留空则自动找内置爬虫同步下来的库。
 
-    相对路径一律相对 MaiBot 根目录解析，且不允许越出根目录，
-    避免配置被误填成 ../../.. 之类的路径。
+    路径解析**不猜宿主目录结构**（不推算 MaiBot 根目录，那是未承诺的私有布局）：
+
+    - 绝对路径: 按配置所写直接使用；
+    - 相对路径: 相对本插件的数据目录（宿主通过 ctx.paths.data_dir 给的那个）
+      解析，且不允许越出该目录，避免配置被误填成 ../../.. 之类的路径。
+
     返回 (路径列表, 警告列表)——纯函数，可在 worker 线程里安全调用。
     """
     raw_cfg = str(raw_cfg or "").strip()
     if raw_cfg:
         raw_list = [p.strip() for p in raw_cfg.split(",") if p.strip()]
-        # 手填的路径才需要防越界
-        check_escape = True
     else:
-        # 内置爬虫同步下来的库放在 MaiBot 分配给本插件的 data_dir，天然可信
+        # 内置爬虫同步下来的库放在宿主分配给本插件的 data_dir，天然可信
         raw_list = [str(Path(data_dir) / VCPEDIA_DB_FILE)]
-        check_escape = False
 
-    root = _maibot_root()
+    base = Path(data_dir)
     paths: list[Path] = []
     warnings: list[str] = []
     for raw in raw_list:
         candidate = Path(raw)
-        if not candidate.is_absolute():
-            candidate = root / candidate
+        relative = not candidate.is_absolute()
+        if relative:
+            candidate = base / candidate
         try:
             resolved = candidate.resolve()
         except OSError:
             warnings.append(f"外部歌曲库路径无效，已跳过: {raw}")
             continue
-        if check_escape and not _within(resolved, root):
-            warnings.append(f"外部歌曲库路径越出 MaiBot 根目录，已跳过: {raw}")
+        if relative and not _within(resolved, base):
+            warnings.append(f"外部歌曲库相对路径越出插件数据目录，已跳过: {raw}")
             continue
         paths.append(resolved)
     return paths, warnings
@@ -515,7 +512,8 @@ class PluginSection(PluginConfigBase):
     extra_song_dbs: str = Field(
         default="",
         description=(
-            "额外歌曲库（SQLite）路径，相对 MaiBot 根目录，多个用英文逗号分隔；"
+            "额外歌曲库（SQLite）路径，多个用英文逗号分隔；"
+            "相对路径按本插件的数据目录解析，也可以直接写绝对路径。"
             "留空则使用内置爬虫同步下来的歌词库"
         ),
     )
@@ -556,9 +554,17 @@ class CrawlerSection(PluginConfigBase):
     sync_admin_ids: str = Field(
         default="",
         description=(
-            "允许触发「/歌词 同步」「/歌词 补歌词」的 QQ 号，多个用英文逗号分隔；"
-            "留空表示不限制（任何发命令的人都能触发）。"
-            "这些命令会向 VCPedia 发起成百上千次请求，群聊环境建议填上自己的 QQ 号"
+            "允许触发「/歌词 同步」「/歌词 补歌词」「/歌词 重抓」的 QQ 号，"
+            "多个用英文逗号分隔。"
+            "留空 = 谁都不能触发（默认关闭）：这些命令会向 VCPedia 连发成百上千次请求，"
+            "属于重任务，请填上自己的 QQ 号后再用。"
+        ),
+    )
+    allow_local_operator: bool = Field(
+        default=True,
+        description=(
+            "是否放行本机控制台（宿主标记 is_local_operator 的调用）。"
+            "关掉后本机也要走上面的 QQ 号白名单"
         ),
     )
     refill_cooldown_days: float = Field(
