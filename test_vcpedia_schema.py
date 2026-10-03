@@ -10,6 +10,9 @@
 用法：
     python test_vcpedia_schema.py                      # 默认测本文件所在目录
     python test_vcpedia_schema.py <插件目录绝对路径>    # 指定其它副本（如桌面副本）
+
+注：本文件是**脚本式自检**，不是 pytest 套件（用例函数一律 `case_*` 命名，
+pytest 收集不到），跑法见 README「本地测试」。
 """
 
 from __future__ import annotations
@@ -19,8 +22,16 @@ import sys
 import tempfile
 from pathlib import Path
 
-if len(sys.argv) > 1:
+# 只在「作为脚本直接运行 + 显式传了目录参数」时才解析该参数并校验。
+#
+# 为什么要这么绕：pytest 以 import 方式加载本模块，而它自己的命令行参数
+# （--collect-only、以及显式给出的文件名）会落在 sys.argv[1]，若不加区分地
+# 当成插件目录解析，就会 SystemExit 把整个 pytest 会话打成 INTERNALERROR。
+# 脚本模式下仍保留清晰报错：路径不对就明说找不到，不要静默回落。
+if __name__ == "__main__" and len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
     PLUGIN_DIR = Path(sys.argv[1]).resolve()
+    if not (PLUGIN_DIR / "vcpedia_store.py").is_file():
+        raise SystemExit(f"找不到插件目录：{PLUGIN_DIR}")
 else:
     PLUGIN_DIR = Path(__file__).resolve().parent
 if not (PLUGIN_DIR / "vcpedia_store.py").is_file():
@@ -109,7 +120,7 @@ def build_legacy(db: Path, layout: str) -> sqlite3.Connection:
     return conn
 
 
-def test_migrate_layout(layout: str) -> None:
+def case_migrate_layout(layout: str) -> None:
     print(f"  -- 旧库形态 {layout} 列 --")
     db = tmp_db(f"legacy{layout}.db")
     conn = build_legacy(db, layout)
@@ -133,7 +144,7 @@ def test_migrate_layout(layout: str) -> None:
     check("行数保持一致", store.count() == (4 if layout == "7" else 2), str(store.count()))
 
 
-def test_field_fidelity() -> None:
+def case_field_fidelity() -> None:
     print("  -- 字段零丢失（21 列含情绪/分类）--")
     db = tmp_db()
     conn = build_legacy(db, "21")
@@ -176,7 +187,7 @@ def test_field_fidelity() -> None:
           str(s7.count_empty_lyrics()))
 
 
-def test_store_api() -> None:
+def case_store_api() -> None:
     print("  -- SongStore 公开 API 语义 --")
     db = tmp_db()
     store = SongStore(db)
@@ -240,7 +251,7 @@ def test_store_api() -> None:
           and store.get("测试曲")["introduction"] == "新简介")
 
 
-def test_relational_api() -> None:
+def case_relational_api() -> None:
     print("  -- 规范化新增的关系型查询 --")
     db = tmp_db()
     build_legacy(db, "21").close()
@@ -280,7 +291,7 @@ def test_relational_api() -> None:
           str(stats))
 
 
-def test_idempotent() -> None:
+def case_idempotent() -> None:
     print("  -- 幂等性 --")
     db = tmp_db()
     build_legacy(db, "21").close()
@@ -294,7 +305,7 @@ def test_idempotent() -> None:
               vs.table_kind(c, "songs_legacy_v1_2") is None)
 
 
-def test_emotion_whitelist() -> None:
+def case_emotion_whitelist() -> None:
     print("  -- 情绪标签白名单 --")
     check("白名单仍为 7 个", EMOTION_TAGS == ("甜美", "温柔", "积极", "帅气", "搞怪", "伤感", "愤怒"),
           str(EMOTION_TAGS))
@@ -312,7 +323,7 @@ def test_emotion_whitelist() -> None:
           safe_song_name("珍珠！(Remix)"))
 
 
-def test_newer_store_contract() -> None:
+def case_newer_store_contract() -> None:
     """新版存储层独有能力：连接复用、批量写连接、LIKE 转义、4 列返回契约。"""
     print("  -- 新版存储层独有能力（连接复用 / 转义 / 列契约）--")
     db = tmp_db()
@@ -390,15 +401,15 @@ def test_newer_store_contract() -> None:
 def main() -> int:
     print("cv_lyric_context 知识库规范化改造 回归测试")
     print()
-    test_migrate_layout("7")
-    test_migrate_layout("18")
-    test_migrate_layout("21")
-    test_field_fidelity()
-    test_store_api()
-    test_relational_api()
-    test_newer_store_contract()
-    test_idempotent()
-    test_emotion_whitelist()
+    case_migrate_layout("7")
+    case_migrate_layout("18")
+    case_migrate_layout("21")
+    case_field_fidelity()
+    case_store_api()
+    case_relational_api()
+    case_newer_store_contract()
+    case_idempotent()
+    case_emotion_whitelist()
     print()
     print(f"合计 {PASS + FAIL} 项，通过 {PASS}，失败 {FAIL}")
     return 1 if FAIL else 0

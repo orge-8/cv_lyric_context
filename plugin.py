@@ -64,6 +64,22 @@ _MIN_CJK_CHARS = 2
 # 所以统一在入索引的必经之路上拦掉。
 _MAX_LYRIC_LINE_CHARS = 100
 
+# 日常聊天形态句（低置信触发器）的识别索引过滤。这类句子在群聊里的出现率
+# 远高于在歌词语境里的出现率，命中后会把歌曲上下文无端注进与歌无关的闲聊
+# （真机 2026-10-03 实录：群友单纯发 9 连哈，bot 被《躲在医院厕所雾化的二人》
+# 的注入带着提了一嘴这首歌）。三条规则，全部只看清洗后的 key：
+# 1) 单字重复 >= _MIN_PURE_REPETITION_CHARS 次（"哈哈哈哈""啦啦啦啦啦"）：
+#    基础词库仅 26 个去重键，全是语气段，识别价值趋近于零；
+# 2) 2~3 字片段重复 >= 3 次（"我不想我不想我不想""hahahahahaha"）：
+#    基础词库全表仅 40 余键，其中「别说了x3」「对不起x3」「我不听x3」等
+#    恰是吵架/撒娇刷屏常用语；拟声拼音串（la/na/da/wo/wu/fu）也在此列；
+# 3) ASCII 低信息键：整个 key 只由 <= 2 种字符构成（"emmmmmmmm"）。
+# 刻意不拦 4 字片段 2 连（"不能打架不能打架""没关系呀没关系呀"）：该形态
+# 共 39 键，实词短语密度高、但日常复现率低，误伤《江南皮革厂》"吃喝嫖赌"
+# 等有辨识度的歌词不值当。代价合计：约 79 个去重键不再参与识别，
+# 其余 5.8 万句实歌词不受影响。
+_MIN_PURE_REPETITION_CHARS = 4
+
 # 注入内容标记，用于识别"本次请求已经注入过"，避免重试时重复叠加
 INJECT_MARKER = "【歌词识别】"
 
@@ -103,6 +119,66 @@ def _clean(text: str) -> str:
     """归一化文本: 全角转半角、去标点空白、转小写，只留字母数字和汉字。"""
     normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
     return "".join(ch for ch in normalized if ch.isalnum())
+
+
+# ── 日常高频用语表 ──────────────────────────────────────────────
+# 群聊里天天出现、命中后必然误注入的通用口语。这些句子在歌词库里也有零星
+# 出处（如「生日快乐」出自《Come Back》、《不好意思》出自《鸽子》），但它们在
+# 群聊里的出现率高几个数量级，且与「用户在引用歌词」几乎无关——宁可丢掉
+# 这几十句歌词的识别能力，也不要让 bot 在别人过生日时突兀地提起某首歌。
+#
+# 词表来源：按「问候/致谢/道歉/祝福/告别/情感/疑问/请求/情绪/日常/网络」分类
+# 枚举，并在真机曲库（7672 首 / 24.2 万行歌词）上逐条审计——命中的键全部
+# 人工过目，确认无一是辨识度歌词。新歌同步进来同样受这张表约束。
+#
+# 只做**精确匹配**（清洗后全等），不做子串匹配：子串会误伤
+# 「我喜欢你的笑容」这类真实歌词。同表还用于门控重复规则（见 _is_chatter_like）。
+_DAILY_CHAT_PHRASES_SOURCE = """
+你好 您好 大家好 哈喽 在吗 在吗在吗 在不在 有空吗 忙吗 早上好 中午好 下午好 晚上好 早安 午安 晚安
+睡了吗 吃了吗 吃饭了吗 起了吗 最近好吗 过得怎么样 最近怎么样 好久不见
+谢谢 谢谢你 谢谢你啊 多谢 辛苦了 辛苦了呀 麻烦你了 麻烦你了啊 感激不尽 谢啦
+对不起 对不起啊 抱歉 抱歉抱歉 不好意思 原谅我 我错了 我错了嘛 别生气 别生气嘛
+不客气 没关系 没事 没事没事 没事的 没事儿 好的 好的好的 收到 收到收到 明白 明白了 知道了 懂了
+了解 行吧 可以 可以可以 没问题 当然 必须的 嗯嗯 嗯嗯嗯 哦哦 哦好的 是这样啊
+生日快乐 祝你生日快乐 新年快乐 春节快乐 中秋快乐 圣诞快乐 节日快乐 恭喜恭喜 恭喜发财 万事如意
+身体健康 一路顺风 加油 加油啊 加油加油 你可以的 相信自己 别放弃 坚持住 会好的 明天会更好
+一切都会好的 一切都会好起来的 祝你好运 开心快乐 天天开心 身体健康万事如意
+再见 拜拜 拜拜了 再见啦 我走了 我睡了 先这样 先这样吧 回头聊 下次见 明天见 晚上见 待会儿见
+我下线了 晚安好梦 有空再聊 我出门了 我到家了 我回来了 在路上了 马上到
+我爱你 我想你 我想你了 想你了 我好想你 我喜欢你 我不喜欢你 我讨厌你 我恨你 别走 别走好吗
+不要走 抱抱 抱抱你 亲亲 么么哒 心疼你 你还好吗 你没事吧 别难过 别伤心 别哭 开心点
+别难过了 别难过啦 你要好好的 想见你 想你了呢
+为什么 为什么啊 为什么呢 到底为什么 这是为什么 你怎么了 你怎么回事 怎么回事啊 你说什么 你说啥
+真的吗 真的假的 是吗 是这样吗 可以吗 行吗 行不行 好不好 对不对 是不是 是不是啊 有没有 在哪里
+你是谁 你在干嘛 你在干什么 怎么办 怎么办啊 我该怎么办 怎么了 然后呢 所以呢 你说呢 你觉得呢
+你猜 你猜猜 什么时候 什么东西 什么情况 怎么会 怎么会这样 你懂吗 你懂的吧 是这样吗
+帮帮我 帮我一下 帮我个忙 求求你了 求你了 拜托了 拜托拜托 麻烦一下 打扰了 打扰一下 请教一下
+让我看看 让我想想 等我一下 等等我 马上就好 快好了 稍等一下 请稍等 麻烦你了谢谢
+累死了 困死了 烦死了 气死了 笑死了 饿死了 冷死了 热死了 无聊死了 累死我了 我太难了 救命啊
+我完蛋了 完蛋了 完蛋了完蛋了 好累啊 好烦啊 好无聊 好开心 好难过 好难受 好想你 好喜欢 好可爱
+太好了 太棒了 好厉害 好厉害啊 绝了 绝了绝了 牛啊 淡定淡定 冷静冷静 别慌 绷不住了 破防了 麻了
+好家伙 离谱 离了个大谱 服了 我服了 无语了 我裂开了 笑死我了 笑死 好活 真的会谢 栓Q
+吃饭了 睡觉了 上班了 下班了 到家了 出门了 洗洗睡 洗洗睡吧 早点休息 该睡了 我吃饭了 我睡觉了
+我要回家 我上班了 我下班了 该上班了 该下班了
+说好了 一言为定 拉勾 就这么定了 等我回来 不见不散 我先睡了 我先走了
+你真好 你最好了 你辛苦了 你也是 我也是 我也可以 我也可以的 我也是啊 我也是呢
+不要不要 不要啊 不要嘛 不要啦 不行不行 不可以 不可以不可以 不可以这样 别这样 别这样啊
+别闹了 想得美 你做梦 谁信啊 我不信 我不听 我不听我不听 别管我 不要管我 关你什么事
+你管我呢 我不告诉你 随你便 随便吧 都行 你说了算 听你的 你说得对 说得对 有道理 确实如此
+确实是 好像是的 大概是吧 也许是吧 应该吧 可能吧 不一定 不一定吧 不知道 我不知道 我也不知
+太感谢了 太感谢你了 真的谢谢你 非常感谢 万分感谢 感谢感谢 多谢多谢
+好哒 好嘞 好呀 好嘛 是的呢 是呀 对呀 对的对的 是这样的 嗯呢 嗯哪
+我在的 我在呢 我一直都在 我在这里 这里这里 来了来了 到了到了 我来了 我来啦
+早点睡 早点睡觉 快去睡吧 快去休息 注意身体 照顾好自己 多喝热水 记得吃饭 记得吃药
+别熬夜 别太累 别太拼了 别累着 别感冒了 天冷了 天冷了多穿点 多穿点衣服
+加油呀 加油哦 你一定可以的 你做得到的 我看好你 支持你 我支持你 我挺你
+"""
+
+#: 清洗后的日常用语集合（keys 已过 _clean，两边必须同一把尺子）
+_DAILY_CHAT_PHRASES = frozenset(
+    _clean(p) for p in _DAILY_CHAT_PHRASES_SOURCE.split() if _clean(p)
+)
+
 
 
 def _as_lines(raw: Any) -> list[str]:
@@ -145,6 +221,78 @@ def _has_min_cjk(text: str, minimum: int = _MIN_CJK_CHARS) -> bool:
         if count >= minimum:
             return True
     return False
+
+
+def _is_pure_repetition(key: str) -> bool:
+    """清洗后的 key 是否为单字重复句（"哈哈哈哈…"“啦啦啦啦啦…”）。"""
+    return len(key) >= _MIN_PURE_REPETITION_CHARS and key == key[0] * len(key)
+
+
+def _is_fragment_repeat(key: str, frag_len: int) -> bool:
+    """key 是否为 frag_len 字片段的重复（允许末尾截断的最后一次）。
+
+    "我不想我不想我不想" -> 片段「我不想」x3；"hahahahahaha" -> 片段
+    「ha」x5+截断。片段本身至少要有两种字符，否则会退化成单字重复判定。
+    """
+    if len(key) < frag_len * 3:
+        return False
+    frag = key[:frag_len]
+    if len(set(frag)) < 2:
+        return False
+    i = frag_len
+    while i + frag_len <= len(key):
+        if key[i:i + frag_len] != frag:
+            return False
+        i += frag_len
+    tail = key[i:]
+    return tail == frag[:len(tail)]
+
+
+def _repeated_fragment(key: str) -> str:
+    """key 若是某片段的整倍重复，返回该片段，否则返回空串。
+
+    "我要回家我要回家我要回家我要回家" -> "我要回家"。只认整倍（不认末尾
+    截断的残次重复），因为这里的结果要拿去查日常用语表，宁可漏也不误伤。
+    """
+    n = len(key)
+    for frag_len in range(2, n // 2 + 1):
+        if n % frag_len:
+            continue
+        frag = key[:frag_len]
+        if frag * (n // frag_len) == key:
+            return frag
+    return ""
+
+
+def _is_chatter_like(key: str) -> bool:
+    """清洗后的 key 是否像日常聊天文本（低置信触发器）。
+
+    规则见 _MIN_PURE_REPETITION_CHARS 上的注释块：
+    1) 单字重复 >= 4 次；
+    2) ASCII 低信息键（只由 <= 2 种字符构成）；
+    3) 2~3 字片段重复 >= 3 次；
+    4) 命中日常高频用语表（_DAILY_CHAT_PHRASES，精确匹配）；
+    5) 片段整倍重复且该片段本身就在日常用语表里（"我要回家"x4）。
+
+    作为歌词识别键，这类句子的召回价值趋近于零，而作为日常聊天的出现率
+    极高，命中只会把歌曲上下文无端注进与歌无关的闲聊。
+    """
+    n = len(key)
+    if not key or n < _MIN_PURE_REPETITION_CHARS:
+        return False
+    if _is_pure_repetition(key):
+        return True
+    if key.isascii() and len(set(key)) <= 2:
+        return True
+    if _is_fragment_repeat(key, 2) or _is_fragment_repeat(key, 3):
+        return True
+    if key in _DAILY_CHAT_PHRASES:
+        return True
+    # 规则 5：重复门控——4 字以上的整句重复（"水煮包子水煮包子水煮包子"）
+    # 本身多是歌曲专属歌词，只有「片段恰是日常用语」时才算刷屏。
+    frag = _repeated_fragment(key)
+    return bool(frag) and frag in _DAILY_CHAT_PHRASES
+
 
 
 def _storable_lyrics(lines: list[str]) -> bool:
@@ -196,7 +344,8 @@ def _index_song_into(index: _AssetIndex, name: str, singers: str, uploader: str,
     added = 0
     for line in lines:
         key = _clean(line)
-        if key and len(key) <= _MAX_LYRIC_LINE_CHARS and _has_min_cjk(key):
+        if key and len(key) <= _MAX_LYRIC_LINE_CHARS and not _is_chatter_like(key) \
+                and _has_min_cjk(key):
             bucket = index.songs_by_line.setdefault(key, [])
             if name not in bucket:
                 bucket.insert(0, name)
@@ -529,7 +678,8 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str) -> tuple[_AssetIndex, 
                 continue
             key = _clean(line)
             # 过滤纯数字/纯英文句：缺少足够汉字时极易误命中（如圆周率歌词）
-            if key and _has_min_cjk(key):
+            # 连带过滤日常聊天形态句（"哈哈哈哈…""对不起对不起对不起"）：见 _is_chatter_like
+            if key and not _is_chatter_like(key) and _has_min_cjk(key):
                 song = match.group(1)
                 song = intern.setdefault(song, song)
                 index.songs_by_line.setdefault(key, []).append(song)
@@ -1187,6 +1337,9 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         for candidate in [text, *_SEGMENT_SPLIT.split(text), *_SENTENCE_SPLIT.split(text)]:
             key = _clean(candidate)
             if len(key) < cfg.min_line_len or key in seen_keys:
+                continue
+            # 匹配期再拦一次日常聊天形态句：索引侧已过滤，这里兜底旧索引/重建窗口期
+            if _is_chatter_like(key):
                 continue
             songs = self._songs_by_line.get(key)
             if songs:

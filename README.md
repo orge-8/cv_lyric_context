@@ -16,14 +16,38 @@
 | VCPedia 同步 | 4000+ 首，含完整创作信息与歌词 | `/歌词 同步`（后台爬取） |
 | 歌词文件 | 你自己放的歌 | 丢进 `lyrics_inbox/`（插件数据目录下），`/加歌` |
 
+## 安装
+
+**纯标准库实现，没有任何第三方依赖**（网络请求走 `urllib`，数据库走内置 `sqlite3`），
+不需要 `pip install`，也没有 `requirements.txt`。
+
+| 项 | 要求 |
+|---|---|
+| MaiBot 宿主 | 1.0.0 ~ 1.99.x |
+| 插件 SDK（`maibot_sdk`） | 2.0.0 ~ 2.99.x |
+| Python | 3.9+（用宿主自带的解释器即可） |
+
+步骤：
+
+1. 下载本仓库：`git clone https://github.com/orge-8/cv_lyric_context.git`，
+   或直接下载 zip 解压。
+2. 把整个 `cv_lyric_context/` 目录放进 MaiBot 的 `plugins/` 下，
+   **目录名保持 `cv_lyric_context`**——Runner 按目录名加载插件，
+   里面有 `_manifest.json` 和 `plugin.py`，不要只挑文件拷。
+3. **完整重启 MaiBot**。插件目录的变动不会热加载，必须重启进程。
+4. 启动日志里出现 `中V歌词识别已加载: N 句 / M 首` 就是装好了。
+
+首次启动时 Runner 会自动在插件目录下生成 `config.toml`，
+`/歌词`、`/歌词 状态`、`/歌词 搜索`、`/歌词 歌曲` 这些只读命令开箱可用。
+要跑同步 / 补歌词这类重任务，先按下面的「配置」一节填好 `crawler.sync_admin_ids`。
+
 ## 快速开始
 
 ```bash
-# 1. 把插件目录放到 MaiBot 的 plugins/ 下，重启 MaiBot
-# 2. 在 QQ 里发（先小批量试跑，确认数据正常再跑全量）
+# 1. 在 QQ 里发（先小批量试跑，确认数据正常再跑全量）
 /歌词 同步 100
-# 3. 同步完会自动重建识别词库，新歌立刻可被识别，不用重启
-# 4. 试试
+# 2. 同步完会自动重建识别词库，新歌立刻可被识别，不用重启
+# 3. 试试
 /歌词 搜索 普通DISCO
 /歌词 歌曲 普通DISCO
 ```
@@ -142,6 +166,31 @@
 
 `song_lyric_keywords.txt` 加载时会过滤含汉字少于 2 个的句子（纯数字/纯英文），
 避免圆周率类歌曲的数字串误命中。
+
+2.8.4 起还会过滤**日常聊天文本**，五条规则（只看清洗后的键）：
+
+1. **单字重复 ≥ 4 次**（"哈哈哈哈…"“啦啦啦啦…”）：基础词库仅 26 个去重键，全是语气段；
+2. **2~3 字片段重复 ≥ 3 次**（"对不起对不起对不起""我不想我不想我不想""hahahahahaha"）：
+   这类句子恰是吵架/撒娇/笑声刷屏常用语；
+3. **ASCII 低信息键**（"emmmmmmmm"）：整个键只由一两种字符构成；
+4. **命中日常高频用语表**（约 390 条，精确匹配，不做子串）：问候/致谢/道歉/祝福/
+   告别/情感/疑问/请求/情绪/日常/网络十一类通用口语，如「生日快乐」「新年快乐」
+   「不好意思」「好久不见」「在吗在吗」「求求你了」「相信自己」「马上就好」。
+   这些句子在歌词库里也有零星出处（`生日快乐` 出自《Come Back》、`不好意思`
+   出自《鸽子》），但群聊里的出现率高几个数量级，宁可丢掉这几十句歌词的识别能力；
+5. **片段整倍重复且片段在用语表内**（"我要回家"×4）：4 字以上整句重复多是歌曲
+   专属歌词（`水煮包子`×3 保留），只有片段本身是日常用语时才算刷屏。
+
+为什么不用「整句能否被常用词拼出」这类通用判定？实测那样会拦掉 800+ 键，
+其中大半是真歌词（`你说你想`、`请听我说`、`请来找我`）——误伤率不可接受。
+所以第 4 条只做**精确匹配**：子串匹配会误伤「我喜欢你的笑容」，而「我讨厌你」
+被拦、「我讨厌的你」保留。
+
+群聊里这类文本命中只会把歌曲上下文无端注进与歌无关的闲聊（真机实录：群友单纯
+发 9 连哈，bot 被注入带着提了一嘴《躲在医院厕所雾化的二人》）。在真机曲库
+（7672 首 / 24.2 万行歌词）上合计过滤约 300 个去重键（0.16%），逐条人工过目，
+无一是辨识度歌词；4 字片段 2 连（"不能打架不能打架"）刻意保留——实词密度高、
+日常复现率低。过滤器吞吐约 24 万行/秒，全量建索引仍在 2 秒内、且跑在后台线程。
 
 旧位置（`assets/lyrics_inbox/`、`assets/user_songs.json`）仍保留在 `.gitignore` 里，
 以防回滚到老版本时被误提交。
@@ -488,7 +537,7 @@ extra_song_dbs = "我的歌库.db"
 ```bat
 set "PYTHON=python"                                  :: python 不在 PATH 就填完整路径
 set "API_KEY=PASTE_YOUR_API_KEY_HERE"                :: 你的 key
-set "DB=E:\mai\maibot\data\plugins\org.mai-mai.cv-lyric-context\vcpedia_songs.db"
+set "DB=D:\MaiBot\data\plugins\org.mai-mai.cv-lyric-context\vcpedia_songs.db"
 set "BASE_URL=https://ark.cn-beijing.volces.com/api/v3"
 set "MODEL=REPLACE_WITH_YOUR_MODEL_ID"               :: 方舟 Model ID
 ```
@@ -502,12 +551,12 @@ set "MODEL=REPLACE_WITH_YOUR_MODEL_ID"               :: 方舟 Model ID
 
 ```powershell
 # 0. 找到真机运行时曲库（PowerShell，MaiBot 根目录下）
-Get-ChildItem E:\mai\maibot\data -Recurse -Filter vcpedia_songs.db |
+Get-ChildItem D:\MaiBot\data -Recurse -Filter vcpedia_songs.db |
   Select-Object FullName, Length
 # 认准大的那个（几 MB 级 = 有歌的；28KB = 空壳）
 
-cd E:\mai\maibot\plugins\cv_lyric_context
-$DB = "E:\mai\maibot\data\plugins\cv_lyric_context\vcpedia_songs.db"  # 按上面结果改
+cd D:\MaiBot\plugins\cv_lyric_context
+$DB = "D:\MaiBot\data\plugins\cv_lyric_context\vcpedia_songs.db"  # 按上面结果改
 
 # 1. 配置 key（环境变量）
 $env:MAIBOT_ANNOTATE_API_KEY = "sk-xxx"        # 或 OPENAI_API_KEY
@@ -572,7 +621,7 @@ openssl s_client -connect vcpedia.cn:443 -servername vcpedia.cn </dev/null 2>/de
 
 ```toml
 [crawler]
-ca_bundle = "C:/mai/proxy-root-ca.cer"
+ca_bundle = "D:/certs/proxy-root-ca.cer"
 ```
 
 `.cer` 和 `.pem` 内容一样（都是 Base64 PEM），改不改后缀都行。
@@ -616,7 +665,13 @@ verify_ssl = false
   Anubis PoW 求解复用前缀哈希；加载期汉字计数改为提前退出；
   关键词里的重复歌名字符串去重；禁用/卸载插件时释放全部核心索引。
 
-## 排障日志
+## 故障排查
+
+绝大部分问题看一行日志就能定位，所以先查「日志速查」，再对症处理。
+爬取侧的常见故障另外收在「同步失败怎么办」；
+命令发出去没反应，见前面「`/歌词`、`/加歌` 没反应怎么办」一节。
+
+### 日志速查
 
 首次触发时各打印一行字段名诊断，日常运行打印命中与注入结果：
 
@@ -732,16 +787,27 @@ python migrate_knowledge_db.py data/vcpedia_songs.db --stats
 ## 本地测试
 
 ```bash
-# 知识库结构回归（103 项断言，纯标准库，不依赖 MaiBot SDK）
+# 1. pytest 套件（tests/ 下的 WebUI 配置显示用例，需要 pytest）
+pytest -q
+
+# 2. 知识库结构回归（103 项断言，纯标准库，不依赖 MaiBot SDK）
 python test_vcpedia_schema.py
 
 # 放到 MaiBot 插件工作区里时也可以指定其它副本
 python test_vcpedia_schema.py /path/to/cv_lyric_context
+
+# 3. LLM 调用参数回归（7 项断言，纯标准库）
+python test_annotate_llm.py
 ```
 
 覆盖：三种历史老库形态（7/18/21 列）的自动迁移、逐字段零丢失、公开 API 语义、
 情绪标签排序、关系型查询，以及新版存储层独有能力（`upsert(conn=)` 连接复用、
 `open_writer`、LIKE 通配符转义、情绪查询只返回 4 列）。
+
+> **根目录的两个 `test_*.py` 是脚本式自检，不是 pytest 套件。** 它们用 `check()`
+> 记录失败而不 `assert`，被 pytest 收集会「断言全灭也显示通过」，所以用例函数
+> 一律 `case_*` 命名（pytest 收集不到），`pytest.ini` 也把默认范围收紧到 `tests/`。
+> 请按上面的命令用 `python` 跑，不要用 `pytest test_vcpedia_schema.py`。
 
 > 注意：本仓库除 `test_vcpedia_schema.py` 外没有更上层的 `test_context.py`
 > 全流程模拟测试——那个夹具在插件开发工作区里。改动核心逻辑（词库索引、
@@ -773,7 +839,9 @@ python test_vcpedia_schema.py /path/to/cv_lyric_context
 | `check_lyrics_parse.py` | 诊断单个词条的歌词解析过程：`python check_lyrics_parse.py <歌名>` |
 | `list_empty_lyrics.py` | 列出库内「歌词为空」的条目，供人工抽查是「本来没歌词」还是「解析漏了」 |
 | `repro_shanyaoluyuan.py` | 本地复现《山遥路远》那条解析管线的固定用例 |
-| `test_vcpedia_schema.py` | 知识库结构回归测试（103 项断言，纯标准库） |
+| `test_vcpedia_schema.py` | 知识库结构回归自检（103 项断言，纯标准库，脚本式；用例函数 `case_*` 命名，不被 pytest 收集） |
+| `test_annotate_llm.py` | LLM 调用参数回归自检（7 项断言，纯标准库，脚本式） |
+| `pytest.ini` | pytest 配置：默认只收集 `tests/` 下的套件 |
 | `singer_check.py` | 歌手归属校验纯函数（推荐池过滤用，可独立单测） |
 | `emotion_annotate.py` | 情绪标注纯函数件：prompt 构造 + 标签解析（离线脚本与插件内同步标注共用） |
 | `annotate_emotions.py` | 离线批量标注情绪标签脚本（读环境变量里的 key，`--db` 指向运行时曲库，不走 MaiBot 运行时） |
