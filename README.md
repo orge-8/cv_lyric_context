@@ -646,6 +646,11 @@ verify_ssl = false
 这会跳过证书链校验，**存在被中间人窃听的风险**。只在确认那个代理是你自己的
 （公司网关、本机安全软件）时才用，公网上不要开。插件关闭校验时会打一条 warning 日志。
 
+> **默认行为**：`crawler.verify_ssl` 的默认值是 **`true`**——即**开箱即用就是完整证书链校验**，
+> 不会静默降级。只有用户显式把它设为 `false` 才会走 `ssl.CERT_NONE` 分支，且那一刻
+> 日志里必有 warning（`已关闭 SSL 证书校验（verify_ssl=false）…`）。优先用上面的
+> `ca_bundle`（只追加信任代理根证书，系统根证书库仍然生效）。
+
 `ca_bundle` 指向的文件不存在或格式非法时，会自动回退到系统证书并记日志，不会让插件起不来。
 
 ## 性能与内存（v2.6.2）
@@ -846,6 +851,14 @@ python test_annotate_llm.py
 覆盖：三种历史老库形态（7/18/21 列）的自动迁移、逐字段零丢失、公开 API 语义、
 情绪标签排序、关系型查询，以及新版存储层独有能力（`upsert(conn=)` 连接复用、
 `open_writer`、LIKE 通配符转义、情绪查询只返回 4 列）。
+
+> **v2.9.0 门禁实测（2026-10-05）**：devkit `run_gates` PASS 2 / SKIP 0 / FAIL 0
+> （`check_plugin` PASS 35 / WARN 4 / FAIL 0、pytest 19 passed）；三层自检
+> pytest 19 + `test_vcpedia_schema.py` 103/103 + `test_annotate_llm.py` 7/7 全绿。
+> 本仓库没有 `tests/smoke_test.py`（自检形态就是上面三条），插件中心自查器
+> `check_submission.py` 报 1 个 FAIL：命中 `vcpedia_client.py` 的 `ssl.CERT_NONE`。
+> 该代码是 v2.x 起就有的**用户显式开关**（`crawler.verify_ssl`，**默认 true 即默认开启校验**，
+> 关闭时打 warning 日志），本版未改动它。
 
 > **根目录的两个 `test_*.py` 是脚本式自检，不是 pytest 套件。** 它们用 `check()`
 > 记录失败而不 `assert`，被 pytest 收集会「断言全灭也显示通过」，所以用例函数
