@@ -1439,6 +1439,7 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             try:
                 songs = self._recent_songs.recent(limit=limit)
             except Exception as exc:  # noqa: BLE001 - 记录畸形时降级而非抛出
+                self.ctx.logger.warning("get_recent_songs 降级（记录不可读）：%r", exc)
                 degraded = f"最近歌曲记录不可读，已降级：{exc}"
         if degraded:
             reason = degraded

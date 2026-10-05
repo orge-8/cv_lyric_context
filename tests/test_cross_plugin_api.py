@@ -297,6 +297,24 @@ def test_hot_path_stays_cheap_on_blocking_hook(tmp_path):
     assert elapsed < 0.5, f"命中登记太慢（100 次 {elapsed * 1000:.1f}ms），BLOCKING hook 会卡事件循环"
 
 
+def test_recent_songs_read_error_degrades_with_log(tmp_path, caplog, monkeypatch):
+    """记录层抛错时必须降级（songs=[]）且留痕，不能让异常冒给调用方。"""
+    plug = _plugin(tmp_path)
+    log = plug._recent_songs
+
+    def _boom(limit=10):
+        raise RuntimeError("记录层异常")
+
+    monkeypatch.setattr(log, "recent", _boom)
+    with caplog.at_level(logging.WARNING):
+        out = asyncio.run(plug.api_get_recent_songs())
+    assert out["songs"] == []
+    assert "降级" in out["reason"]
+    assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+        "记录层异常被静默降级：日志里找不到痕迹（全检第 12 项）"
+    )
+
+
 # ---------------------------------------------------------------- 组件注册
 
 

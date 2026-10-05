@@ -853,8 +853,8 @@ python test_annotate_llm.py
 `open_writer`、LIKE 通配符转义、情绪查询只返回 4 列）。
 
 > **v2.9.0 门禁实测（2026-10-05）**：devkit `run_gates` PASS 2 / SKIP 0 / FAIL 0
-> （`check_plugin` PASS 35 / WARN 4 / FAIL 0、pytest 23 passed）；三层自检
-> pytest 23 + `test_vcpedia_schema.py` 103/103 + `test_annotate_llm.py` 7/7 全绿。
+> （`check_plugin` PASS 35 / WARN 4 / FAIL 0、pytest 24 passed）；三层自检
+> pytest 24 + `test_vcpedia_schema.py` 103/103 + `test_annotate_llm.py` 7/7 全绿。
 > 本仓库没有 `tests/smoke_test.py`（自检形态就是上面三条），插件中心自查器
 > `check_submission.py` 报 1 个 FAIL：命中 `vcpedia_client.py` 的 `ssl.CERT_NONE`。
 > 该代码是 v2.x 起就有的**用户显式开关**（`crawler.verify_ssl`，**默认 true 即默认开启校验**，
