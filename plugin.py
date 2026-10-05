@@ -40,11 +40,12 @@ _PLUGIN_DIR = str(Path(__file__).resolve().parent)
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
-from maibot_sdk import Command, EventHandler, Field, HookHandler, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import API, Command, EventHandler, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import ErrorPolicy, EventType, HookMode, HookOrder
 
 import lyrics_import
 from lyrics_import import ImportReport
+from recent_songs import DEFAULT_FLUSH_THROTTLE_SEC, RecentSongsLog
 from vcpedia_mixin import DB_FILE as VCPEDIA_DB_FILE, VCPediaMixin
 from vcpedia_sync import SyncStats
 
@@ -1004,6 +1005,10 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         self._hits: dict[str, deque[tuple[float, str, str]]] = {}
         # 会话 -> (时间戳, 最近一次登记的文本)，用于两套监听的去重
         self._last_recorded: dict[str, tuple[float, frozenset[str]]] = {}
+        # 最近命中过的歌曲（有界环形，落盘 data_dir/recent_songs.json）。
+        # 与 _hits（会话内 TTL 用）和 _recent_recommends（软排除用）都不同：
+        # 这是跨插件只读 API get_recent_songs 的数据源，on_load 里才建。
+        self._recent_songs: RecentSongsLog | None = None
         # 诊断: hook/事件/命令的实际字段名只打一次，避免刷屏
         self._probed_incoming = False
         self._probed_request = False
@@ -1016,6 +1021,8 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         if not self.config.plugin.enabled:
             self.ctx.logger.info("插件已在配置中禁用，跳过数据加载")
             return
+        # 命中记录（跨插件只读 API 的数据源）：坏文件从空开始，不影响加载
+        self._recent_songs = RecentSongsLog(str(self.ctx.paths.data_dir))
         # 先初始化内置爬虫的歌曲库，索引构建会把它接进识别词库
         self._vcpedia_init()
         await self._load_assets_async()
@@ -1032,6 +1039,9 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
                 )
 
     async def on_unload(self) -> None:
+        # 命中记录用的是节流写盘：卸载时强制落盘，别把最后几条留在内存里丢掉
+        if self._recent_songs is not None:
+            self._recent_songs.flush(force=True)
         await self._vcpedia_shutdown()
         self._hits.clear()
         self._last_recorded.clear()
@@ -1356,6 +1366,7 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             self._last_recorded[session_id] = (now, keys)
             for seg, _, songs in hits:
                 self._hits.setdefault(session_id, deque(maxlen=20)).append((now, seg, songs[0]))
+                self._note_song_hit(songs[0])
                 self.ctx.logger.info(
                     "歌词命中: 「%s」-> 《%s》 (会话=%s)", seg[:30], songs[0], session_id
                 )
@@ -1366,6 +1377,67 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
                 if song not in matched:
                     matched.append(song)
         return matched
+
+    def _note_song_hit(self, name: str) -> None:
+        """把一次歌词命中登记进落盘记录（跨插件只读查询的数据源）。
+
+        歌手取歌曲库 ``singers`` 列（`songs` 兼容视图已聚合好多位歌手）；
+        库里查不到就留空串——**不猜、不阻塞**。任何异常都吞掉：
+        记录失败绝不能打断命中链路（命中本身已登记进 `_hits` 并会注入上下文）。
+        """
+        log = self._recent_songs
+        if log is None:
+            return
+        artist = ""
+        try:
+            artist = str(self._song_record(name).get("singers") or "")
+        except Exception:  # noqa: BLE001 - 取歌手失败不影响命中记录本身
+            artist = ""
+        try:
+            if log.add(name, artist):
+                log.flush(throttle_sec=DEFAULT_FLUSH_THROTTLE_SEC)
+        except Exception:  # noqa: BLE001 - 记录失败绝不打断命中链路
+            pass
+
+    # ---------- 跨插件只读 API ----------
+
+    @API(
+        "get_recent_songs",
+        version="1",
+        public=True,
+        description="只读查询最近命中过的歌曲（零网络零写盘）",
+    )
+    async def api_get_recent_songs(self, limit: int = 10, **kwargs: Any) -> dict[str, Any]:
+        """只读暴露最近命中记录（``recent_songs.json``），供其他插件轮询。
+
+        契约纪律（调用方可依赖，测试守着）：
+
+        - **零网络零写盘**：只读内存态，不触发落盘、不改任何状态；
+        - **结构永远完整**：坏/空记录 → ``songs=[]`` + ``reason``，不抛异常；
+        - 每条只含 ``name / artist / at``；``artist`` 是库里聚合的歌手/P主，
+          查不到就是空串（不猜）；``limit`` 钳到 1..100，最新在前。
+        """
+        songs: list[dict[str, Any]] = []
+        degraded = ""
+        if self._recent_songs is not None:
+            try:
+                songs = self._recent_songs.recent(limit=limit)
+            except Exception as exc:  # noqa: BLE001 - 记录畸形时降级而非抛出
+                degraded = f"最近歌曲记录不可读，已降级：{exc}"
+        if degraded:
+            reason = degraded
+        elif self._recent_songs is None:
+            reason = "插件尚未完成启动或已停用（最近歌曲记录未就绪）"
+        elif self._recent_songs.count == 0:
+            reason = "暂无歌曲命中记录"
+        else:
+            reason = ""
+        return {
+            "schema_version": 1,
+            "reason": reason,
+            "active": self._recent_songs is not None,
+            "songs": songs,
+        }
 
     @HookHandler(
         "chat.receive.after_process",

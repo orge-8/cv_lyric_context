@@ -155,6 +155,7 @@
 | `user_songs.json` | 歌词文件收件箱导入的自定义歌单 |
 | `vcpedia_songs.db` | VCPedia 同步下来的歌（SQLite，`songs` + `sync_meta` 表） |
 | `anubis_cookies.txt` | 反爬 cookie，失效自动重解，可安全删除 |
+| `recent_songs.json` | 最近命中过的歌（有界环形 30 条，v2.9.0 新增，供跨插件只读查询） |
 
 > **为什么用户数据不在插件目录里**：整目录更新或重装插件会把 `assets/` 覆盖掉，
 > 用户的歌单和收件箱会一起丢。所以这些路径全部由数据目录推导，插件源码目录保持只读。
@@ -784,10 +785,52 @@ python migrate_knowledge_db.py data/vcpedia_songs.db --stats
 | `tags_of(歌名, kind)` | 取分类或情绪标签（保序） |
 | `role_breakdown()` / `stats()` | 数据完整度体检 |
 
+## 跨插件只读 API（v2.9.0 新增）
+
+### `get_recent_songs` — 只读查询最近命中过的歌
+
+```python
+@API("get_recent_songs", version="1", public=True)
+async def api_get_recent_songs(self, limit: int = 10) -> dict
+```
+
+**参数**：`limit`（默认 10，钳到 1..100，最新在前）。
+
+**返回**（结构永远完整的纯 dict，任何情况下不抛异常）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `schema_version` | `int` | 恒为 `1` |
+| `reason` | `str` | 空 = 数据正常；否则说明降级原因（见下） |
+| `active` | `bool` | 插件已启用且 `on_load` 完成（记录已就绪） |
+| `songs` | `list` | `[{"name": str, "artist": str, "at": float}]`，最新在前 |
+
+**`reason` 的取值**：`""`（正常）/ `插件尚未完成启动或已停用（最近歌曲记录未就绪）`
+（`active=false`，不要用它的数据）/ `暂无歌曲命中记录`。
+
+**数据来源**：`recent_songs.json`——**歌词命中那一刻**登记一条（有界环形 30 条，
+超出丢最旧），字段只有 `name / artist / at`。`artist` 取歌曲库 `singers` 列
+（聚合的歌手/P主，形如 `某P主、某歌手`），库里查不到就是空串（**不猜**）。
+写盘是**节流**的（首次立即落盘，此后默认 30s 窗口，卸载时强制落盘），
+热路径上不做同步 IO；因此刚命中后的极短时间内，API 读到的可能是内存态中
+尚未落盘、但**已经存在**的条目（API 读内存，不读文件）。
+
+**与既有内存态的区别**：`_hits` 是**会话内 TTL**（注入上下文用，不落盘），
+`_recent_recommends` 只记**最近推荐**（软排除用，不落盘）。本记录回答的是
+"最近有人在群里聊到/点了哪首歌"，跨重启保留。
+
+**纪律承诺（有测试守着）**：本 API **只读内存态**——零网络、零写盘、不触发落盘
+（`tests/test_cross_plugin_api.py` 断言调用前后文件 mtime/内容不变、
+内存记录不变、`dirty` 标记不被制造）。调用方可按任意频率轮询。
+
+> **本版同时抬高 `sdk.min_version`：2.0.0 → 2.1.0**。理由：`@API` 组件在 SDK
+> **2.1.0** 才引入（实测 2.0.0 / 2.0.1 的 `maibot_sdk` 没有 `API`，2.1.0 起可用）。
+> 此前声明的 2.0.0 是**低估**——本版开始真正用 `@API`，按"声明要准"改为实际引入版本。
+
 ## 本地测试
 
 ```bash
-# 1. pytest 套件（tests/ 下的 WebUI 配置显示用例，需要 pytest）
+# 1. pytest 套件（tests/ 下的 WebUI 配置显示 + 跨插件 API 契约用例，需要 pytest）
 pytest -q
 
 # 2. 知识库结构回归（103 项断言，纯标准库，不依赖 MaiBot SDK）
@@ -843,6 +886,7 @@ python test_annotate_llm.py
 | `test_annotate_llm.py` | LLM 调用参数回归自检（7 项断言，纯标准库，脚本式） |
 | `pytest.ini` | pytest 配置：默认只收集 `tests/` 下的套件 |
 | `singer_check.py` | 歌手归属校验纯函数（推荐池过滤用，可独立单测） |
+| `recent_songs.py` | 最近命中歌曲的落盘记录（有界环形 + 节流原子写；纯标准库，可脱机单测） |
 | `emotion_annotate.py` | 情绪标注纯函数件：prompt 构造 + 标签解析（离线脚本与插件内同步标注共用） |
 | `annotate_emotions.py` | 离线批量标注情绪标签脚本（读环境变量里的 key，`--db` 指向运行时曲库，不走 MaiBot 运行时） |
 | `run_annotate.bat` | Windows 双击启动器：把 key / 库路径 / 端点填好后调用上面的脚本 |
