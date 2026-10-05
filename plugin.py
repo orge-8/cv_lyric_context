@@ -1023,6 +1023,7 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             return
         # 命中记录（跨插件只读 API 的数据源）：坏文件从空开始，不影响加载
         self._recent_songs = RecentSongsLog(str(self.ctx.paths.data_dir))
+        self._log_recent_songs_state()
         # 先初始化内置爬虫的歌曲库，索引构建会把它接进识别词库
         self._vcpedia_init()
         await self._load_assets_async()
@@ -1378,12 +1379,22 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
                     matched.append(song)
         return matched
 
+    def _log_recent_songs_state(self) -> None:
+        """把记录层的降级/失败原因打出来（构造时读盘失败、结构异常等）。
+
+        全检第 12 项：降级必须在日志里看得见——否则"API 里 songs 一直空"
+        在真机上查不出任何线索。
+        """
+        log = self._recent_songs
+        if log is not None and log.last_error:
+            self.ctx.logger.warning("最近歌曲记录降级：%s", log.last_error)
+
     def _note_song_hit(self, name: str) -> None:
         """把一次歌词命中登记进落盘记录（跨插件只读查询的数据源）。
 
         歌手取歌曲库 ``singers`` 列（`songs` 兼容视图已聚合好多位歌手）；
-        库里查不到就留空串——**不猜、不阻塞**。任何异常都吞掉：
-        记录失败绝不能打断命中链路（命中本身已登记进 `_hits` 并会注入上下文）。
+        库里查不到就留空串——**不猜**。异常全部吞掉（记录失败绝不打断命中链路），
+        但**每一处降级都会留日志**：静默降级等于故障隐形（全检第 12 项）。
         """
         log = self._recent_songs
         if log is None:
@@ -1391,13 +1402,18 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         artist = ""
         try:
             artist = str(self._song_record(name).get("singers") or "")
-        except Exception:  # noqa: BLE001 - 取歌手失败不影响命中记录本身
+        except Exception as exc:  # noqa: BLE001 - 取歌手失败不影响命中记录本身
             artist = ""
+            self.ctx.logger.warning(
+                "取歌手失败（歌名「%s」），本次 artist 记为空串：%r", name, exc
+            )
         try:
             if log.add(name, artist):
                 log.flush(throttle_sec=DEFAULT_FLUSH_THROTTLE_SEC)
-        except Exception:  # noqa: BLE001 - 记录失败绝不打断命中链路
-            pass
+                if log.last_error:
+                    self.ctx.logger.warning("最近歌曲记录写盘失败：%s", log.last_error)
+        except Exception as exc:  # noqa: BLE001 - 记录失败绝不打断命中链路
+            self.ctx.logger.warning("登记最近歌曲失败（歌名「%s」）：%r", name, exc)
 
     # ---------- 跨插件只读 API ----------
 

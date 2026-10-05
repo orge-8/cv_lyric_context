@@ -224,6 +224,79 @@ def test_record_hit_without_log_is_noop(tmp_path):
     assert out["active"] is False and out["songs"] == []
 
 
+# ---------------------------------------------------------------- 全检加固用例
+
+
+def test_artist_lookup_failure_leaves_a_trace(tmp_path, caplog):
+    """全检第 12 项（静默降级=故障隐形）：取歌手失败必须留日志，不能安静吞掉。
+
+    若不记日志：API 里 artist 一直是空串，用户/排障者拿不到任何线索。
+    """
+    plug = _hit_plugin(tmp_path)
+    plug._recent_songs = RecentSongsLog(str(tmp_path))
+
+    def _boom(name):
+        raise RuntimeError("库不可用：songs 视图缺失")
+
+    plug._song_record = _boom  # type: ignore[assignment]
+    with caplog.at_level(logging.WARNING):
+        assert plug.record_hit("session-1", "测试歌词") == ["测试曲"]
+
+    assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+        "取歌手失败被静默吞掉：日志里找不到任何痕迹（全检第 12 项）"
+    )
+    assert "测试曲" in caplog.text, "降级日志必须带上具体对象（歌名）"
+
+
+def test_recent_log_write_failure_leaves_a_trace(tmp_path, caplog, monkeypatch):
+    """落盘失败也必须留日志（第 12 项）。"""
+    plug = _hit_plugin(tmp_path)
+    log = RecentSongsLog(str(tmp_path))
+    plug._recent_songs = log
+    plug._song_record = lambda name: {"singers": "某P主"}  # type: ignore[assignment]
+
+    def _fail_flush(**kwargs):
+        log.last_error = "磁盘只读" if hasattr(log, "last_error") else ""
+        return False
+
+    monkeypatch.setattr(log, "flush", _fail_flush)
+    with caplog.at_level(logging.WARNING):
+        plug.record_hit("session-1", "测试歌词")
+
+    assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+        "落盘失败被静默吞掉：日志里找不到任何痕迹（全检第 12 项）"
+    )
+
+
+def test_corrupt_log_on_load_leaves_a_trace(tmp_path, caplog):
+    """坏文件被备份重建（一次性数据丢失风险）也必须在加载时留痕。"""
+    (tmp_path / "recent_songs.json").write_text("{ 坏 json", encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        plug = _plugin(tmp_path)          # 构造即读盘
+        if plug._recent_songs is not None:
+            plug._log_recent_songs_state()  # 插件加载时调用的留痕钩子
+    assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+        "坏文件被静默重建：日志里看不到（全检第 12 项）"
+    )
+
+
+def test_hot_path_stays_cheap_on_blocking_hook(tmp_path):
+    """全检第 13 项的轻量版：命中记录跑在 BLOCKING hook 的同步路径上，必须廉价。
+
+    预算：100 次登记 < 0.5s（<5ms/次）。缓存命中时不应触发 SQLite；
+    节流生效时只有第一次 flush 真写盘。
+    """
+    plug = _hit_plugin(tmp_path)
+    plug._recent_songs = RecentSongsLog(str(tmp_path))
+    plug._song_record = lambda name: {"singers": "某P主"}  # type: ignore[assignment]
+
+    started = time.perf_counter()
+    for i in range(100):
+        plug._note_song_hit(f"测试曲{i}")
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.5, f"命中登记太慢（100 次 {elapsed * 1000:.1f}ms），BLOCKING hook 会卡事件循环"
+
+
 # ---------------------------------------------------------------- 组件注册
 
 

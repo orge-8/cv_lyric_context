@@ -853,12 +853,16 @@ python test_annotate_llm.py
 `open_writer`、LIKE 通配符转义、情绪查询只返回 4 列）。
 
 > **v2.9.0 门禁实测（2026-10-05）**：devkit `run_gates` PASS 2 / SKIP 0 / FAIL 0
-> （`check_plugin` PASS 35 / WARN 4 / FAIL 0、pytest 19 passed）；三层自检
-> pytest 19 + `test_vcpedia_schema.py` 103/103 + `test_annotate_llm.py` 7/7 全绿。
+> （`check_plugin` PASS 35 / WARN 4 / FAIL 0、pytest 23 passed）；三层自检
+> pytest 23 + `test_vcpedia_schema.py` 103/103 + `test_annotate_llm.py` 7/7 全绿。
 > 本仓库没有 `tests/smoke_test.py`（自检形态就是上面三条），插件中心自查器
 > `check_submission.py` 报 1 个 FAIL：命中 `vcpedia_client.py` 的 `ssl.CERT_NONE`。
 > 该代码是 v2.x 起就有的**用户显式开关**（`crawler.verify_ssl`，**默认 true 即默认开启校验**，
 > 关闭时打 warning 日志），本版未改动它。
+>
+> **全检加固（2026-10-05）**：命中记录的降级不再静默——取歌手失败、写盘失败、
+> 加载期坏文件被备份重建，三处都会打 warning（带歌名/路径/原因），
+> 免得"API 里 songs/artist 一直为空"在真机上查不出线索。
 
 > **根目录的两个 `test_*.py` 是脚本式自检，不是 pytest 套件。** 它们用 `check()`
 > 记录失败而不 `assert`，被 pytest 收集会「断言全灭也显示通过」，所以用例函数

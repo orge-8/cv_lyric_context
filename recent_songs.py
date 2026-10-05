@@ -33,9 +33,11 @@ def _clean_field(value: Any, limit: int) -> str:
 class RecentSongsLog:
     """最近命中过的歌曲：``{schema, entries: [{name, artist, at}]}``，环形上限。
 
-    - **坏即空**：文件损坏时备份成 ``.broken`` 并从干净状态开始，绝不抛出；
+     - **坏即空**：文件损坏时备份成 ``.broken`` 并从干净状态开始，绝不抛出；
     - **节流写盘**：``add()`` 只动内存，``flush()`` 才落盘（默认 30s 节流，
       卸载时 ``force=True`` 兜底），避免命中热路径上做同步 IO；
+    - **失败留痕**：本模块不打日志（保持纯标准库可单测），但所有降级/失败都会写进
+      ``last_error``，由调用方在合适的位置打出来——避免"静默降级 = 故障隐形"；
     - ``recent()`` 是纯只读筛选，供跨插件 API 直接调用。
     """
 
@@ -45,6 +47,8 @@ class RecentSongsLog:
         self._entries: list[dict[str, Any]] = []
         self._dirty = False
         self._last_saved_at = 0.0
+        #: 最近一次降级/失败的原因（空串 = 最近一次操作正常）；调用方负责打日志
+        self.last_error = ""
         self._load()
 
     @property
@@ -61,20 +65,31 @@ class RecentSongsLog:
         return self._dirty
 
     def _load(self) -> None:
-        """读取落盘记录；坏文件备份为 ``.broken`` 后当空档案，不抛异常。"""
+        """读取落盘记录；坏文件备份为 ``.broken`` 后当空档案，不抛异常。
+
+        失败原因写进 ``last_error``（含路径与异常），由调用方打日志——
+        一次性把全部命中记录丢掉这种事，不能在日志里看不见。
+        """
         if not os.path.exists(self._path):
             return
         try:
             with open(self._path, "r", encoding="utf-8") as handle:
                 raw = json.load(handle)
-        except Exception:  # noqa: BLE001 —— 任何读取/解析失败都从干净状态开始
+        except Exception as exc:  # noqa: BLE001 —— 任何读取/解析失败都从干净状态开始
+            backed = False
             try:
                 os.replace(self._path, self._path + ".broken")
+                backed = True
             except OSError:
-                pass
+                backed = False
+            self.last_error = (
+                f"记录文件不可读（{self._path}）：{exc!r}；"
+                f"{'已备份为 .broken 并重建' if backed else '备份失败，本次按空档案继续'}"
+            )
             return
         entries = raw.get("entries") if isinstance(raw, dict) else raw
         if not isinstance(entries, list):
+            self.last_error = f"记录文件结构异常（{self._path}）：entries 不是列表，按空档案继续"
             return
         self._entries = [item for item in entries if isinstance(item, dict)][-self._limit:]
 
@@ -114,10 +129,13 @@ class RecentSongsLog:
             with open(tmp, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, ensure_ascii=False, indent=2)
             os.replace(tmp, self._path)
-        except OSError:
+        except OSError as exc:
+            # 失败原因留给调用方打日志：内存里的记录还在，下轮 flush 会再试
+            self.last_error = f"写盘失败（{self._path}）：{exc!r}"
             return False
         self._last_saved_at = now
         self._dirty = False
+        self.last_error = ""
         return True
 
     def recent(self, limit: int = 10) -> list[dict[str, Any]]:
