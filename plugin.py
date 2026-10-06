@@ -93,6 +93,25 @@ _SESSION_SWEEP_SECONDS = 300  # 清扫限频：最快每 5 分钟扫一次
 # 清扫前 _last_recorded 只按时间去重窗口（DEDUP_SECONDS）清理，两次清扫之间
 # 的脏数据会堆积；清扫本身又限频 5 分钟，所以再给一个条数硬上限兜底。
 _MAX_DEDUP_ENTRIES = 2000
+
+# ── 子串匹配（v2.10.0）────────────────────────────────────────
+# 整句精确匹配的前提是「引用者把歌词记对了」。真机 2026-10-06 实录：
+# 群友把《我的悲伤是水做的》的「其实也并不喜欢吃鱼」记成「可是我并不
+# 喜欢吃鱼」，开头两字之差，整句查表落空。子串匹配在整句未命中时把
+# 消息按 N 字滑窗切片段去歌词片段索引里找，只要与真实歌词**连续共享
+# >= N 字**就能认出来。窗口长度由配置 subspan_min_chars 控制（0=关闭）。
+#
+# 误报防线（三层，全部必要）：
+# 1. 片段归属歌数 <= _SUBSPAN_MAX_SONGS 才入索引——被很多首歌共享的
+#    片段（"我不知道什么"这类通用短语）辨识度为零，不参与召回；
+# 2. 片段命中 _chatter_ngrams 黑名单（日常高频用语的滑窗片段）或
+#    _is_chatter_like 判定的直接跳过——精确匹配层的闲聊防线在片段层
+#    需要等价物；
+# 3. 窗口默认 6 字起：基础词库 5.9 万句里 6 字连续片段的碰撞率远低于
+#    4~5 字，宁可少接住也别把闲聊拽进歌词语境。
+_SUBSPAN_MAX_SONGS = 3    # 片段归属歌数上限：超过视为通用片段，不再登记
+_MAX_SUBSPAN_HITS = 3     # 单条消息最多登记几个子串命中（防长文刷出一串命中）
+_SUBSPAN_MAX_KEY_CHARS = 120  # 清洗后超过此长度的候选不做子串扫描（超长文本不是在引用歌词）
 # 按需从歌曲库补查歌词的缓存上限（首/尾淘汰）。启动时预载的基础词库不走这条
 # 路径、不受影响；只有库里查到才进这个缓存，防长驻下无上限增长。
 _MAX_LYRICS_LRU = 200
@@ -295,6 +314,52 @@ def _is_chatter_like(key: str) -> bool:
     return bool(frag) and frag in _DAILY_CHAT_PHRASES
 
 
+def _chatter_ngrams(n: int) -> frozenset[str]:
+    """日常高频用语的 N 字滑窗片段集：子串匹配层的闲聊黑名单（纯函数，可测）。
+
+    精确匹配层靠 _DAILY_CHAT_PHRASES 整句全等拦截，但子串层的匹配单位是
+    片段，需要等价物：消息滑窗片段若本身是某句日常用语的片段（如
+    「我要回家我要」←「我要回家」x4），它出现在歌词片段索引里时与
+    「用户在引用歌词」基本无关，宁可不注入。表很小（数百句 × 数个片段），
+    启动时算一次即可；n 变更须重算（随索引重建一起走）。
+    """
+    if n <= 0:
+        return frozenset()
+    grams: set[str] = set()
+    for phrase in _DAILY_CHAT_PHRASES:
+        if len(phrase) < n:
+            continue
+        for i in range(len(phrase) - n + 1):
+            grams.add(phrase[i:i + n])
+    return frozenset(grams)
+
+
+def _subspan_find(key: str, n: int, subspans_by_gram: dict[str, list[str]],
+                  blocked: frozenset[str]) -> list[tuple[str, list[str]]]:
+    """在清洗后的候选 key 里滑窗找歌词片段，返回 [(片段, [歌名]), ...]（纯函数，可测）。
+
+    - 同一首歌的多个重叠窗口只记第一个：连续共享 8 字时 6 字窗会连中
+      3 次，登记 3 个同歌命中只会重复注入；
+    - 片段命中闲聊黑名单（blocked）或闲聊形态判定（_is_chatter_like，
+      兜住黑名单没覆盖的重复形态）的直接跳过；
+    - 顺序按片段在消息里出现的位置排，调用方自行限流（_MAX_SUBSPAN_HITS）。
+    """
+    if n <= 0 or len(key) < n:
+        return []
+    found: list[tuple[str, list[str]]] = []
+    taken: set[str] = set()
+    for i in range(len(key) - n + 1):
+        gram = key[i:i + n]
+        songs = subspans_by_gram.get(gram)
+        if not songs or gram in blocked or _is_chatter_like(gram):
+            continue
+        if any(song in taken for song in songs):
+            continue
+        taken.update(songs)
+        found.append((gram, songs))
+    return found
+
+
 
 def _storable_lyrics(lines: list[str]) -> bool:
     """歌词是否值得常驻 _lyrics_by_name。
@@ -317,10 +382,12 @@ class _AssetIndex:
     原地更新运行时索引（同步后重建走这条路）。
     """
 
-    __slots__ = ("songs_by_line", "meta_by_name", "db_meta", "lyrics_by_name", "indexed_names")
+    __slots__ = ("songs_by_line", "meta_by_name", "db_meta", "lyrics_by_name", "indexed_names",
+                 "subspans_by_gram", "subspan_n")
 
     def __init__(self, songs_by_line=None, meta_by_name=None, db_meta=None,
-                 lyrics_by_name=None, indexed_names=None) -> None:
+                 lyrics_by_name=None, indexed_names=None,
+                 subspans_by_gram=None, subspan_n: int = 0) -> None:
         # 清洗后的歌词句 -> [歌名, ...]（个别句子属于多首歌）
         self.songs_by_line = songs_by_line if songs_by_line is not None else {}
         # 歌名 -> (歌手, P主)
@@ -331,6 +398,32 @@ class _AssetIndex:
         self.lyrics_by_name = lyrics_by_name if lyrics_by_name is not None else {}
         # 歌词句已进 songs_by_line 的歌名
         self.indexed_names = indexed_names if indexed_names is not None else set()
+        # 子串匹配（v2.10.0）：滑窗片段 -> [歌名]。窗口长度 subspan_n 依赖配置，
+        # 变更须整库重建（见 on_config_update）。0 表示子串匹配关闭。
+        self.subspans_by_gram = subspans_by_gram if subspans_by_gram is not None else {}
+        self.subspan_n = subspan_n
+
+
+def _add_subspans_into(index: _AssetIndex, key: str, name: str) -> None:
+    """把一条歌词句的 N 字滑窗片段写进子串索引（v2.10.0，纯增不删）。
+
+    只在整句 key 已经通过闲聊/最短长度过滤后调用——片段继承整句的准入
+    判定，但反过来不成立：片段比整句更通用，所以另有两层防线
+    （归属歌数上限 + 运行期闲聊黑名单，见文件头「子串匹配」注释块）。
+    归属歌数达到 _SUBSPAN_MAX_SONGS 的片段不再登记新歌：被多首歌共享的
+    片段是通用短语，召回价值为零，还白占内存。
+    """
+    n = index.subspan_n
+    if n <= 0 or len(key) < n:
+        return
+    table = index.subspans_by_gram
+    for i in range(len(key) - n + 1):
+        gram = key[i:i + n]
+        bucket = table.get(gram)
+        if bucket is None:
+            table[gram] = [name]
+        elif name not in bucket and len(bucket) < _SUBSPAN_MAX_SONGS:
+            bucket.append(name)
 
 
 def _index_song_into(index: _AssetIndex, name: str, singers: str, uploader: str,
@@ -350,6 +443,7 @@ def _index_song_into(index: _AssetIndex, name: str, singers: str, uploader: str,
             bucket = index.songs_by_line.setdefault(key, [])
             if name not in bucket:
                 bucket.insert(0, name)
+                _add_subspans_into(index, key, name)
                 added += 1
     # 只有真正贡献过歌词句才标记"已索引"。歌词为空的歌（如历史上解析
     # 失败的词条）保持未标记，这样重抓补上歌词后重建索引能把它捞进来。
@@ -621,7 +715,8 @@ def _migrate_legacy_user_data(data_dir: str) -> list[tuple[str, str]]:
     return logs
 
 
-def _build_asset_index(raw_extra_dbs: str, data_dir: str) -> tuple[_AssetIndex, list[tuple[str, str]]]:
+def _build_asset_index(raw_extra_dbs: str, data_dir: str,
+                       subspan_n: int = 0) -> tuple[_AssetIndex, list[tuple[str, str]]]:
     """构建歌词识别索引快照（knowledge_db + 关键词文件 + 自定义歌单 + 外部库）。
 
     纯数据构建：只读文件/DB，不碰插件实例，可在 worker 线程里安全运行。
@@ -630,7 +725,7 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str) -> tuple[_AssetIndex, 
     intern 表做歌名字符串去重：约 3000 首歌名在 6 万行关键词里重复出现，
     去重后只留一份 str 对象。
     """
-    index = _AssetIndex()
+    index = _AssetIndex(subspan_n=max(0, int(subspan_n or 0)))
     logs: list[tuple[str, str]] = []
     intern: dict[str, str] = {}
 
@@ -683,7 +778,10 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str) -> tuple[_AssetIndex, 
             if key and not _is_chatter_like(key) and _has_min_cjk(key):
                 song = match.group(1)
                 song = intern.setdefault(song, song)
-                index.songs_by_line.setdefault(key, []).append(song)
+                bucket = index.songs_by_line.setdefault(key, [])
+                if song not in bucket:
+                    bucket.append(song)
+                    _add_subspans_into(index, key, song)
                 index.indexed_names.add(song)
     else:
         logs.append(("warning", f"缺少歌词关键词文件: {txt_path}"))
@@ -733,6 +831,14 @@ class PluginSection(PluginConfigBase):
     config_version: str = Field(default="1", description="配置版本号（热更新迁移用，勿手动修改）")
     enabled: bool = Field(default=True, description="是否启用插件")
     min_line_len: int = Field(default=4, ge=2, le=20, description="参与匹配的歌词句最短字数（过滤过短误报）")
+    subspan_min_chars: int = Field(
+        default=6, ge=0, le=12,
+        description=(
+            "子串匹配滑窗长度：整句未命中时，按 N 字滑窗在歌词库里找连续共享片段，"
+            "接得住「记岔开头/只记得半句」（0=关闭）。越小接得越短、误报越多；"
+            "修改后自动整库重建识别词库"
+        ),
+    )
     ttl_seconds: int = Field(default=600, ge=30, le=86400, description="命中结果的有效期（秒），过期不再注入")
     max_inject: int = Field(default=3, ge=1, le=10, description="单次注入最多携带的歌曲数")
     inject_context_lines: int = Field(
@@ -1001,6 +1107,11 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         # 歌词句已进 _songs_by_line 的歌名。判断"这首歌还需不需要索引"要看它，
         # 不能看 _meta_by_name —— 后者只表示知道这首歌，不代表歌词已入库。
         self._indexed_names: set[str] = set()
+        # 子串匹配（v2.10.0）：滑窗片段 -> [歌名]，与 _songs_by_line 同源同生命周期。
+        # _subspan_blocked 是日常用语的滑窗片段黑名单，随索引重建一起重算。
+        self._subspans_by_gram: dict[str, list[str]] = {}
+        self._subspan_n = 0
+        self._subspan_blocked: frozenset[str] = frozenset()
         # 会话 -> 最近命中 [(timestamp, 歌词原文, 歌名), ...]
         self._hits: dict[str, deque[tuple[float, str, str]]] = {}
         # 会话 -> (时间戳, 最近一次登记的文本)，用于两套监听的去重
@@ -1028,8 +1139,9 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         self._vcpedia_init()
         await self._load_assets_async()
         self.ctx.logger.info(
-            "中V歌词识别已加载: %d 句歌词关键词 / %d 首歌元数据",
+            "中V歌词识别已加载: %d 句歌词关键词 / %d 首歌元数据 / 子串片段 %d（滑窗 %d 字，0=关闭）",
             len(self._songs_by_line), len(self._meta_by_name),
+            len(self._subspans_by_gram), self._subspan_n,
         )
         if self.config.plugin.auto_import_inbox:
             report = await asyncio.to_thread(self._run_import)
@@ -1055,13 +1167,27 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         self._db_meta.clear()
         self._lyrics_by_name.clear()
         self._indexed_names.clear()
+        self._subspans_by_gram.clear()
+        self._subspan_n = 0
+        self._subspan_blocked = frozenset()
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         if scope == "self":
             self.ctx.logger.info("插件配置已更新: version=%s", version)
             self._vcpedia_on_config_update(version)
+            if not self.config.plugin.enabled:
+                return
             # 若从"禁用"切到"启用"，补一次数据加载
-            if self.config.plugin.enabled and not self._songs_by_line:
+            if not self._songs_by_line:
+                self._vcpedia_init()
+                await self._load_assets_async()
+                return
+            # 子串滑窗长度变了：片段索引的窗口数依赖 N，必须整库重建
+            new_n = max(0, int(self.config.plugin.subspan_min_chars or 0))
+            if self._subspan_n != new_n:
+                self.ctx.logger.info(
+                    "子串滑窗长度变更 (%d -> %d)，重建识别词库", self._subspan_n, new_n
+                )
                 self._vcpedia_init()
                 await self._load_assets_async()
 
@@ -1072,6 +1198,7 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         return _AssetIndex(
             self._songs_by_line, self._meta_by_name, self._db_meta,
             self._lyrics_by_name, self._indexed_names,
+            self._subspans_by_gram, self._subspan_n,
         )
 
     async def _load_assets_async(self) -> None:
@@ -1083,12 +1210,17 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         """
         raw_cfg = str(self.config.plugin.extra_song_dbs or "")
         data_dir = str(self.ctx.paths.data_dir)
-        index, logs = await asyncio.to_thread(_build_asset_index, raw_cfg, data_dir)
+        n = max(0, int(self.config.plugin.subspan_min_chars or 0))
+        index, logs = await asyncio.to_thread(_build_asset_index, raw_cfg, data_dir, n)
         self._songs_by_line = index.songs_by_line
         self._meta_by_name = index.meta_by_name
         self._db_meta = index.db_meta
         self._lyrics_by_name = index.lyrics_by_name
         self._indexed_names = index.indexed_names
+        self._subspans_by_gram = index.subspans_by_gram
+        self._subspan_n = index.subspan_n
+        # 闲聊片段黑名单与滑窗长度绑定：索引换入时一并重算（纯内存计算，微秒级）
+        self._subspan_blocked = _chatter_ngrams(self._subspan_n)
         for level, message in logs:
             getattr(self.ctx.logger, level, self.ctx.logger.info)("%s", message)
 
@@ -1340,10 +1472,13 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
 
         候选 = 整条消息 + 按空白切出的各段 + 按标点切出的各句。
         任一候选命中即登记，同一条消息里命中多句歌词会全部登记。
+        整句未命中时再走子串匹配兜底（v2.10.0）：按滑窗片段查子串索引，
+        接得住「记岔开头/只记得半句」的引用，seg/key 记为命中片段本身，
+        注入侧 _lyric_window 用包含匹配就能定位到真实歌词行。
         """
         self._sweep_stale_sessions()
         cfg = self.config.plugin
-        hits: list[tuple[str, str, list[str]]] = []  # (原句, 清洗键, 歌名列表)
+        hits: list[tuple[str, str, list[str], bool]] = []  # (原句/片段, 清洗键, 歌名列表, 是否子串命中)
         seen_keys: set[str] = set()
         for candidate in [text, *_SEGMENT_SPLIT.split(text), *_SENTENCE_SPLIT.split(text)]:
             key = _clean(candidate)
@@ -1355,25 +1490,38 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             songs = self._songs_by_line.get(key)
             if songs:
                 seen_keys.add(key)
-                hits.append((candidate, key, songs))
+                hits.append((candidate, key, songs, False))
+                continue
+            # 子串匹配兜底：只对未整句命中的候选做滑窗扫描
+            if self._subspan_n > 0 and len(key) <= _SUBSPAN_MAX_KEY_CHARS:
+                span_hits = _subspan_find(
+                    key, self._subspan_n, self._subspans_by_gram, self._subspan_blocked,
+                )
+                for gram, gram_songs in span_hits[:_MAX_SUBSPAN_HITS]:
+                    if gram in seen_keys:
+                        continue
+                    seen_keys.add(gram)
+                    hits.append((gram, gram, gram_songs, True))
         if not hits:
             return []
 
         # 去重: 同一会话内短时间内收到的相同一组句子只登记一次
         now = time.time()
-        keys = frozenset(key for _, key, _ in hits)
+        keys = frozenset(key for _, key, _, _ in hits)
         last = self._last_recorded.get(session_id)
         if not (last and now - last[0] <= DEDUP_SECONDS and last[1] == keys):
             self._last_recorded[session_id] = (now, keys)
-            for seg, _, songs in hits:
+            for seg, _, songs, via_subspan in hits:
                 self._hits.setdefault(session_id, deque(maxlen=20)).append((now, seg, songs[0]))
                 self._note_song_hit(songs[0])
                 self.ctx.logger.info(
-                    "歌词命中: 「%s」-> 《%s》 (会话=%s)", seg[:30], songs[0], session_id
+                    "歌词命中%s: 「%s」-> 《%s》 (会话=%s)",
+                    "（子串）" if via_subspan else "",
+                    seg[:30], songs[0], session_id,
                 )
 
         matched: list[str] = []
-        for _, _, songs in hits:
+        for _, _, songs, _ in hits:
             for song in songs:
                 if song not in matched:
                     matched.append(song)
