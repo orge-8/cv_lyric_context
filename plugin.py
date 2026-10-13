@@ -200,6 +200,85 @@ _DAILY_CHAT_PHRASES = frozenset(
 )
 
 
+# ── 二次元/网络高频梗表（v2.11.0）────────────────────────────────
+# ACG 语境下的高频寒暄/刷屏梗，与日常用语表同性质：在群聊里的出现率远高于
+# 「用户在引用歌词」，命中只会把歌曲上下文无端注入寒暄。真机 2026-10-13 实录：
+# 群友发「Ciallo～(∠・ω< )⌒☆ 你好呀！」——Ciallo 既是知名 ACG 寒暄梗，又恰好
+# 是《已经没有人类了》的真实歌词行，清洗后 6 字符恰达子串滑窗下限，被子串
+# 兜底误命中成歌词引用。与「生日快乐出自《Come Back》」同款取舍：宁可丢掉
+# 个别梗句的歌词识别能力，也不要 bot 在日常寒暄里突兀报歌名。
+#
+# 收录标准（与日常用语表一致）：
+# - 清洗后 >= 4 字：低于 4 字的候选键本来就不参与匹配（_MIN_PURE_REPETITION_CHARS
+#   与 min_line_len 双重下限），收了也是死数据——这也是「亚撒西/欧内该/哈基米」
+#   这类 3 字梗不收的原因（它们永远匹配不上，无需过滤）；
+# - 群聊高频、语义与「引用歌词」基本无关；
+# - 已对基础词库（59638 句 / 3412 首）逐条审计：0 精确碰撞、0 个 >=6 字片段
+#   子串碰撞（唯一子串邻居「看到前方高能预警」是完整歌词键，不受影响）。
+# 真机同步库（7672 首）中 ciallo ∈《已经没有人类了》为已知碰撞，按取舍接受。
+#
+# 运行期扩展：config.plugin.meme_phrases 可追加自定义梗词（空格/逗号分隔，
+# 见 _register_meme_phrases），不改代码也能补词。
+_ACG_MEME_PHRASES_SOURCE = """
+ciallo cialloω 空尼奇瓦 空你几哇 空泥机瓦 扣你几哇 阿里嘎多 阿里嘎多够扎伊马斯
+斯米马赛 斯米马三 欧内嘎伊 撒由那拉 达咩达咩 纳尼纳尼 卡哇伊内 谢谢茄子
+前方高能 弹幕护体 空降成功 有内味了 哔哩哔哩干杯 耗子尾汁 年轻人不讲武德
+闪电五连鞭 芜湖起飞 蚌埠住了 我勒个豆 芭比q了 完了芭比q了
+尊嘟假嘟 鸡你太美 你干嘛哎哟 唱跳rap篮球 我不到啊 阿伟死了 杰哥不要
+yyds xswl awsl u1s1 听我说谢谢你 逐渐理解一切 我不做人了
+"""
+# cialloω：真机 2026-10-13 实录里的实际清洗形态——kaomoji「(∠・ω< )⌒☆」中
+# 的 ω 是希腊字母、isalnum() 为真，清洗后保留进键（"cialloω" 7 字符），与
+# 纯词根 "ciallo" 两个形态都收。
+
+#: 清洗后的内置梗集合（keys 已过 _clean，与日常用语表同一把尺子）
+_ACG_MEME_PHRASES = frozenset(
+    _clean(p) for p in _ACG_MEME_PHRASES_SOURCE.split() if _clean(p)
+)
+
+# ── 梗过滤表的运行期扩展（config.plugin.meme_phrases）──────────────
+# 表本身是模块级 frozenset（纯函数 _is_chatter_like / _chatter_ngrams 依赖），
+# config 追加词放独立可变集，合并结果走缓存；注册时整体重建（删词同样生效）
+# 并作废两级缓存。插件单进程单实例，模块级状态无并发问题。
+_EXTRA_MEME_PHRASES: set[str] = set()
+_phrases_cache: Optional[frozenset[str]] = None
+_ngram_cache: dict[int, frozenset[str]] = {}
+
+
+def _chat_filter_phrases() -> frozenset[str]:
+    """日常用语表 ∪ 内置梗表 ∪ config 追加词（带缓存，_is_chatter_like 热路径用）。"""
+    global _phrases_cache
+    if _phrases_cache is None:
+        _phrases_cache = frozenset(
+            _DAILY_CHAT_PHRASES | _ACG_MEME_PHRASES | _EXTRA_MEME_PHRASES
+        )
+    return _phrases_cache
+
+
+def _register_meme_phrases(raw: Any) -> int:
+    """把 config.plugin.meme_phrases（空格/逗号分隔）并入梗过滤表，返回追加条数。
+
+    以本次配置为准整体重建追加集：改词、删词都生效；与内置表/日常表重叠的
+    词自动去重。清洗后 <4 字的碎片直接丢弃——候选键有 min_line_len 与
+    _MIN_PURE_REPETITION_CHARS 双重下限，短词永远匹配不上，收了也是死数据。
+    必须在索引构建（on_load / on_config_update 重建路径）之前调用——
+    索引准入与片段黑名单都依赖这张表。清洗规则与两表一致（_clean）。
+    """
+    global _phrases_cache
+    fresh: set[str] = set()
+    for piece in re.split(r"[\s，,、;；]+", str(raw or "")):
+        k = _clean(piece)
+        if len(k) >= 4:
+            fresh.add(k)
+    _EXTRA_MEME_PHRASES.clear()
+    _EXTRA_MEME_PHRASES.update(
+        fresh - _DAILY_CHAT_PHRASES - _ACG_MEME_PHRASES
+    )
+    _phrases_cache = None
+    _ngram_cache.clear()
+    return len(_EXTRA_MEME_PHRASES)
+
+
 
 def _as_lines(raw: Any) -> list[str]:
     """把 user_songs.json 里的 lyrics 字段统一成行列表。"""
@@ -291,8 +370,9 @@ def _is_chatter_like(key: str) -> bool:
     1) 单字重复 >= 4 次；
     2) ASCII 低信息键（只由 <= 2 种字符构成）；
     3) 2~3 字片段重复 >= 3 次；
-    4) 命中日常高频用语表（_DAILY_CHAT_PHRASES，精确匹配）；
-    5) 片段整倍重复且该片段本身就在日常用语表里（"我要回家"x4）。
+    4) 命中过滤表（_chat_filter_phrases：日常高频用语表 ∪ 二次元/网络梗表
+       ∪ config 追加词，精确匹配）；
+    5) 片段整倍重复且该片段本身就在过滤表里（"我要回家"x4）。
 
     作为歌词识别键，这类句子的召回价值趋近于零，而作为日常聊天的出现率
     极高，命中只会把歌曲上下文无端注进与歌无关的闲聊。
@@ -306,32 +386,38 @@ def _is_chatter_like(key: str) -> bool:
         return True
     if _is_fragment_repeat(key, 2) or _is_fragment_repeat(key, 3):
         return True
-    if key in _DAILY_CHAT_PHRASES:
+    if key in _chat_filter_phrases():
         return True
     # 规则 5：重复门控——4 字以上的整句重复（"水煮包子水煮包子水煮包子"）
-    # 本身多是歌曲专属歌词，只有「片段恰是日常用语」时才算刷屏。
+    # 本身多是歌曲专属歌词，只有「片段恰是日常用语/高频梗」时才算刷屏。
     frag = _repeated_fragment(key)
-    return bool(frag) and frag in _DAILY_CHAT_PHRASES
+    return bool(frag) and frag in _chat_filter_phrases()
 
 
 def _chatter_ngrams(n: int) -> frozenset[str]:
-    """日常高频用语的 N 字滑窗片段集：子串匹配层的闲聊黑名单（纯函数，可测）。
+    """过滤表（日常用语 ∪ 高频梗 ∪ config 追加词）的 N 字滑窗片段集：子串匹配层的黑名单（纯函数，可测）。
 
-    精确匹配层靠 _DAILY_CHAT_PHRASES 整句全等拦截，但子串层的匹配单位是
-    片段，需要等价物：消息滑窗片段若本身是某句日常用语的片段（如
+    精确匹配层靠 _chat_filter_phrases 整句全等拦截，但子串层的匹配单位是
+    片段，需要等价物：消息滑窗片段若本身是某句日常用语/梗词的片段（如
     「我要回家我要」←「我要回家」x4），它出现在歌词片段索引里时与
     「用户在引用歌词」基本无关，宁可不注入。表很小（数百句 × 数个片段），
-    启动时算一次即可；n 变更须重算（随索引重建一起走）。
+    启动时算一次即可（按 n 缓存，_register_meme_phrases 时作废）；
+    n 变更须重算（随索引重建一起走）。
     """
     if n <= 0:
         return frozenset()
+    cached = _ngram_cache.get(n)
+    if cached is not None:
+        return cached
     grams: set[str] = set()
-    for phrase in _DAILY_CHAT_PHRASES:
+    for phrase in _chat_filter_phrases():
         if len(phrase) < n:
             continue
         for i in range(len(phrase) - n + 1):
             grams.add(phrase[i:i + n])
-    return frozenset(grams)
+    result = frozenset(grams)
+    _ngram_cache[n] = result
+    return result
 
 
 def _subspan_find(key: str, n: int, subspans_by_gram: dict[str, list[str]],
@@ -839,6 +925,14 @@ class PluginSection(PluginConfigBase):
             "修改后自动整库重建识别词库"
         ),
     )
+    meme_phrases: str = Field(
+        default="",
+        description=(
+            "追加的二次元/网络梗过滤词（空格或逗号分隔）：这些词在群聊里是高频梗，"
+            "不再按歌词识别，避免寒暄/刷屏被误注入歌曲上下文（Ciallo、空尼奇瓦、"
+            "前方高能等已内置）。适合补充你所在社群的专属梗词；改动后重启生效"
+        ),
+    )
     ttl_seconds: int = Field(default=600, ge=30, le=86400, description="命中结果的有效期（秒），过期不再注入")
     max_inject: int = Field(default=3, ge=1, le=10, description="单次注入最多携带的歌曲数")
     inject_context_lines: int = Field(
@@ -1137,6 +1231,10 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         self._log_recent_songs_state()
         # 先初始化内置爬虫的歌曲库，索引构建会把它接进识别词库
         self._vcpedia_init()
+        # config 追加梗词必须先于索引构建注册：索引准入与片段黑名单都依赖过滤表
+        added = _register_meme_phrases(self.config.plugin.meme_phrases)
+        if added:
+            self.ctx.logger.info("梗过滤表: 并入 config 自定义梗词 %d 条", added)
         await self._load_assets_async()
         self.ctx.logger.info(
             "中V歌词识别已加载: %d 句歌词关键词 / %d 首歌元数据 / 子串片段 %d（滑窗 %d 字，0=关闭）",
@@ -1180,6 +1278,10 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
             # 若从"禁用"切到"启用"，补一次数据加载
             if not self._songs_by_line:
                 self._vcpedia_init()
+                # 索引构建前先并入最新梗词（与 on_load 同序）
+                added = _register_meme_phrases(self.config.plugin.meme_phrases)
+                if added:
+                    self.ctx.logger.info("梗过滤表: 并入 config 自定义梗词 %d 条", added)
                 await self._load_assets_async()
                 return
             # 子串滑窗长度变了：片段索引的窗口数依赖 N，必须整库重建
