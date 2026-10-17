@@ -48,6 +48,7 @@ from lyrics_import import ImportReport
 from recent_songs import DEFAULT_FLUSH_THROTTLE_SEC, RecentSongsLog
 from vcpedia_mixin import DB_FILE as VCPEDIA_DB_FILE, VCPediaMixin
 from vcpedia_sync import SyncStats
+from vcpedia_webui import VCPediaWebUIMixin
 
 # 随包分发的**只读**素材（曲库元数据 + 关键词表）。用户数据不放这里，
 # 一律走 ctx.paths.data_dir，否则插件更新/重装会覆盖或弄脏用户的歌单。
@@ -130,9 +131,6 @@ _SENTENCE_SPLIT = re.compile(r"[，,。.!！?？；;、\n\r]+")
 
 # Context Item 快照结构版本，取自 MaiBot 的 CONTEXT_ITEM_SCHEMA_VERSION
 CONTEXT_ITEM_SCHEMA_VERSION = 1
-
-# 兼容旧配置：早期版本跨插件读取 vcpedia-crawler 的库，现在内置后不再需要
-DEFAULT_EXTRA_DB = "plugins/vcpedia-crawler/data/vcpedia_songs.db"
 
 
 def _clean(text: str) -> str:
@@ -1147,11 +1145,12 @@ class CVLyricContextConfig(PluginConfigBase):
     integration: IntegrationSection = Field(default_factory=IntegrationSection)
 
 
-class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
+class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
     """歌词识别 + 歌曲库（内置 VCPedia 爬虫）。
 
-    VCPediaMixin 提供 /歌词 系列命令与两个 LLM 工具；实测 MaiBot SDK
-    能正确注册继承来的 @Command / @Tool 组件。
+    VCPediaMixin 提供 /歌词 系列命令与两个 LLM 工具；VCPediaWebUIMixin 提供
+    dashboard 自定义页面的 @API（webui.json 绑定）。实测 MaiBot SDK
+    能正确注册继承来的 @Command / @Tool / @API 组件。
     """
 
     config_model = CVLyricContextConfig
@@ -1180,6 +1179,8 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
         self._sync_stats = None
         self._sync_stream = ""
         self._refetch_stop = False
+        # WebUI 页面触发的任务种类（同步 / 补歌词），只用于页面展示
+        self._webui_task_kind = ""
         # 氛围选歌：最近推荐过的歌名（软排除队列，长度由 recommend.soft_exclude_size 控制）
         self._recent_recommends = deque()
         # 清洗后的歌词句 -> [歌名, ...]（个别句子属于多首歌）
@@ -2172,17 +2173,52 @@ class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin):
 # 不搬进 hint，用户在配置页上一个字都看不到（源代码模式才见得到）。
 # 这里只改展示元数据，不碰任何配置键与校验语义。
 
-#: 默认收起的 section：标题自带「可选 / 默认关闭」的功能节。收起后标题
-#: 与说明仍可见，点开即可配置，避免整页卡片全开淹没常用配置。
-_WEBUI_COLLAPSED_SECTIONS: frozenset = frozenset({"crawler"})
+#: 默认收起的 section：非核心功能的配套节（爬取 / 氛围选歌 / 情绪标注 / 插件联动
+#: 都是「配一次就不用管」的可选能力）。收起后标题与说明仍可见，点开即可配置，
+#: 避免整页卡片全开淹没主配置节的常用字段。
+_WEBUI_COLLAPSED_SECTIONS: frozenset = frozenset({"crawler", "recommend", "emotion", "integration"})
 
 #: 手工指定的 section 标题（键 = section 名）；仅在 SDK 输出标题等于
 #: 节名（未配置 __ui_label__）时采用。
 _WEBUI_SECTION_TITLES: dict = {}
 
-#: 手工指定的字段 label（键 = 字段名）；仅在自动推导不可用时采用。
+#: 手工指定的字段 label（键 = 字段名）；自动推导从 description 第一小句截取，
+#: CJK 没有词边界，硬切容易出「 dangling 括号 / 的、是否收尾 / 词切一半」，
+#: 这些字段一律用手工 label；其余字段仍可走自动推导。
 _WEBUI_LABEL_OVERRIDES: dict = {
     "base_url": "VCPedia 站点地址",
+    "inject_basic_credits": "注入年份与词/曲/编",
+    "inject_full_staff": "注入完整 STAFF",
+    "auto_import_inbox": "启动时自动导入收件箱",
+    "max_lines_per_song": "单文件最多入库行数",
+    "detail_lyric_lines": "详情展示歌词行数",
+    "lyric_preview_chars": "歌词预览字数",
+    "max_fail": "连续失败中止阈值",
+    "allow_sync_command": "允许命令触发同步",
+    "sync_admin_ids": "可触发重任务的 QQ 号",
+    "refill_cooldown_days": "补歌词跳过天数",
+    "allow_unknown_singer": "允许推荐歌手未知的歌",
+    "recommend_count": "默认推荐首数",
+    "annotate_on_sync": "同步后自动标注情绪",
+    "annotate_timeout_ms": "单首标注超时（毫秒）",
+    "play_tool_enabled": "启用点歌联动提示",
+    "play_tool_hint": "自定义点歌提示追加",
+    "max_play_candidates": "可点播查询串条数",
+}
+
+#: 格式敏感字段的占位提示（可视化模式输入框灰字，不改校验语义）。
+_WEBUI_FIELD_PLACEHOLDERS: dict = {
+    "meme_phrases": "如：yyds  awsl  爷青回（空格或逗号分隔）",
+    "extra_song_dbs": "如：extra.db 或 D:/libs/a.db, D:/libs/b.db",
+    "categories": "如：Category:洛天依歌曲, Category:殿堂曲",
+    "sync_admin_ids": "如：123456789, 987654321",
+    "ca_bundle": "如：C:/path/to/proxy-root-ca.pem",
+    "target_singers": "如：洛天依, 言和",
+    "known_virtual_singers": "如：洛天依, 言和, 乐正绫",
+    "llm_task": "utils / planner / replyer",
+    "llm_model": "留空 = 走任务配置的路由模型",
+    "play_tool_name": "search_and_play_music",
+    "play_tool_hint": "留空 = 使用内置文案",
 }
 
 
@@ -2209,7 +2245,7 @@ def _webui_label_from_description(description: str) -> str:
         text = text[:12]
         if " " in text[4:]:
             text = text[: text.rfind(" ")].rstrip() or text
-    while text and text[-1] in "（(\"“：:，,；;、":
+    while text and text[-1] in "（(【「\"“：:，,；;、":
         text = text[:-1].rstrip()
     return text if len(text) >= 2 else ""
 
@@ -2240,6 +2276,8 @@ def _apply_webui_display_polish(schema: dict) -> dict:
                 field["hidden"] = True  # 插件自维护字段：可视化模式不渲染，源代码模式仍可见
             if not field.get("hint") and field.get("description"):
                 field["hint"] = field["description"]
+            if not field.get("placeholder") and fname in _WEBUI_FIELD_PLACEHOLDERS:
+                field["placeholder"] = _WEBUI_FIELD_PLACEHOLDERS[fname]
             label = field.get("label")
             if (not label or label == fname) and field.get("description"):
                 new_label = _WEBUI_LABEL_OVERRIDES.get(fname) or _webui_label_from_description(

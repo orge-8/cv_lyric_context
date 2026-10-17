@@ -23,8 +23,8 @@
 
 | 项 | 要求 |
 |---|---|
-| MaiBot 宿主 | 1.0.0 ~ 1.99.x |
-| 插件 SDK（`maibot_sdk`） | 2.0.0 ~ 2.99.x |
+| MaiBot 宿主 | 1.0.0 ~ 1.3.8（实测范围；dashboard 页面需 1.3.6+） |
+| 插件 SDK（`maibot_sdk`） | 2.1.0 ~ 2.13.0（实测范围） |
 | Python | 3.9+（用宿主自带的解释器即可） |
 
 步骤：
@@ -353,7 +353,7 @@ MaiBot**，加载时会自动导入，日志里会有 `歌词文件已入库: �
   用户的收件箱与歌单统一落在插件数据目录，路径由 `ctx.paths.data_dir` 推导。
 - 插件**不读宿主的数据库或日志**，也不读其它插件的文件。`sqlite3` 只用在自己数据目录下的运行时曲库、随仓库分发的只读素材库 `assets/knowledge_db.db`，以及你在 `plugin.extra_song_dbs` 里显式指定的外部曲库上——素材库与外部曲库一律以 `mode=ro` 只读打开。
 - 不修改宿主的任何文件，也不改动其它插件或适配器的组件开关状态；配置读写交给宿主的配置管理层，插件不自己写回 `config.toml`。
-- 仓库内不含任何凭据。离线批量标注脚本（`annotate_emotions.py`）的 key 从**环境变量**读取，`annotate_config.json` 已在 `.gitignore` 中；`config.toml` 由宿主运行时生成，同样不入库。
+- 仓库内不含任何凭据。情绪标注只走 MaiBot 自己的 LLM 通道（宿主配好模型任务即可），插件不持有任何 API key；`config.toml` 由宿主运行时生成，同样不入库。
 - `verify_ssl = false` 默认关闭（默认值 `true`）；只有自己搭了中间人代理、又不想配 `ca_bundle` 时才该打开，插件会在打开时打 warning 日志。详见「公司网络 / 安全软件导致证书错误」。
 
 ## VCPedia 同步
@@ -531,68 +531,12 @@ extra_song_dbs = "我的歌库.db"
 `plugin.org.mai-mai.cv-lyric-context` 配文本模型（根治）；② `emotion.llm_task` 改
 `planner` / `replyer` 或具体模型名；③ 关掉 `annotate_on_sync`。
 
-**与离线脚本的分工**：同步自动标注走**新歌优先**，负责让新歌即插即用；
-离线脚本 `annotate_emotions.py` 走**从老到新**，负责慢慢排空历史存量（约 4000 首）。
-两条路径写同一张表，互不冲突：标过的自动出队，失败的留在队列里下轮重试。
+**排空历史存量**：同步后自动标注走**新歌优先**，让新歌即插即用；早于该机制入库的
+约 4000 首老数据，靠**多次同步**（或临时把 `emotion.annotate_on_sync_limit` 调大）慢慢排空。
+失败的歌不写标签、下轮仍进队列，天然断点续跑；不标注也不影响歌词识别与推荐之外的任何功能。
 
-### 批量标注情绪标签（真机执行，一次性）
-
-标注用独立脚本 `annotate_emotions.py`，**不进 MaiBot 运行时**，key 不落插件配置。
-
-**最省事的方式：双击 `run_annotate.bat`**（不用开 PowerShell、不用敲命令）。
-右键用记事本打开它，改这 4 行一次即可：
-
-```bat
-set "PYTHON=python"                                  :: python 不在 PATH 就填完整路径
-set "API_KEY=PASTE_YOUR_API_KEY_HERE"                :: 你的 key
-set "DB=D:\MaiBot\data\plugins\org.mai-mai.cv-lyric-context\vcpedia_songs.db"
-set "BASE_URL=https://ark.cn-beijing.volces.com/api/v3"
-set "MODEL=REPLACE_WITH_YOUR_MODEL_ID"               :: 方舟 Model ID
-```
-
-双击运行后先干跑 3 首（不写库），问你是否全量跑，回 `y` 就开始。
-想提速就给 `set "EXTRA=--concurrency 4"`。
-
-**曲库在 MaiBot 分配给插件的持久化目录**（默认 `data/plugins/<plugin_id>/vcpedia_songs.db`，
-相对 MaiBot 根目录），不在插件源码目录的 `data/`——脚本必须用 `--db` 显式指向它
-（或写进 `annotate_config.json` 的 `db` 字段，就不用每次带参数了）：
-
-```powershell
-# 0. 找到真机运行时曲库（PowerShell，MaiBot 根目录下）
-Get-ChildItem D:\MaiBot\data -Recurse -Filter vcpedia_songs.db |
-  Select-Object FullName, Length
-# 认准大的那个（几 MB 级 = 有歌的；28KB = 空壳）
-
-cd D:\MaiBot\plugins\cv_lyric_context
-$DB = "D:\MaiBot\data\plugins\cv_lyric_context\vcpedia_songs.db"  # 按上面结果改
-
-# 1. 配置 key（环境变量）
-$env:MAIBOT_ANNOTATE_API_KEY = "sk-xxx"        # 或 OPENAI_API_KEY
-# 端点/模型默认 OpenAI 官方 + deepseek-chat；自建/中转写 annotate_config.json：
-#   {"base_url": "https://api.xxx.com/v1", "model": "deepseek-chat"}
-# （该文件已 gitignore，不入库）
-
-# 2. 先试 3 首看质量（--dry-run 只打印不写库）
-python annotate_emotions.py --db $DB --limit 3 --dry-run
-
-# 3. 全量跑：约 4000 首（有歌词的），1.5~2 小时
-#    断点续跑：失败/中断的歌不写标签，下轮自动重试；Ctrl+C 随时安全退出
-python annotate_emotions.py --db $DB
-
-# 查看覆盖情况（标签分布统计）
-python -c "import sys; from vcpedia_store import SongStore; print(SongStore(sys.argv[1]).emotion_stats())" $DB
-
-# 某首标得不准？清掉重标（v2.8.0 起情绪存于标签表，用 CLI 而不是 UPDATE songs 裸 SQL）：
-python migrate_knowledge_db.py $DB --clear-emotion "歌名"
-# 手动打标签
-python migrate_knowledge_db.py $DB --set-emotion "歌名" "温柔|积极"
-```
-
-标注依据是**整首歌的歌词**（超长歌词保留开头/结尾各 1500 字），
-prompt 要求「不要因为单句歌词而改变整体判断」，temperature 0.2。
-
-无歌词的条目不参与标注，也不会被推荐。建议跑标注时停掉 MaiBot，避免 SQLite 写锁偶发冲突
-（就算冲突也不丢数据：失败的歌不写列，重跑自动补）。
+**看覆盖进度**：发「`/歌词 状态`」，或看 dashboard「歌词曲库」页的「已标注情感」与
+「待标注情感」两项统计。
 
 ### 公司网络 / 安全软件导致证书错误
 
@@ -730,8 +674,8 @@ verify_ssl = false
 | `未找到 Anubis challenge 脚本` | 站点可能已关掉反爬，或页面结构变了；看返回的状态码判断 |
 | 库里没有某首歌 | 该曲不在配置的分类下；换 `crawler.categories` 或确认歌名 |
 | 歌词为空 | 词条本身没有歌词章节（相声、纯音乐、器乐等非歌曲条目） |
-| `/歌词 重抓` 回来「歌词 0 行」 | 先发「`/歌词 状态`」看解析器自检：不通过＝进程里是旧模块，完整重启 MaiBot；通过＝该页面结构特殊，用 `check_lyrics_parse.py <歌名>` 追踪解析步骤并贴输出 |
-| 想抽查剩下那些空歌词条目 | `python list_empty_lyrics.py 30` 列出名字（会标出哪些还没确认过），挑几首跑 `python check_lyrics_parse.py <歌名>` 看是真的没歌词还是解析漏了 |
+| `/歌词 重抓` 回来「歌词 0 行」 | 先发「`/歌词 状态`」看解析器自检：不通过＝进程里是旧模块，完整重启 MaiBot；通过＝该页面结构特殊，按上面的日志速查对照解析器各级输出，必要时把该页面 URL 反馈给开发者 |
+| 想抽查剩下那些空歌词条目 | 发「`/歌词 状态`」看缺歌词总数；dashboard「歌词曲库」页的**缺歌词清单**区块可列出名字（会标出哪些还没确认过），挑几首用「`/歌词 搜索 <歌名>`」逐个确认是真的没歌词还是解析漏了 |
 | 命令发完没反应 | 见「`/歌词` 没反应怎么办」 |
 
 ## 知识库结构（v2.8.0 起）
@@ -766,29 +710,10 @@ v2.8.0 之前，曲库是一张 21 列的宽表 `songs`：创作者被平铺成 
 
 ### 迁移
 
-旧库在插件启动时会**自动迁移**（首次打开 `SongStore` 时完成），旧表改名为
-`songs_legacy_v1` 保留以备回退。也可以手工执行，先预览再正式迁移：
+旧库在插件启动时**自动迁移**（首次打开 `SongStore` 时完成），旧表改名为
+`songs_legacy_v1` 保留以备回退，迁移过程逐字段校验零丢失，耗时约 1.7s、库体积增约 4%。
 
-```bash
-cd <插件目录>
-
-# 预览：复制到临时文件试跑，报告统计与逐字段校验，不改动原库
-python migrate_knowledge_db.py data/vcpedia_songs.db
-
-# 正式迁移：先做文件级备份，再迁移，并自动校验零丢失
-python migrate_knowledge_db.py data/vcpedia_songs.db --apply
-
-# 确认无误后回收旧表空间
-python migrate_knowledge_db.py data/vcpedia_songs.db --apply --drop-legacy
-
-# 体检：各表规模、各角色覆盖比例、情绪标签分布
-python migrate_knowledge_db.py data/vcpedia_songs.db --stats
-```
-
-迁移已实测：3412 首旧库逐字段零丢失，耗时约 1.7s，库体积仅增约 4%。
-
-> 真机部署时迁移会在首次启动自动发生。稳妥起见可先在真机执行一次
-> `--apply`（会自动备份）再重启 MaiBot。
+> 真机部署时迁移会在首次启动自动发生。稳妥起见可以先备份一份运行时曲库文件再重启。
 
 ### 结构升级后新开的能力
 
@@ -844,6 +769,50 @@ async def api_get_recent_songs(self, limit: int = 10) -> dict
 > **本版同时抬高 `sdk.min_version`：2.0.0 → 2.1.0**。理由：`@API` 组件在 SDK
 > **2.1.0** 才引入（实测 2.0.0 / 2.0.1 的 `maibot_sdk` 没有 `API`，2.1.0 起可用）。
 > 此前声明的 2.0.0 是**低估**——本版开始真正用 `@API`，按"声明要准"改为实际引入版本。
+
+## dashboard 自定义页面（v2.12.0 新增）
+
+`webui.json` 声明一个**声明式**页面（协议 v2，`declarative_basic`），在 dashboard 的
+**顶部工作区 tab「歌词曲库」**里用：
+
+| 区块 | 内容 | 绑定的 API |
+|---|---|---|
+| 看板 | 曲库总数 / 缺歌词 / 歌词覆盖率 / 已标注情感 | `lyrics.stats` |
+| 曲库状态 | 上次同步、爬取分类、待标注数、配置的单次批量 | `lyrics.stats` / `lyrics.task` |
+| 后台任务 | 触发增量同步、批量补歌词、取消；进度条 + 已完成/新增/失败 | `lyrics.task` / `lyrics.start_sync` / `lyrics.start_refetch` / `lyrics.cancel` |
+| 曲库检索 | 关键词 + 范围（歌名/歌手/UP主 或 歌词片段），点行看歌词预览 | `lyrics.search` |
+| 缺歌词清单（默认收起） | 可按「跳过最近 N 天已确认无歌词」过滤 | `lyrics.empty` |
+| 最近命中 | 群里聊到过的歌（`recent_songs.json`） | `lyrics.recent` |
+| 单曲档案 | 按歌名取完整档案（创作者分工 / 标签 / 歌词预览） | `lyrics.song` |
+
+**页面位置必须是 workspace**：sidebar 页只在 dashboard 的「设置」工作区才进左侧栏菜单
+（`Layout.tsx:127-135` 的过滤），用户停在别的插件工作区时整个消失 —— identity-guard
+v1.1.0 真机踩过。顶栏最多直显 2 个工作区 tab，超出的在「更多」菜单里。
+
+**几个刻意的取舍**（详见 `docs/decisions-lyrics-webui.md`）：
+
+- **触发不另做鉴权**：`lyrics.start_sync` / `lyrics.start_refetch` 不看 `sync_admin_ids`，
+  改由 dashboard 登录态把关；但**尊重** `plugin.enabled` 与 `crawler.allow_sync_command`
+  —— 配置里写了「关闭同步命令」，页面上也一律拒绝。
+  ⚠️ **代价**：能登录 dashboard 的人就能触发对外网的重任务。
+- **页面不继承「0 = 不限」**：命令侧 `0` 是全量同步（首次建库需要），页面上误点一下就是
+  小时级任务，所以条数口径为「显式值 > `sync_batch_limit` > 保底 50」，夹到 500，
+  替换原因会在返回结果里说明。
+- **单条写入不做**：改歌词/改情感用 `/歌词 重抓 <歌名>`；页面的单条编辑要和导入链路、
+  标注覆盖规则对齐，边界多收益低。
+- **条数参数在声明里是 string**：声明式页面的输入框只能给字符串，声明成 integer 会被宿主
+  判不合规（422，前端只显示「插件 API 执行失败」）。数字转换与范围夹取在插件侧完成。
+
+**2026-10-17 优化轮**（仍属 v2.12.0，细节见 `docs/decisions-lyrics-webui.md`）：
+
+- 页面补 `poll_interval_seconds: 3`——`auto_refresh` 只管交互触发重查，没有它后台任务
+  进度不会自动刷新（前端 `seconds < 3` 直接不轮询）；任务区新增「任务类型 / 已用时」。
+- 输入框长 label 精简（协议没有 hint/placeholder，说明下沉为旁挂 text 节点）。
+- 配置页：19 个字段改手工 label（自动推导的 12 字硬切会产出 dangling 括号 / 「的」收尾），
+  11 个格式敏感字段补 placeholder 示例，爬取/选歌/标注/联动四个配套节默认收起。
+
+**要求**：宿主 **1.3.6+**（协议 v2 起点；1.3.5 及更早会拒绝声明并**连累整个插件加载失败**），
+且 dashboard 前端包含插件页面路由。`@API` 组件自 SDK 2.1.0 起可用（本插件已声明该下限）。
 
 ## 本地测试
 
@@ -903,25 +872,17 @@ python test_annotate_llm.py
 | `vcpedia_store.py` | 歌曲库 SQLite 读写（对外 API 不变，内部写规范化表；含关系型查询） |
 | `assets/knowledge_db.db`<br>`assets/song_lyric_keywords.txt` | 内置歌曲元数据库与歌词关键词表（只读素材） |
 
-**辅助脚本**（不注册任何组件、不参与插件运行，仅在排障或批量维护时手动执行；
-放在仓库根目录是为了能直接 `import` 上面的运行时模块）
+**辅助模块与自检脚本**（运行时模块与维护脚本的边界见下表；脚本式自检用例一律 `case_*` 命名，
+不被 pytest 收集，按 `python <脚本>` 跑而不是 `pytest <脚本>`）
 
 | 文件 | 职责 |
 |---|---|
-| `migrate_knowledge_db.py` | 库迁移与维护 CLI：预览 / 正式迁移 / 校验 / 回收旧表 / 改情绪标签 |
-| `check_lyrics_parse.py` | 诊断单个词条的歌词解析过程：`python check_lyrics_parse.py <歌名>` |
-| `list_empty_lyrics.py` | 列出库内「歌词为空」的条目，供人工抽查是「本来没歌词」还是「解析漏了」 |
-| `repro_shanyaoluyuan.py` | 本地复现《山遥路远》那条解析管线的固定用例 |
 | `test_vcpedia_schema.py` | 知识库结构回归自检（103 项断言，纯标准库，脚本式；用例函数 `case_*` 命名，不被 pytest 收集） |
 | `test_annotate_llm.py` | LLM 调用参数回归自检（7 项断言，纯标准库，脚本式） |
 | `pytest.ini` | pytest 配置：默认只收集 `tests/` 下的套件 |
 | `singer_check.py` | 歌手归属校验纯函数（推荐池过滤用，可独立单测） |
 | `recent_songs.py` | 最近命中歌曲的落盘记录（有界环形 + 节流原子写；纯标准库，可脱机单测） |
-| `emotion_annotate.py` | 情绪标注纯函数件：prompt 构造 + 标签解析（离线脚本与插件内同步标注共用） |
-| `annotate_emotions.py` | 离线批量标注情绪标签脚本（读环境变量里的 key，`--db` 指向运行时曲库，不走 MaiBot 运行时） |
-| `run_annotate.bat` | Windows 双击启动器：把 key / 库路径 / 端点填好后调用上面的脚本 |
-
-> 这些脚本都不接受来自聊天消息的输入，也不会被 `plugin.py` 调用。
+| `emotion_annotate.py` | 情绪标注纯函数件：prompt 构造 + 标签解析（插件内同步标注用） |
 
 `VCPediaMixin` 以多继承混入主类（`class CVLyricContextPlugin(VCPediaMixin, MaiBotPlugin)`），
 实测 MaiBot SDK 能正确注册继承来的 `@Command` / `@Tool`，不用把代码复制进 `plugin.py`。
