@@ -132,9 +132,6 @@ _SENTENCE_SPLIT = re.compile(r"[，,。.!！?？；;、\n\r]+")
 # Context Item 快照结构版本，取自 MaiBot 的 CONTEXT_ITEM_SCHEMA_VERSION
 CONTEXT_ITEM_SCHEMA_VERSION = 1
 
-# 兼容旧配置：早期版本跨插件读取 vcpedia-crawler 的库，现在内置后不再需要
-DEFAULT_EXTRA_DB = "plugins/vcpedia-crawler/data/vcpedia_songs.db"
-
 
 def _clean(text: str) -> str:
     """归一化文本: 全角转半角、去标点空白、转小写，只留字母数字和汉字。"""
