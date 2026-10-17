@@ -845,6 +845,50 @@ async def api_get_recent_songs(self, limit: int = 10) -> dict
 > **2.1.0** 才引入（实测 2.0.0 / 2.0.1 的 `maibot_sdk` 没有 `API`，2.1.0 起可用）。
 > 此前声明的 2.0.0 是**低估**——本版开始真正用 `@API`，按"声明要准"改为实际引入版本。
 
+## dashboard 自定义页面（v2.12.0 新增）
+
+`webui.json` 声明一个**声明式**页面（协议 v2，`declarative_basic`），在 dashboard 的
+**顶部工作区 tab「歌词曲库」**里用：
+
+| 区块 | 内容 | 绑定的 API |
+|---|---|---|
+| 看板 | 曲库总数 / 缺歌词 / 歌词覆盖率 / 已标注情感 | `lyrics.stats` |
+| 曲库状态 | 上次同步、爬取分类、待标注数、配置的单次批量 | `lyrics.stats` / `lyrics.task` |
+| 后台任务 | 触发增量同步、批量补歌词、取消；进度条 + 已完成/新增/失败 | `lyrics.task` / `lyrics.start_sync` / `lyrics.start_refetch` / `lyrics.cancel` |
+| 曲库检索 | 关键词 + 范围（歌名/歌手/UP主 或 歌词片段），点行看歌词预览 | `lyrics.search` |
+| 缺歌词清单（默认收起） | 可按「跳过最近 N 天已确认无歌词」过滤 | `lyrics.empty` |
+| 最近命中 | 群里聊到过的歌（`recent_songs.json`） | `lyrics.recent` |
+| 单曲档案 | 按歌名取完整档案（创作者分工 / 标签 / 歌词预览） | `lyrics.song` |
+
+**页面位置必须是 workspace**：sidebar 页只在 dashboard 的「设置」工作区才进左侧栏菜单
+（`Layout.tsx:127-135` 的过滤），用户停在别的插件工作区时整个消失 —— identity-guard
+v1.1.0 真机踩过。顶栏最多直显 2 个工作区 tab，超出的在「更多」菜单里。
+
+**几个刻意的取舍**（详见 `docs/decisions-lyrics-webui.md`）：
+
+- **触发不另做鉴权**：`lyrics.start_sync` / `lyrics.start_refetch` 不看 `sync_admin_ids`，
+  改由 dashboard 登录态把关；但**尊重** `plugin.enabled` 与 `crawler.allow_sync_command`
+  —— 配置里写了「关闭同步命令」，页面上也一律拒绝。
+  ⚠️ **代价**：能登录 dashboard 的人就能触发对外网的重任务。
+- **页面不继承「0 = 不限」**：命令侧 `0` 是全量同步（首次建库需要），页面上误点一下就是
+  小时级任务，所以条数口径为「显式值 > `sync_batch_limit` > 保底 50」，夹到 500，
+  替换原因会在返回结果里说明。
+- **单条写入不做**：改歌词/改情感用 `/歌词 重抓 <歌名>`；页面的单条编辑要和导入链路、
+  标注覆盖规则对齐，边界多收益低。
+- **条数参数在声明里是 string**：声明式页面的输入框只能给字符串，声明成 integer 会被宿主
+  判不合规（422，前端只显示「插件 API 执行失败」）。数字转换与范围夹取在插件侧完成。
+
+**2026-10-17 优化轮**（仍属 v2.12.0，细节见 `docs/decisions-lyrics-webui.md`）：
+
+- 页面补 `poll_interval_seconds: 3`——`auto_refresh` 只管交互触发重查，没有它后台任务
+  进度不会自动刷新（前端 `seconds < 3` 直接不轮询）；任务区新增「任务类型 / 已用时」。
+- 输入框长 label 精简（协议没有 hint/placeholder，说明下沉为旁挂 text 节点）。
+- 配置页：19 个字段改手工 label（自动推导的 12 字硬切会产出 dangling 括号 / 「的」收尾），
+  11 个格式敏感字段补 placeholder 示例，爬取/选歌/标注/联动四个配套节默认收起。
+
+**要求**：宿主 **1.3.6+**（协议 v2 起点；1.3.5 及更早会拒绝声明并**连累整个插件加载失败**），
+且 dashboard 前端包含插件页面路由。`@API` 组件自 SDK 2.1.0 起可用（本插件已声明该下限）。
+
 ## 本地测试
 
 ```bash

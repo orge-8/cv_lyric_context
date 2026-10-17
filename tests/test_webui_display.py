@@ -81,3 +81,35 @@ def test_config_version_hidden_if_present():
         for fname, f in (s.get("fields") or {}).items():
             if fname == "config_version":
                 assert f.get("hidden") is True, "config_version 应只在源代码模式可见"
+
+
+def test_labels_have_no_broken_truncation():
+    """CJK 硬切容易留下 dangling 括号或「的/是否」收尾，一律视为坏 label。"""
+    bad_tail = ("的", "是否", "和", "与", "「", "（", "(", "【", "，", ",", "、")
+    for s in _webui_sections().values():
+        for fname, f in (s.get("fields") or {}).items():
+            if f.get("hidden"):
+                continue
+            label = (f.get("label") or "").strip()
+            assert len(label) <= 20, f"字段 {fname} 的 label 过长（{len(label)} 字）会被前端截断: {label}"
+            assert not label.endswith(bad_tail), f"字段 {fname} 的 label 断句不完整: {label}"
+
+
+def test_format_fields_have_placeholder():
+    """格式敏感的文本字段必须给占位示例（灰字提示，不改校验语义）。"""
+    required = {"meme_phrases", "extra_song_dbs", "categories", "sync_admin_ids"}
+    seen = set()
+    for s in _webui_sections().values():
+        for fname, f in (s.get("fields") or {}).items():
+            if fname in required:
+                seen.add(fname)
+                assert (f.get("placeholder") or "").strip(), f"字段 {fname} 缺 placeholder 示例"
+    assert seen == required, f"配置节里找不到这些字段: {required - seen}"
+
+
+def test_auxiliary_sections_collapsed():
+    """主配置节保持展开；爬取/选歌/标注/联动等配套节默认收起，避免整页卡片全开。"""
+    sections = _webui_sections()
+    assert sections["plugin"].get("collapsed") is not True
+    for name in ("crawler", "recommend", "emotion", "integration"):
+        assert sections[name].get("collapsed") is True, f"配套节 {name} 应默认收起"

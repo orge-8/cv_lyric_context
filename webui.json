@@ -1,0 +1,358 @@
+{
+  "schema_version": 2,
+  "required_capabilities": ["declarative_basic"],
+  "workspace_title": "歌词曲库",
+  "pages": [
+    {
+      "id": "lyrics",
+      "title": "歌词曲库",
+      "description": "曲库规模与歌词覆盖率、检索、缺歌词清单、最近命中，以及同步/补歌词后台任务的触发与进度。",
+      "placement": "workspace",
+      "icon": "database",
+      "auto_refresh": true,
+      "poll_interval_seconds": 3,
+      "queries": {
+        "stats": {
+          "api": "lyrics.stats",
+          "version": "1",
+          "parameters": {}
+        },
+        "task": {
+          "api": "lyrics.task",
+          "version": "1",
+          "parameters": {}
+        },
+        "search": {
+          "api": "lyrics.search",
+          "version": "1",
+          "parameters": {
+            "keyword": { "type": "string", "max_length": 60 },
+            "scope": { "type": "string", "max_length": 16 },
+            "limit": { "type": "string", "max_length": 8 }
+          }
+        },
+        "empty": {
+          "api": "lyrics.empty",
+          "version": "1",
+          "parameters": {
+            "limit": { "type": "string", "max_length": 8 },
+            "skip_days": { "type": "string", "max_length": 8 }
+          }
+        },
+        "recent": {
+          "api": "lyrics.recent",
+          "version": "1",
+          "parameters": {
+            "limit": { "type": "string", "max_length": 8 }
+          }
+        },
+        "song": {
+          "api": "lyrics.song",
+          "version": "1",
+          "parameters": {
+            "name": { "type": "string", "max_length": 80 }
+          }
+        }
+      },
+      "actions": {
+        "start_sync": {
+          "api": "lyrics.start_sync",
+          "version": "1",
+          "parameters": {
+            "limit": { "type": "string", "max_length": 8 }
+          }
+        },
+        "start_refetch": {
+          "api": "lyrics.start_refetch",
+          "version": "1",
+          "parameters": {
+            "limit": { "type": "string", "max_length": 8 }
+          }
+        },
+        "cancel": {
+          "api": "lyrics.cancel",
+          "version": "1",
+          "parameters": {},
+          "confirmation": "确认取消正在跑的后台任务？已抓取的部分会保留入库。"
+        }
+      },
+      "content": [
+        {
+          "type": "grid",
+          "columns": 4,
+          "children": [
+            {
+              "type": "stat",
+              "label": "曲库总数",
+              "value": { "scope": "query", "source": "stats", "field": "total" }
+            },
+            {
+              "type": "stat",
+              "label": "缺歌词",
+              "value": { "scope": "query", "source": "stats", "field": "empty_lyrics" }
+            },
+            {
+              "type": "stat",
+              "label": "歌词覆盖率 %",
+              "value": { "scope": "query", "source": "stats", "field": "coverage_percent" }
+            },
+            {
+              "type": "stat",
+              "label": "已标注情感",
+              "value": { "scope": "query", "source": "stats", "field": "emotion_annotated" }
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "曲库状态",
+          "children": [
+            {
+              "type": "grid",
+              "columns": 2,
+              "children": [
+                {
+                  "type": "text",
+                  "label": "上次同步",
+                  "value": { "scope": "query", "source": "stats", "field": "last_sync" }
+                },
+                {
+                  "type": "text",
+                  "label": "爬取分类",
+                  "value": { "scope": "query", "source": "stats", "field": "categories" }
+                },
+                {
+                  "type": "text",
+                  "label": "待标注情感",
+                  "value": { "scope": "query", "source": "stats", "field": "emotion_pending" }
+                },
+                {
+                  "type": "text",
+                  "label": "配置的单次批量",
+                  "value": { "scope": "query", "source": "task", "field": "sync_batch_limit" }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "后台任务（同步 / 补歌词）",
+          "children": [
+            {
+              "type": "input",
+              "name": "limit",
+              "label": "本次条数（0 / 留空 = 按配置）",
+              "value": ""
+            },
+            {
+              "type": "text",
+              "value": "留空或 0 表示按「配置的单次批量」执行；配置为「不限」时按 50 首执行，避免误点触发全量任务"
+            },
+            {
+              "type": "text",
+              "label": "任务类型",
+              "value": { "scope": "query", "source": "task", "field": "kind" },
+              "when": {
+                "reference": { "scope": "query", "source": "task", "field": "running" },
+                "operator": "truthy"
+              }
+            },
+            {
+              "type": "text",
+              "label": "已用时",
+              "value": { "scope": "query", "source": "task", "field": "elapsed" },
+              "when": {
+                "reference": { "scope": "query", "source": "task", "field": "running" },
+                "operator": "truthy"
+              }
+            },
+            {
+              "type": "progress",
+              "value": { "scope": "query", "source": "task", "field": "percent" },
+              "when": {
+                "reference": { "scope": "query", "source": "task", "field": "running" },
+                "operator": "truthy"
+              }
+            },
+            {
+              "type": "grid",
+              "columns": 4,
+              "children": [
+                {
+                  "type": "stat",
+                  "label": "进度",
+                  "value": { "scope": "query", "source": "task", "field": "percent" }
+                },
+                {
+                  "type": "stat",
+                  "label": "已完成",
+                  "value": { "scope": "query", "source": "task", "field": "done" }
+                },
+                {
+                  "type": "stat",
+                  "label": "新增 / 更新",
+                  "value": { "scope": "query", "source": "task", "field": "added" }
+                },
+                {
+                  "type": "stat",
+                  "label": "失败",
+                  "value": { "scope": "query", "source": "task", "field": "failed" }
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "label": "最近一次任务结果",
+              "value": { "scope": "query", "source": "task", "field": "summary" }
+            },
+            {
+              "type": "text",
+              "label": "触发受限",
+              "value": { "scope": "query", "source": "task", "field": "trigger_block_reason" },
+              "when": {
+                "reference": { "scope": "query", "source": "task", "field": "can_trigger" },
+                "operator": "empty"
+              }
+            },
+            {
+              "type": "button",
+              "label": "开始增量同步",
+              "action": "start_sync",
+              "disabled_when": {
+                "reference": { "scope": "query", "source": "task", "field": "running" },
+                "operator": "truthy"
+              },
+              "disabled_reason": "已有任务在跑，先取消或等它结束"
+            },
+            {
+              "type": "button",
+              "label": "补抓缺歌词",
+              "action": "start_refetch",
+              "variant": "muted",
+              "disabled_when": {
+                "reference": { "scope": "query", "source": "task", "field": "running" },
+                "operator": "truthy"
+              },
+              "disabled_reason": "已有任务在跑，先取消或等它结束"
+            },
+            {
+              "type": "button",
+              "label": "取消当前任务",
+              "action": "cancel",
+              "variant": "danger",
+              "disabled_when": {
+                "reference": { "scope": "query", "source": "task", "field": "running" },
+                "operator": "empty"
+              },
+              "disabled_reason": "当前没有在跑的任务"
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "曲库检索",
+          "children": [
+            {
+              "type": "input",
+              "name": "keyword",
+              "label": "检索关键词",
+              "value": ""
+            },
+            {
+              "type": "select",
+              "name": "scope",
+              "label": "检索范围",
+              "value": "name",
+              "options": [
+                { "label": "歌名 / 歌手 / UP 主", "value": "name" },
+                { "label": "歌词片段", "value": "lyrics" }
+              ]
+            },
+            {
+              "type": "table",
+              "label": "检索结果（点行展开歌词预览）",
+              "value": { "scope": "query", "source": "search", "field": "rows" },
+              "columns": [
+                { "field": "name", "label": "歌名" },
+                { "field": "singers", "label": "演唱 / UP主" },
+                { "field": "has_lyrics", "label": "有歌词" },
+                { "field": "lyrics_chars", "label": "歌词字数" },
+                { "field": "emotion", "label": "情感标签" }
+              ],
+              "selection": "picked_song",
+              "detail": "song_detail"
+            }
+          ]
+        },
+        {
+          "type": "collapsible",
+          "label": "缺歌词清单",
+          "default_open": false,
+          "children": [
+            {
+              "type": "input",
+              "name": "skip_days",
+              "label": "跳过天数（0 = 不跳过）",
+              "value": "0"
+            },
+            {
+              "type": "text",
+              "value": "跳过最近 N 天内已确认无歌词的条目，避免它们堵在队首被反复重抓"
+            },
+            {
+              "type": "table",
+              "value": { "scope": "query", "source": "empty", "field": "rows" },
+              "columns": [
+                { "field": "name", "label": "歌名" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "collapsible",
+          "label": "最近命中（群里聊到过的歌）",
+          "default_open": true,
+          "children": [
+            {
+              "type": "table",
+              "value": { "scope": "query", "source": "recent", "field": "rows" },
+              "columns": [
+                { "field": "time", "label": "时间" },
+                { "field": "name", "label": "歌名" },
+                { "field": "artist", "label": "歌手" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "dialog",
+          "name": "song_detail",
+          "label": "歌曲详情",
+          "children": [
+            {
+              "type": "text",
+              "label": "歌名",
+              "value": { "scope": "selection", "source": "picked_song", "field": "name" }
+            },
+            {
+              "type": "text",
+              "label": "演唱 / UP主",
+              "value": { "scope": "selection", "source": "picked_song", "field": "singers" }
+            },
+            {
+              "type": "text",
+              "label": "情感标签",
+              "value": { "scope": "selection", "source": "picked_song", "field": "emotion" }
+            },
+            {
+              "type": "text",
+              "label": "歌词预览",
+              "value": { "scope": "selection", "source": "picked_song", "field": "preview" }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
