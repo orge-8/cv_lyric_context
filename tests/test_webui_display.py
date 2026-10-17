@@ -20,15 +20,18 @@ if not hasattr(_MOD, "create_plugin"):
 _PLUGIN = _MOD.create_plugin()
 
 
-def _webui_sections() -> dict:
-    schema = _PLUGIN.get_webui_config_schema(
+def _webui_schema() -> dict:
+    return _PLUGIN.get_webui_config_schema(
         plugin_id=getattr(_MOD, "__plugin_id__", _PLUGIN_DIR.name),
         plugin_name=_PLUGIN_DIR.name,
         plugin_version="",
         plugin_description="",
         plugin_author="",
-    )
-    sections = (schema or {}).get("sections") or {}
+    ) or {}
+
+
+def _webui_sections() -> dict:
+    sections = _webui_schema().get("sections") or {}
     assert sections, "schema 无 sections：Runner 会渲染出整页空白"
     return sections
 
@@ -108,8 +111,56 @@ def test_format_fields_have_placeholder():
 
 
 def test_auxiliary_sections_collapsed():
-    """主配置节保持展开；爬取/选歌/标注/联动等配套节默认收起，避免整页卡片全开。"""
+    """主配置节与权限节保持展开；选歌/标注/联动等配套节默认收起。"""
     sections = _webui_sections()
     assert sections["plugin"].get("collapsed") is not True
-    for name in ("crawler", "recommend", "emotion", "integration"):
+    # crawler 里放着「管理员 QQ 号」——新用户第一个要配的开关，折叠起来等于藏起来
+    assert sections["crawler"].get("collapsed") is not True, (
+        "crawler 独占「同步与权限」页签且含管理员配置，不应默认收起"
+    )
+    for name in ("recommend", "emotion", "integration"):
         assert sections[name].get("collapsed") is True, f"配套节 {name} 应默认收起"
+
+
+def test_tabs_cover_every_section():
+    """tabs 布局下前端只渲染 tab.sections 里的节，漏一个就等于该节整块消失。"""
+    schema = _webui_schema()
+    layout = schema.get("layout") or {}
+    if layout.get("type") != "tabs":
+        return  # 旧宿主走 auto 平铺，不会丢节
+    tabs = layout.get("tabs") or []
+    assert tabs, "layout 声明为 tabs 却没有任何页签"
+    listed = [name for tab in tabs for name in (tab.get("sections") or [])]
+    assert sorted(listed) == sorted(schema["sections"]), (
+        f"页签未覆盖全部配置节：遗漏 {set(schema['sections']) - set(listed)}"
+    )
+    assert len(listed) == len(set(listed)), f"同一节被多个页签重复引用: {listed}"
+    for tab in tabs:
+        assert tab.get("id") and tab.get("title"), f"页签缺 id/title: {tab}"
+
+
+def test_admin_fields_ranked_first():
+    """权限三项必须排在被它们约束的爬取参数之前（用户反馈曾找了很久）。"""
+    crawler = _webui_sections()["crawler"]
+    ordered = [
+        name
+        for name, field in sorted(
+            crawler["fields"].items(), key=lambda kv: kv[1].get("order") or 0
+        )
+        if not field.get("hidden")
+    ]
+    assert ordered[:3] == ["allow_sync_command", "sync_admin_ids", "allow_local_operator"], (
+        f"权限字段未排在最前: {ordered[:5]}"
+    )
+
+
+def test_admin_field_speaks_the_user_language():
+    """字段文案要能被「我想加管理员」的直觉检索到，而不是内部术语。"""
+    crawler = _webui_sections()["crawler"]
+    field = crawler["fields"]["sync_admin_ids"]
+    assert "管理员" in field["label"], f"label 未出现「管理员」: {field['label']}"
+    hint = field["hint"]
+    assert "管理员" in hint and "留空" in hint, "hint 须说明这是管理员配置且留空即禁用"
+    assert "只读" in hint, "hint 须说明只读命令不受限制，避免用户以为全都锁了"
+    # 节标题要能指向权限，否则用户不会点进「爬取」里找
+    assert "权限" in crawler["title"], f"节标题未体现权限: {crawler['title']}"

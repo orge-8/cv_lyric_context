@@ -109,7 +109,8 @@ class VCPediaMixin:
         if count == 0:
             self.ctx.logger.info(
                 "歌词库为空，发送「/歌词 同步 100」开始首次同步"
-                "（全量耗时较长，可先设 crawler.sync_batch_limit 小批量试跑）"
+                "（全量耗时较长，可先在配置「同步与权限」页签把"
+                "「单次同步最多抓取多少首」调小批量试跑）"
             )
         ok, note = parser_selfcheck()
         if ok:
@@ -223,8 +224,9 @@ class VCPediaMixin:
         admins = {x.strip() for x in raw.split(",") if x.strip()}
         if not admins:
             return (
-                "重任务命令默认关闭。请在插件配置 crawler.sync_admin_ids 里填入"
-                "允许触发的 QQ 号（多个用英文逗号分隔）后再试。"
+                "重任务命令默认关闭。请在插件配置里填入允许触发的 QQ 号后再试："
+                "MaiBot dashboard → 插件 → 中V歌词识别 → 配置 → "
+                "「同步与权限」页签 → 「管理员 QQ 号」（多个用英文逗号分隔）。"
             )
 
         sender = ""
@@ -245,7 +247,10 @@ class VCPediaMixin:
             return "未能识别发送者 QQ 号，出于安全考虑已拒绝（详见日志）。"
         if sender in admins:
             return ""
-        return "这个命令只有插件配置里指定的管理员能触发（crawler.sync_admin_ids）。"
+        return (
+            "这个命令只有管理员能触发：请让管理员把你的 QQ 号加进插件配置的"
+            "「同步与权限」页签 →「管理员 QQ 号」。"
+        )
 
     async def _reply(self, stream_id: str, text: str) -> tuple[bool, str, int]:
         """统一回复：确实发出去才返回拦截级别 2，否则返回 0 让 bot 接一句话。
@@ -358,6 +363,8 @@ class VCPediaMixin:
             "/歌词 歌曲 <歌名> — 查看歌曲详情与歌词\n"
             "/歌词 取消 — 中止正在进行的同步或补歌词\n"
             "/加歌 — 导入收件箱里的歌词文件\n"
+            "注意：同步 / 重抓 / 补歌词属重任务，需要管理员先把你的 QQ 号加进"
+            "插件配置的「同步与权限」页签；其余命令任何人都能用。\n"
             "也可以在聊天里直接问，我会自动查询歌曲库。"
         )
         return await self._reply(stream_id, text)
@@ -449,8 +456,9 @@ class VCPediaMixin:
         self._sync_stream = stream_id or ""
         self._sync_stats = SyncStats()
         self._sync_task = asyncio.create_task(self._run_sync(limit))
-        # 回显分类：WebUI 改配置只写文件、不推给插件运行器，改完没重启的话
-        # 同步跑的还是旧分类。把分类说出来，用户当场就能发现没生效。
+        # 回显分类：配置热更新依赖宿主对插件配置文件的监听，个别版本有延迟或
+        # 根本没推（WebUI 结构化保存只写文件，推送靠文件监听兜底）。把分类说出来，
+        # 用户当场就能发现改完没生效，而不是等一个小时的同步跑完才察觉。
         reply = (
             f"已开始同步（{'全量' if limit == 0 else f'最多 {limit} 首'}），"
             f"分类：{'、'.join(self._categories())}。"

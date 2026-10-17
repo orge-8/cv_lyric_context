@@ -908,7 +908,10 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str,
 
 
 class PluginSection(PluginConfigBase):
-    """插件配置。"""
+    """识别与注入的开关：怎么判定歌词、注入哪些信息、搜索返回多少条、歌词文件怎么导入。
+
+    多数场景保持默认即可，只读命令（/歌词 状态 / 搜索 / 歌曲）不受这里的配置影响。
+    """
 
     __ui_label__ = "中V歌词识别设置"
 
@@ -971,9 +974,12 @@ class PluginSection(PluginConfigBase):
 
 
 class CrawlerSection(PluginConfigBase):
-    """VCPedia 爬取设置。"""
+    """谁能触发重任务命令（同步 / 补歌词 / 重抓）、爬哪些分类、限速与超时。
 
-    __ui_label__ = "VCPedia 爬取"
+    三条重任务命令默认全部关闭：先在「管理员 QQ 号」里填上自己的 QQ 号才能用。
+    """
+
+    __ui_label__ = "同步与命令权限"
     __ui_icon__ = "cloud-download"
     __ui_order__ = 1
 
@@ -993,22 +999,27 @@ class CrawlerSection(PluginConfigBase):
         description="单次同步最多抓取多少首（0 表示不限，全量首次同步会很久）",
     )
     allow_sync_command: bool = Field(
-        default=True, description="是否允许通过「/歌词 同步」命令触发同步"
+        default=True,
+        description=(
+            "是否允许在 QQ 里触发重任务命令（/歌词 同步、/歌词 补歌词、/歌词 重抓）。"
+            "关掉后即使填了管理员 QQ 号也无法触发；一般保持开启，"
+            "用下面的「管理员 QQ 号」决定谁可以触发"
+        ),
     )
     sync_admin_ids: str = Field(
         default="",
         description=(
-            "允许触发「/歌词 同步」「/歌词 补歌词」「/歌词 重抓」的 QQ 号，"
-            "多个用英文逗号分隔。"
-            "留空 = 谁都不能触发（默认关闭）：这些命令会向 VCPedia 连发成百上千次请求，"
-            "属于重任务，请填上自己的 QQ 号后再用。"
+            "管理员 QQ 号：填在这里的号才允许触发 /歌词 同步、/歌词 补歌词、/歌词 重抓，"
+            "多个用英文逗号分隔。留空 = 谁都触发不了（默认关闭）——"
+            "这几条命令会向 VCPedia 连发成百上千次请求，属重任务，请先填上自己的 QQ 号。"
+            "只读命令（/歌词 状态、/歌词 搜索、/歌词 歌曲）不受限制，任何人都能用"
         ),
     )
     allow_local_operator: bool = Field(
         default=True,
         description=(
             "是否放行本机控制台（宿主标记 is_local_operator 的调用）。"
-            "关掉后本机也要走上面的 QQ 号白名单"
+            "开启时本机不受上面的 QQ 号白名单限制；关掉后本机也要走白名单"
         ),
     )
     refill_cooldown_days: float = Field(
@@ -2173,10 +2184,29 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
 # 不搬进 hint，用户在配置页上一个字都看不到（源代码模式才见得到）。
 # 这里只改展示元数据，不碰任何配置键与校验语义。
 
-#: 默认收起的 section：非核心功能的配套节（爬取 / 氛围选歌 / 情绪标注 / 插件联动
-#: 都是「配一次就不用管」的可选能力）。收起后标题与说明仍可见，点开即可配置，
-#: 避免整页卡片全开淹没主配置节的常用字段。
-_WEBUI_COLLAPSED_SECTIONS: frozenset = frozenset({"crawler", "recommend", "emotion", "integration"})
+#: 默认收起的 section：非核心功能的配套节（氛围选歌 / 情绪标注 / 插件联动
+#: 都是「配一次就不用管」的可选能力）。收起后标题与说明仍可见，点开即可配置。
+#: crawler 不在此列——它现在独占一个页签，且「管理员 QQ 号」是新用户第一个要配的项，
+#: 收起来等于把唯一必须改的开关藏进折叠卡片里。
+_WEBUI_COLLAPSED_SECTIONS: frozenset = frozenset({"recommend", "emotion", "integration"})
+
+#: 可视化模式的页签分组（layout.type = tabs）。
+#: 前端只渲染 tab.sections 里列出的节，**没列进任何页签的节会整块消失**，
+#: 所以未知/新增的节一律追加到最后一个页签（见 _apply_webui_tabs）。
+#: 宿主 < 1.3.6 不认识 layout.tabs，会走 auto 分支按 section.order 平铺，
+#: 不会丢内容——页签是渐进增强，不是硬依赖。
+_WEBUI_TABS: tuple = (
+    {"id": "core", "title": "识别与注入", "sections": ("plugin",)},
+    {"id": "sync", "title": "同步与权限", "sections": ("crawler",)},
+    {"id": "extra", "title": "扩展功能", "sections": ("recommend", "emotion", "integration")},
+)
+
+#: 指定节内需要提到最前面的字段（键 = section 名，值 = 字段名顺序）。
+#: 「管理员 QQ 号」曾被排在 13 个爬取参数的第 9 位、还藏在折叠卡片里，
+#: 用户反馈找了很久才找到——权限类字段必须排在被它约束的爬取参数之前。
+_WEBUI_FIELD_PRIORITY: dict = {
+    "crawler": ("allow_sync_command", "sync_admin_ids", "allow_local_operator"),
+}
 
 #: 手工指定的 section 标题（键 = section 名）；仅在 SDK 输出标题等于
 #: 节名（未配置 __ui_label__）时采用。
@@ -2194,8 +2224,9 @@ _WEBUI_LABEL_OVERRIDES: dict = {
     "detail_lyric_lines": "详情展示歌词行数",
     "lyric_preview_chars": "歌词预览字数",
     "max_fail": "连续失败中止阈值",
-    "allow_sync_command": "允许命令触发同步",
-    "sync_admin_ids": "可触发重任务的 QQ 号",
+    "allow_sync_command": "允许命令触发重任务",
+    "sync_admin_ids": "管理员 QQ 号（谁能触发同步）",
+    "allow_local_operator": "本机控制台免白名单",
     "refill_cooldown_days": "补歌词跳过天数",
     "allow_unknown_singer": "允许推荐歌手未知的歌",
     "recommend_count": "默认推荐首数",
@@ -2250,8 +2281,54 @@ def _webui_label_from_description(description: str) -> str:
     return text if len(text) >= 2 else ""
 
 
+def _apply_webui_tabs(schema: dict) -> dict:
+    """把 section 分组到页签（layout.type = tabs）。
+
+    前端（``routes/plugin-config.tsx``）在 tabs 布局下**只渲染 tab.sections 里
+    列出的节**，没被任何页签引用的节会整块消失。所以这里做两件事：
+    ① 只保留实际存在的节；② 把所有未归类的节追加到最后一个页签。
+    宿主不支持 tabs 时会退回 auto 平铺，内容不丢。
+    """
+
+    sections = schema.get("sections")
+    if not isinstance(sections, dict) or not sections:
+        return schema
+    tabs: list[dict] = []
+    grouped: list[str] = []
+    for spec in _WEBUI_TABS:
+        names = [name for name in spec["sections"] if name in sections]
+        if not names:
+            continue
+        tabs.append({"id": spec["id"], "title": spec["title"], "sections": names})
+        grouped.extend(names)
+    leftover = [name for name in sections if name not in grouped]
+    if not tabs:
+        return schema
+    tabs[-1]["sections"].extend(leftover)
+    schema["layout"] = {"type": "tabs", "tabs": tabs}
+    return schema
+
+
+def _apply_field_priority(section: dict, field_names: tuple) -> None:
+    """把指定字段提到节内最前面（只改 order，不动校验与读取路径）。"""
+
+    fields = section.get("fields")
+    if not isinstance(fields, dict):
+        return
+    leading = [name for name in field_names if name in fields]
+    if not leading:
+        return
+    rest = [name for name in fields if name not in leading]
+    # 先按现有 order 排好其余字段，再整体重排 0..N，避免与顺序靠后的字段撞号
+    rest.sort(key=lambda name: (fields[name] or {}).get("order") or 0)
+    for index, name in enumerate(leading + rest):
+        field = fields.get(name)
+        if isinstance(field, dict):
+            field["order"] = index
+
+
 def _apply_webui_display_polish(schema: dict) -> dict:
-    """把 description 抄进 hint、补中文 label / 节标题、收起可选功能节。"""
+    """把 description 抄进 hint、补中文 label / 节标题、收起可选节、分组页签。"""
     if not isinstance(schema, dict):
         return schema
     sections = schema.get("sections")
@@ -2278,14 +2355,18 @@ def _apply_webui_display_polish(schema: dict) -> dict:
                 field["hint"] = field["description"]
             if not field.get("placeholder") and fname in _WEBUI_FIELD_PLACEHOLDERS:
                 field["placeholder"] = _WEBUI_FIELD_PLACEHOLDERS[fname]
-            label = field.get("label")
-            if (not label or label == fname) and field.get("description"):
-                new_label = _WEBUI_LABEL_OVERRIDES.get(fname) or _webui_label_from_description(
-                    field["description"]
-                )
-                if new_label and new_label != fname:
-                    field["label"] = new_label
-    return schema
+            # 手工 label 优先：自动推导只在前者缺席时兜底
+            if fname in _WEBUI_LABEL_OVERRIDES:
+                field["label"] = _WEBUI_LABEL_OVERRIDES[fname]
+            else:
+                label = field.get("label")
+                if (not label or label == fname) and field.get("description"):
+                    new_label = _webui_label_from_description(field["description"])
+                    if new_label and new_label != fname:
+                        field["label"] = new_label
+        if name in _WEBUI_FIELD_PRIORITY:
+            _apply_field_priority(section, _WEBUI_FIELD_PRIORITY[name])
+    return _apply_webui_tabs(schema)
 
 
 def create_plugin():
