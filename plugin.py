@@ -6,9 +6,11 @@
    （清洗标点/全半角后）。命中则按会话登记「歌词 -> 歌名」。
 2. 在 maisaka.replyer.before_model_request Hook 里，把 TTL 内的命中整理成
    system 内容注入本次模型请求:
-   - 新版运行时传 items（Context Item 快照），返回 SystemMessageItem；
-   - 旧版运行时传 messages，返回 {"role": "system", "content": ...}。
+   - 新版运行时传 items（Context Item 快照），并入已有的 SystemMessageItem；
+   - 旧版运行时传 messages，并入已有的 system 消息。
    两条路径同时给出，运行时只会读取自己认识的那个键，互不干扰。
+   注意：一次 LLM 请求只允许一条 system（否则供应商会报「有两个 system」），
+   所以两条路径都是**并入**已有 system，只有在完全没有时才新增一条。
 
 3. 歌词文件收件箱: 把 .txt / .lrc 歌词文件丢进**插件数据目录**下的 lyrics_inbox/，
    插件加载时或收到「/加歌」命令时自动解析入库（写进同目录的 user_songs.json），
@@ -2033,6 +2035,56 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             "parts": [{"type": "text", "text": text}],
         }
 
+    # ---------------- 单 system 纪律 ----------------
+    #
+    # 不少 LLM 供应商（OpenAI 兼容层、部分国内网关）只接受**一条** system 消息，
+    # 请求里出现第二条会直接报「一个请求有两个 system」。宿主请求本身已经带着
+    # 自己的 system（人设/工具说明），所以注入时只能并进那一条，不能追加新的。
+    # 两条路径（items / messages）都遵守同一纪律。
+
+    @staticmethod
+    def _merge_system_into_messages(messages: list[Any], text: str) -> list[Any]:
+        """把 text 并进 messages 里已有的 system 消息；没有才新增一条。
+
+        返回新列表，不就地改动调用方传入的 dict。
+        """
+        out = list(messages)
+        for idx, msg in enumerate(out):
+            if not isinstance(msg, dict) or msg.get("role") != "system":
+                continue
+            merged = dict(msg)
+            existing = merged.get("content")
+            if isinstance(existing, list):
+                # 多模态 content（[{type: text|image_url...}]）→ 追加一个文本 part
+                merged["content"] = list(existing) + [{"type": "text", "text": text}]
+            elif isinstance(existing, str) and existing.strip():
+                merged["content"] = f"{existing}\n\n{text}"
+            else:
+                merged["content"] = text
+            out[idx] = merged
+            return out
+        return out + [{"role": "system", "content": text}]
+
+    @classmethod
+    def _merge_system_into_items(cls, items: list[Any], text: str) -> list[Any]:
+        """把 text 并进 items 里已有的 SystemMessageItem；没有才新增一个。
+
+        items 最终同样会被展开成消息序列，这里多出一个 SystemMessageItem
+        就等于多出一条 system 消息，触发同一个报错。
+        """
+        out = list(items)
+        for idx, item in enumerate(out):
+            if not isinstance(item, dict) or item.get("item_type") != "SystemMessageItem":
+                continue
+            parts = item.get("parts")
+            if not isinstance(parts, list):
+                continue
+            merged = dict(item)
+            merged["parts"] = list(parts) + [{"type": "text", "text": text}]
+            out[idx] = merged
+            return out
+        return out + [cls._build_system_item(text)]
+
     @staticmethod
     def _item_texts(items: list[Any]) -> str:
         """拼出 items 里所有文本内容，用于判断是否已经注入过。"""
@@ -2090,16 +2142,15 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
                 for m in messages
             ):
                 return {"action": "continue"}
-            modified["messages"] = list(messages) + [
-                {"role": "system", "content": planner_text}
-            ]
+            # 并入已有 system，不新增第二条（见「单 system 纪律」）
+            modified["messages"] = self._merge_system_into_messages(messages, planner_text)
 
         # 方式 3: planner 请求带 items（Context Item schema v1）
         items = kwargs.get("items")
         if isinstance(items, list):
             if INJECT_MARKER in self._item_texts(items):
                 return {"action": "continue"}
-            modified["items"] = list(items) + [self._build_system_item(planner_text)]
+            modified["items"] = self._merge_system_into_items(items, planner_text)
             modified["item_schema_version"] = kwargs.get(
                 "item_schema_version", CONTEXT_ITEM_SCHEMA_VERSION
             )
@@ -2149,7 +2200,7 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         if isinstance(items, list):
             if INJECT_MARKER in self._item_texts(items):
                 return {"action": "continue"}
-            modified["items"] = list(items) + [self._build_system_item(system_text)]
+            modified["items"] = self._merge_system_into_items(items, system_text)
             modified["item_schema_version"] = kwargs.get(
                 "item_schema_version", CONTEXT_ITEM_SCHEMA_VERSION
             )
@@ -2162,7 +2213,8 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
                 for m in messages
             ):
                 return {"action": "continue"}
-            modified["messages"] = list(messages) + [{"role": "system", "content": system_text}]
+            # 并入已有 system，不新增第二条（见「单 system 纪律」）
+            modified["messages"] = self._merge_system_into_messages(messages, system_text)
 
         if not modified:
             self.ctx.logger.info(
