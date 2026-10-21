@@ -13,6 +13,8 @@ check_same_thread=True，跨线程复用会抛 ProgrammingError）。
 
 from __future__ import annotations
 
+import logging
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -104,6 +106,72 @@ def _coerce_aid(value: Any) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return number if number > 0 else None
+
+
+# ── 歌名匹配（供跨插件按歌名查 B站标识）─────────────────────────────
+#
+# 真实曲库里歌名形态很杂（3412 首样本统计）：
+#   - 大小写混杂：`a fairy of dreams` / `ADVENTURE` / `Aloud`；
+#   - 带括号补充：`Binary Life(二元生命)` / `九尾妖狐(PoKeR)` / `10（From bottom to the top）`
+#     —— 占 1%（20/3412）；
+#   - 点歌侧传来的常是「歌名 歌手」整串（`普通DISCO 洛天依`）。
+#
+# 而 `safe_song_name` **不转小写**，只做精确匹配的话「普通disco」命中不了
+# 「普通DISCO」。这里按「精确 → 忽略大小写 → 去括号 → 剥尾部 token」逐级放宽，
+# **每一级都要求唯一命中**：多候选不猜，返回空让调用方回退平台搜索。
+# 宁可回退，也不能放错版本——这是与 search_rank.py 同一条纪律。
+
+logger = logging.getLogger(__name__)
+
+#: 只剥「末尾完整括号段」：`9(:D` 这种没有配对的括号不动
+_RE_BRACKET_TAIL = re.compile(r"[\(（][^\(（\)）]*[\)）]\s*$")
+
+#: 精确 / 忽略大小写匹配（`COLLATE NOCASE` 只对 ASCII 有效，中文无大小写，无害）
+_SELECT_SONG = "SELECT id, name, bilibili_aid, bilibili_bvid FROM song WHERE deleted_at IS NULL AND ("
+_MATCH_SQL = (
+    _SELECT_SONG
+    + " name = ? OR safe_name = ? OR name = ? COLLATE NOCASE OR safe_name = ? COLLATE NOCASE"
+    ") ORDER BY id"
+)
+_BASE_SQL = (
+    _SELECT_SONG + " name LIKE ? ESCAPE '\\'"
+    ") ORDER BY id"
+)
+
+
+def _strip_trailing_brackets(text: str) -> str:
+    """剥掉歌名末尾的括号补充：`Binary Life(二元生命)` → `Binary Life`。"""
+    return _RE_BRACKET_TAIL.sub("", str(text or "")).strip()
+
+
+def _lookup_song_rows(conn: sqlite3.Connection, query: str) -> tuple[List[sqlite3.Row], str]:
+    """按一层歌名匹配规则查库，返回 (候选行, 命中层级)。
+
+    层级：`exact`（含忽略大小写）/ `base`（去括号补充）。都没有就返回空。
+    """
+    text = str(query or "").strip()
+    if not text:
+        return [], ""
+    safe = safe_song_name(text)
+    rows = conn.execute(_MATCH_SQL, (text, safe, text, safe)).fetchall()
+    if rows:
+        return list(rows), "exact"
+
+    # 基名：查询自带括号补充时剥掉它，否则**查询本身就是基名**——
+    # 后者不能跳过，否则「库里叫 `Binary Life(二元生命)`、用户点 `Binary Life`」
+    # 这种最常见的形态永远命不中。
+    base = _strip_trailing_brackets(text) or text
+    if base != text:
+        # 反向：查询带括号补充、库里存的是基名
+        base_safe = safe_song_name(base)
+        rows = conn.execute(_MATCH_SQL, (base, base_safe, base, base_safe)).fetchall()
+        if rows:
+            return list(rows), "base"
+    # 正向：库里是「基名 + 括号」。LIKE 前缀只做粗筛，再用「剥括号后必须等于基名」
+    # 精筛——否则 `Binary Life` 会把 `Binary Life 2` 这类无关项也捞进来。
+    rows = conn.execute(_BASE_SQL, (_escape_like(base) + "%",)).fetchall()
+    matched = [row for row in rows if _strip_trailing_brackets(row["name"]) == base]
+    return matched, "base" if matched else ""
 
 
 class SongStore:
@@ -340,31 +408,52 @@ class SongStore:
         return dict(row) if row else None
 
     def bilibili_ref(self, name: str) -> Optional[Dict[str, Any]]:
-        """取某首歌的原曲 B站标识，供点歌类插件按 bvid/aid 精确取流。
+        """按歌名取原曲 B站标识（多级匹配，**唯一命中**才采纳）。
 
-        返回 `None` 表示**库里没有这首歌**；返回 dict 但 `bvid` / `aid` 都为空
-        表示**歌在库里但没有 B站标识**（v2.14.0 起才采集，旧数据可能为空）。
-        调用方需要区分这两种情况——前者应回退到搜索，后者只能靠搜索。
+        逐级放宽：精确（含忽略大小写）→ 去括号补充 → 剥掉尾部 token
+        （点歌侧常传「歌名 歌手」整串，如 `普通DISCO 洛天依`）。
+
+        **每一级都要求唯一命中**：命中 0 条或多条都返回 None。多条时不猜——
+        `九尾妖狐(PoKeR)` 与 `九尾妖狐(肯德龟)` 这类同名不同版本，猜错就是
+        播错歌；让调用方回退到平台搜索才是安全边界。
+
+        返回 `None` 表示**没有可用的唯一匹配**（库里没这首，或存在歧义）；
+        返回 dict 但 `bvid` / `aid` 都为空，表示**歌在库里但没有 B站标识**
+        （v2.14.0 起才采集，旧数据可能为空）。调用方需要区分这两种情况。
 
         Returns:
-            `{"name": str, "aid": int|None, "bvid": str}` 或 `None`。
+            `{"name": str, "aid": int|None, "bvid": str, "match": str}`
+            （`match` ∈ `exact` / `base` / `prefix`），或 `None`。
         """
-        safe = safe_song_name(name)
-        if not safe and not (name or "").strip():
+        raw = str(name or "").strip()
+        if not raw:
             return None
+        rows: List[sqlite3.Row] = []
+        level = ""
         with self._session() as conn:
-            row = conn.execute(
-                "SELECT name, bilibili_aid, bilibili_bvid FROM song "
-                "WHERE (name = ? OR safe_name = ?) AND deleted_at IS NULL "
-                "ORDER BY id LIMIT 1",
-                (name, safe),
-            ).fetchone()
-        if row is None:
+            rows, level = _lookup_song_rows(conn, raw)
+            if not rows:
+                tokens = raw.split()
+                # 从长到短试前缀：`普通DISCO 洛天依` → `普通DISCO`
+                for cut in range(len(tokens) - 1, 0, -1):
+                    rows, level = _lookup_song_rows(conn, " ".join(tokens[:cut]))
+                    if rows:
+                        level = "prefix"
+                        break
+        if not rows:
             return None
+        if len(rows) > 1:
+            logger.info(
+                "bilibili_ref: 「%s」匹配到 %d 条记录（%s），存在歧义，不猜测",
+                raw, len(rows), "; ".join(str(row["name"]) for row in rows[:3]),
+            )
+            return None
+        row = rows[0]
         return {
             "name": row["name"],
             "aid": row["bilibili_aid"],
             "bvid": str(row["bilibili_bvid"] or ""),
+            "match": level,
         }
 
     def search(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:

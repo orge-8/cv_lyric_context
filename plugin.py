@@ -1738,7 +1738,10 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         参数：
             name: 歌名（会按 `safe_song_name` 归一化后匹配）。
 
-        返回字段：`schema_version` / `reason` / `found` / `name` / `aid` / `bvid`。
+        返回字段：`schema_version` / `reason` / `found` / `name` / `aid` / `bvid` / `match`。
+
+        `match` 表示歌名命中的层级（`exact` / `base` / `prefix`），供排查用：
+        查不到时能区分「库里真没有」与「匹配上了但没采集标识」。
         """
         empty = {
             "schema_version": 1,
@@ -1747,6 +1750,7 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             "name": str(name or ""),
             "aid": None,
             "bvid": "",
+            "match": "",
         }
         query = str(name or "").strip()
         if not query:
@@ -1763,7 +1767,7 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             self.ctx.logger.warning("get_song_bilibili 查询失败（%s）：%r", query, exc)
             return {**empty, "reason": f"曲库查询失败：{exc}"}
         if ref is None:
-            return {**empty, "reason": "曲库里没有这首歌"}
+            return {**empty, "reason": "曲库里没有这首歌（或存在同名歧义）"}
         return {
             "schema_version": 1,
             "reason": "" if (ref["bvid"] or ref["aid"]) else "该曲目尚未采集 B站标识",
@@ -1771,6 +1775,7 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             "name": ref["name"],
             "aid": ref["aid"],
             "bvid": ref["bvid"],
+            "match": str(ref.get("match") or ""),
         }
 
     @HookHandler(

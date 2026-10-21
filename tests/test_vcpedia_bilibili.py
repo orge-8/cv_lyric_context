@@ -279,7 +279,7 @@ _MOD = importlib.import_module(_PLUGIN_DIR.name)
 if not hasattr(_MOD, "create_plugin"):
     _MOD = importlib.import_module(f"{_PLUGIN_DIR.name}.plugin")
 
-_API_KEYS = {"schema_version", "reason", "found", "name", "aid", "bvid"}
+_API_KEYS = {"schema_version", "reason", "found", "name", "aid", "bvid", "match"}
 
 
 class _Ctx:
@@ -352,3 +352,213 @@ def test_api_name_is_normalized(tmp_path) -> None:
     out = asyncio.run(plug.api_get_song_bilibili(name="权御天下！"))
     assert out["found"] is True, out
     assert out["aid"] == 2075941
+
+
+# ── 歌名多级匹配（v2.14.1）─────────────────────────────────────
+#
+# 点歌插件传来的是用户原话（`普通DISCO` / `普通disco` / `普通DISCO 洛天依`），
+# 而库里歌名形态很杂。`safe_song_name` **不转小写**，只做精确匹配会大量漏命中。
+# 逐级放宽，但**每一级都要求唯一命中**：同名多版本时不猜，返回 None 让点歌
+# 回退平台搜索——宁可回退，不能播错版本。
+
+def _store_with(tmp_path, names: list[str]):
+    """建一个装了指定歌名的临时曲库（aid 依次递增便于区分）。"""
+    store = SongStore(Path(tmp_path) / "match.db")
+    for index, name in enumerate(names):
+        store.upsert({"name": name, "bilibili_aid": 1000 + index})
+    return store
+
+
+def test_exact_match(tmp_path) -> None:
+    store = _store_with(tmp_path, ["普通DISCO"])
+    ref = store.bilibili_ref("普通DISCO")
+    assert ref is not None
+    assert ref["name"] == "普通DISCO"
+    assert ref["match"] == "exact"
+
+
+def test_case_insensitive_match(tmp_path) -> None:
+    """safe_song_name 不转小写，「普通disco」必须能命中「普通DISCO」。"""
+    store = _store_with(tmp_path, ["普通DISCO"])
+    ref = store.bilibili_ref("普通disco")
+    assert ref is not None, "大小写差异不该导致漏命中"
+    assert ref["name"] == "普通DISCO"
+
+
+@pytest.mark.parametrize("query", ["普通DISCO！", "普通DISCO", " 普通DISCO "])
+def test_punctuation_and_space_tolerant(tmp_path, query: str) -> None:
+    store = _store_with(tmp_path, ["普通DISCO"])
+    assert store.bilibili_ref(query) is not None
+
+
+def test_strip_bracket_suffix_from_library_name(tmp_path) -> None:
+    """库里是 `Binary Life(二元生命)`，点「Binary Life」应命中。"""
+    store = _store_with(tmp_path, ["Binary Life(二元生命)"])
+    ref = store.bilibili_ref("Binary Life")
+    assert ref is not None
+    assert ref["name"] == "Binary Life(二元生命)"
+    assert ref["match"] == "base"
+
+
+def test_strip_bracket_suffix_from_query(tmp_path) -> None:
+    """反向：查询带括号补充、库里是基名。"""
+    store = _store_with(tmp_path, ["Binary Life"])
+    ref = store.bilibili_ref("Binary Life（日文版）")
+    assert ref is not None
+    assert ref["name"] == "Binary Life"
+    assert ref["match"] == "base"
+
+
+def test_ambiguous_base_is_not_guessed(tmp_path) -> None:
+    """`九尾妖狐` 在库里有 PoKeR / 肯德龟 两版 → 不猜，返回 None。
+
+    这是本模块最重要的一条纪律：猜错就是播错歌，宁可让点歌回退搜索。
+    """
+    store = _store_with(tmp_path, ["九尾妖狐(PoKeR)", "九尾妖狐(肯德龟)"])
+    assert store.bilibili_ref("九尾妖狐") is None
+
+
+def test_exact_wins_over_ambiguous_base(tmp_path) -> None:
+    """歧义只发生在放宽后的层级；精确命中时照常返回。"""
+    store = _store_with(tmp_path, ["九尾妖狐(PoKeR)", "九尾妖狐(肯德龟)"])
+    ref = store.bilibili_ref("九尾妖狐(PoKeR)")
+    assert ref is not None and ref["name"] == "九尾妖狐(PoKeR)"
+
+
+def test_no_substring_false_positive(tmp_path) -> None:
+    """`Binary Life` 不能被 `Binary Life 2` 这类同前缀无关项命中。"""
+    store = _store_with(tmp_path, ["Binary Life 2"])
+    assert store.bilibili_ref("Binary Life") is None
+
+
+def test_prefix_strip_for_song_plus_artist(tmp_path) -> None:
+    """点歌侧常传「歌名 歌手」整串。"""
+    store = _store_with(tmp_path, ["普通DISCO"])
+    ref = store.bilibili_ref("普通DISCO 洛天依")
+    assert ref is not None
+    assert ref["name"] == "普通DISCO"
+    assert ref["match"] == "prefix"
+
+
+def test_prefix_strip_does_not_invent_matches(tmp_path) -> None:
+    """库里只有「现场版」时，「歌名 歌手」不能剥成一半去命中它。"""
+    store = _store_with(tmp_path, ["普通DISCO 现场版"])
+    assert store.bilibili_ref("普通DISCO 洛天依") is None
+
+
+def test_bracketless_name_with_unpaired_parens(tmp_path) -> None:
+    """`9(:D` 这类没有配对括号的歌名不能被剥成 `9`，否则会误命中。"""
+    store = _store_with(tmp_path, ["9(:D"])
+    assert store.bilibili_ref("9") is None
+    assert store.bilibili_ref("9(:D") is not None
+
+
+def test_blank_query(tmp_path) -> None:
+    store = _store_with(tmp_path, ["普通DISCO"])
+    assert store.bilibili_ref("") is None
+    assert store.bilibili_ref("   ") is None
+
+
+# ── 歌名多级匹配（v2.14.1）─────────────────────────────────────
+#
+# 点歌插件传来的是用户原话（`普通DISCO` / `普通disco` / `普通DISCO 洛天依`），
+# 而库里歌名形态很杂。`safe_song_name` **不转小写**，只做精确匹配会大量漏命中。
+# 逐级放宽，但**每一级都要求唯一命中**：同名多版本时不猜，返回 None 让点歌
+# 回退平台搜索——宁可回退，不能播错版本。
+
+def _store_with(tmp_path, names: list[str]):
+    """建一个装了指定歌名的临时曲库（aid 依次递增便于区分）。"""
+    store = SongStore(Path(tmp_path) / "match.db")
+    for index, name in enumerate(names):
+        store.upsert({"name": name, "bilibili_aid": 1000 + index})
+    return store
+
+
+def test_exact_match(tmp_path) -> None:
+    store = _store_with(tmp_path, ["普通DISCO"])
+    ref = store.bilibili_ref("普通DISCO")
+    assert ref is not None
+    assert ref["name"] == "普通DISCO"
+    assert ref["match"] == "exact"
+
+
+def test_case_insensitive_match(tmp_path) -> None:
+    """safe_song_name 不转小写，「普通disco」必须能命中「普通DISCO」。"""
+    store = _store_with(tmp_path, ["普通DISCO"])
+    ref = store.bilibili_ref("普通disco")
+    assert ref is not None, "大小写差异不该导致漏命中"
+    assert ref["name"] == "普通DISCO"
+
+
+@pytest.mark.parametrize("query", ["普通DISCO！", "普通DISCO", " 普通DISCO "])
+def test_punctuation_and_space_tolerant(tmp_path, query: str) -> None:
+    store = _store_with(tmp_path, ["普通DISCO"])
+    assert store.bilibili_ref(query) is not None
+
+
+def test_strip_bracket_suffix_from_library_name(tmp_path) -> None:
+    """库里是 `Binary Life(二元生命)`，点「Binary Life」应命中。"""
+    store = _store_with(tmp_path, ["Binary Life(二元生命)"])
+    ref = store.bilibili_ref("Binary Life")
+    assert ref is not None
+    assert ref["name"] == "Binary Life(二元生命)"
+    assert ref["match"] == "base"
+
+
+def test_strip_bracket_suffix_from_query(tmp_path) -> None:
+    """反向：查询带括号补充、库里是基名。"""
+    store = _store_with(tmp_path, ["Binary Life"])
+    ref = store.bilibili_ref("Binary Life（日文版）")
+    assert ref is not None
+    assert ref["name"] == "Binary Life"
+    assert ref["match"] == "base"
+
+
+def test_ambiguous_base_is_not_guessed(tmp_path) -> None:
+    """`九尾妖狐` 在库里有 PoKeR / 肯德龟 两版 → 不猜，返回 None。
+
+    这是本模块最重要的一条纪律：猜错就是播错歌，宁可让点歌回退搜索。
+    """
+    store = _store_with(tmp_path, ["九尾妖狐(PoKeR)", "九尾妖狐(肯德龟)"])
+    assert store.bilibili_ref("九尾妖狐") is None
+
+
+def test_exact_wins_over_ambiguous_base(tmp_path) -> None:
+    """歧义只发生在放宽后的层级；精确命中时照常返回。"""
+    store = _store_with(tmp_path, ["九尾妖狐(PoKeR)", "九尾妖狐(肯德龟)"])
+    ref = store.bilibili_ref("九尾妖狐(PoKeR)")
+    assert ref is not None and ref["name"] == "九尾妖狐(PoKeR)"
+
+
+def test_no_substring_false_positive(tmp_path) -> None:
+    """`Binary Life` 不能被 `Binary Life 2` 这类同前缀无关项命中。"""
+    store = _store_with(tmp_path, ["Binary Life 2"])
+    assert store.bilibili_ref("Binary Life") is None
+
+
+def test_prefix_strip_for_song_plus_artist(tmp_path) -> None:
+    """点歌侧常传「歌名 歌手」整串。"""
+    store = _store_with(tmp_path, ["普通DISCO"])
+    ref = store.bilibili_ref("普通DISCO 洛天依")
+    assert ref is not None
+    assert ref["name"] == "普通DISCO"
+    assert ref["match"] == "prefix"
+
+
+def test_prefix_strip_does_not_invent_matches(tmp_path) -> None:
+    """库里只有「现场版」时，「歌名 歌手」不能剥成一半去命中它。"""
+    store = _store_with(tmp_path, ["普通DISCO 现场版"])
+    assert store.bilibili_ref("普通DISCO 洛天依") is None
+
+
+def test_bracketless_name_with_unpaired_parens(tmp_path) -> None:
+    """`9(:D` 这类没有配对括号的歌名不能被剥成 `9`，否则会误命中。"""
+    store = _store_with(tmp_path, ["9(:D"])
+    assert store.bilibili_ref("9") is None
+    assert store.bilibili_ref("9(:D") is not None
+
+
+def test_blank_query(tmp_path) -> None:
+    store = _store_with(tmp_path, ["普通DISCO"])
+    assert store.bilibili_ref("") is None
+    assert store.bilibili_ref("   ") is None
