@@ -456,6 +456,79 @@ class SongStore:
             "match": level,
         }
 
+    def songs_missing_bilibili(self, limit: int) -> List[str]:
+        """取缺 B站标识的歌曲名（供回填任务分批取用）。
+
+        已填过的条目不再满足条件，所以第二次跑只会处理「确实没有 bb_id」的
+        那一小部分——不需要额外的冷却时间戳。
+
+        Args:
+            limit: 本批上限（<=0 返回空列表）。
+
+        Returns:
+            歌名列表（按 id 升序，稳定可续跑）。
+        """
+        if limit <= 0:
+            return []
+        with self._session() as conn:
+            rows = conn.execute(
+                "SELECT name FROM song WHERE deleted_at IS NULL "
+                "AND bilibili_aid IS NULL AND (bilibili_bvid IS NULL OR bilibili_bvid = '') "
+                "ORDER BY id LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [str(row["name"]) for row in rows]
+
+    def count_missing_bilibili(self) -> int:
+        """缺 B站标识的条目总数（用于回报「还剩多少」）。"""
+        with self._session() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM song WHERE deleted_at IS NULL "
+                "AND bilibili_aid IS NULL AND (bilibili_bvid IS NULL OR bilibili_bvid = '')"
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def update_bilibili(self, name: str, aid: Any, bvid: str) -> bool:
+        """只写 B站标识两列，**不碰歌词 / 创作者 / 分类**。
+
+        与 `upsert` 的关键区别：回填 B站标识时不该把已经同步好的歌词和 9 个
+        创作者字段整体覆盖一遍（那是 `upsert` 的语义，且会顺带刷新
+        `fetched_at`，让「多久没抓过」的判断失真）。这里保持最小写入面。
+
+        单调累积：新值为空时保留旧值——BV 号不会变，页面模板改动却会让
+        新解析结果为空。
+
+        Returns:
+            True 表示确实写入了至少一个标识；False 表示定位不到歌，
+            或新旧值相同（无变化）。
+        """
+        text = str(name or "").strip()
+        if not text:
+            return False
+        new_aid = _coerce_aid(aid)
+        new_bvid = str(bvid or "").strip()
+        with self._session() as conn:
+            row = conn.execute(
+                "SELECT id, bilibili_aid, bilibili_bvid FROM song "
+                "WHERE (name = ? OR safe_name = ?) AND deleted_at IS NULL "
+                "ORDER BY id LIMIT 1",
+                (text, safe_song_name(text)),
+            ).fetchone()
+            if row is None:
+                return False
+            old_aid = row["bilibili_aid"]
+            old_bvid = str(row["bilibili_bvid"] or "")
+            keep_aid = new_aid if new_aid is not None else old_aid
+            keep_bvid = new_bvid or old_bvid
+            if keep_aid == old_aid and keep_bvid == old_bvid:
+                return False
+            conn.execute(
+                "UPDATE song SET bilibili_aid = ?, bilibili_bvid = ?, updated_at = ? "
+                "WHERE id = ?",
+                (keep_aid, keep_bvid, time.time(), row["id"]),
+            )
+        return True
+
     def search(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
         """按歌名/歌手/UP主模糊搜索。"""
         kw = (keyword or "").strip()

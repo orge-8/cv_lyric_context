@@ -562,3 +562,149 @@ def test_blank_query(tmp_path) -> None:
     store = _store_with(tmp_path, ["普通DISCO"])
     assert store.bilibili_ref("") is None
     assert store.bilibili_ref("   ") is None
+
+
+# ── B站标识回填任务（v2.14.2）──────────────────────────────────
+#
+# 真机 2026-10-22 实测：`/歌词 补歌词` 只挑**歌词为空**的条目（43 首全是确无
+# 歌词的，一首都没补回），而 B站标识缺失的是**全部历史条目**——两者要筛的
+# 对象完全不同，所以需要独立入口。
+#
+# 回填必须走 `update_bilibili`（只写两列），不能复用 `upsert`：后者会整体
+# 覆盖歌词与 9 个创作者字段，等于把已同步的内容再刷一遍。
+
+
+def _refill_store(tmp_path):
+    return SongStore(Path(tmp_path) / "refill.db")
+
+
+def test_songs_missing_bilibili_skips_filled(tmp_path) -> None:
+    store = _refill_store(tmp_path)
+    store.upsert({"name": "已有aid", "bilibili_aid": 111})
+    store.upsert({"name": "缺标识"})
+    store.upsert({"name": "已有bvid", "bilibili_bvid": "BV1zs411S7sz"})
+    assert store.songs_missing_bilibili(10) == ["缺标识"]
+    assert store.count_missing_bilibili() == 1
+
+
+def test_songs_missing_bilibili_limit(tmp_path) -> None:
+    store = _refill_store(tmp_path)
+    for index in range(5):
+        store.upsert({"name": f"歌{index}"})
+    assert len(store.songs_missing_bilibili(3)) == 3
+    assert store.songs_missing_bilibili(0) == []
+
+
+def test_update_bilibili_writes_only_two_columns(tmp_path) -> None:
+    """最关键的一条：回填不能碰歌词与创作者。"""
+    store = _refill_store(tmp_path)
+    store.upsert({
+        "name": "权御天下",
+        "lyrics": "原歌词内容\n第二行",
+        "lyricist": "作词人甲",
+        "composer": "作曲人乙",
+        "introduction": "简介原文",
+    })
+    assert store.update_bilibili("权御天下", 2075941, "") is True
+    # 注意：`get()` 返回的是旧 21 列的兼容视图，不含 bilibili 列，
+    # 所以 B站标识要用 bilibili_ref 读
+    assert store.bilibili_ref("权御天下")["aid"] == 2075941
+    got = store.get("权御天下")
+    assert got["lyrics"] == "原歌词内容\n第二行", "歌词被覆盖了"
+    assert got["lyricist"] == "作词人甲", "创作者被覆盖了"
+    assert got["introduction"] == "简介原文", "简介被覆盖了"
+
+
+def test_update_bilibili_is_monotonic(tmp_path) -> None:
+    """再次回填解析不到值时保留旧标识。"""
+    store = _refill_store(tmp_path)
+    store.upsert({"name": "世末歌者", "bilibili_bvid": "BV1Qs411k7Qv"})
+    assert store.update_bilibili("世末歌者", None, "") is False
+    assert store.bilibili_ref("世末歌者")["bvid"] == "BV1Qs411k7Qv"
+
+
+def test_update_bilibili_unchanged_returns_false(tmp_path) -> None:
+    store = _refill_store(tmp_path)
+    store.upsert({"name": "达拉崩吧", "bilibili_aid": 9372087})
+    assert store.update_bilibili("达拉崩吧", 9372087, "") is False
+
+
+def test_update_bilibili_unknown_song(tmp_path) -> None:
+    store = _refill_store(tmp_path)
+    assert store.update_bilibili("不存在", 123, "") is False
+
+
+class _FakeWikiClient:
+    """假 VCPedia 客户端：按标题返回预置 wikitext。"""
+
+    def __init__(self, pages: dict) -> None:
+        self.pages = pages
+        self.fetched: list[str] = []
+
+    def fetch_wikitext(self, title: str):
+        self.fetched.append(title)
+        return self.pages.get(title)
+
+
+def _worker_plugin(tmp_path, names: list[str]):
+    plug = _MOD.create_plugin()
+    plug.set_plugin_config({})
+    plug._ctx = _Ctx()
+    plug._store = SongStore(Path(tmp_path) / "worker.db")
+    for name in names:
+        plug._store.upsert({"name": name})
+    plug._refetch_stop = False
+    return plug
+
+
+def test_worker_fills_and_counts(tmp_path) -> None:
+    plug = _worker_plugin(tmp_path, ["权御天下", "无标识歌"])
+    fake = _FakeWikiClient({"权御天下": QUANYU, "无标识歌": "{{消歧义}}\n* 别的歌"})
+    plug._get_client = lambda: fake
+    stats = plug._refetch_bilibili_worker(["权御天下", "无标识歌"])
+    assert stats == {"tried": 2, "filled": 1, "no_id": 1, "errors": 0, "stopped": False}
+    assert plug.store.bilibili_ref("权御天下")["aid"] == 2075941
+    assert fake.fetched == ["权御天下", "无标识歌"]
+
+
+def test_worker_counts_fetch_failure_as_error(tmp_path) -> None:
+    plug = _worker_plugin(tmp_path, ["拉不到的歌"])
+    fake = _FakeWikiClient({})  # 返回 None
+    plug._get_client = lambda: fake
+    stats = plug._refetch_bilibili_worker(["拉不到的歌"])
+    assert stats["errors"] == 1 and stats["filled"] == 0
+
+
+def test_worker_respects_stop_flag(tmp_path) -> None:
+    plug = _worker_plugin(tmp_path, ["甲", "乙", "丙"])
+    fake = _FakeWikiClient({"甲": QUANYU, "乙": QUANYU, "丙": QUANYU})
+    plug._get_client = lambda: fake
+
+    def fake_worker_stop(_name):
+        plug._refetch_stop = True
+        return QUANYU
+
+    fake.fetch_wikitext = fake_worker_stop
+    stats = plug._refetch_bilibili_worker(["甲", "乙", "丙"])
+    assert stats["stopped"] is True
+    assert stats["tried"] == 1, "中止后不该继续抓"
+
+
+def test_command_pattern_matches_aliases() -> None:
+    """命令别名要能匹配，且不能和「补歌词」串味。"""
+    import re
+
+    plug = _MOD.create_plugin()
+    info = getattr(type(plug).cmd_refetch_bilibili, "__maibot_component_info__")
+    pattern = info.command_pattern
+    for text in (
+        "/歌词 补BV",
+        "/歌词 补bv 100",
+        "/歌词 补b站",
+        "/歌词 补B站 50",
+        "/歌词 refetch_bilibili",
+        "／歌词 补bv",
+    ):
+        assert re.match(pattern, text), text
+    for text in ("/歌词 补歌词", "/歌词", "/歌词 补BVx", "/歌词 搜索 权御天下"):
+        assert not re.match(pattern, text), text

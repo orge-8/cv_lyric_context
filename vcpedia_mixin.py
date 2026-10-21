@@ -25,7 +25,7 @@ from singer_check import check_singer
 from vcpedia_client import USER_AGENT, VCPediaClient, VCPediaError
 from vcpedia_store import EMOTION_TAGS, SongStore
 from vcpedia_sync import SyncStats, VCPediaSyncer, build_record
-from vcpedia_wikitext_parser import parse_wikitext
+from vcpedia_wikitext_parser import parse_bilibili_id, parse_wikitext
 
 DB_FILE = "vcpedia_songs.db"
 COOKIE_FILE = "anubis_cookies.txt"
@@ -565,6 +565,139 @@ class VCPediaMixin:
             f"已开始批量补歌词（最多 {limit} 首空歌词条目）… 完成后回报结果；"
             "发送「/歌词 取消」可中止。",
         )
+
+    @Command(
+        "lyrics_refetch_bilibili",
+        description=(
+            "批量回填歌曲库缺失的 B站原曲标识（只写 bilibili_aid/bvid 两列，"
+            "不动歌词与创作者）；供点歌插件按原曲精确取流"
+        ),
+        pattern=(
+            r"^\s*[/／]\s*歌词\s+"
+            r"(?i:补bv|补b站|补bilibili|refetch_bilibili)"
+            r"(?:\s+(?P<limit>\d+))?\s*$"
+        ),
+    )
+    async def cmd_refetch_bilibili(
+        self, stream_id: str = "", text: str = "", **kwargs: Any
+    ) -> tuple[bool, str, int]:
+        """回填 B站标识。
+
+        为什么不复用「补歌词」：那条命令只挑**歌词为空**的条目（真机 2026-10-22
+        实测 43 首全是确无歌词的，一首都没补回），而 B站标识缺失的是全部历史
+        条目——两者要筛的对象完全不同。
+
+        为什么只写两列：`upsert` 的语义是整体覆盖歌词与 9 个创作者字段，
+        回填 B站标识时那样做等于把已同步的内容再刷一遍，没有收益还有风险。
+        """
+        if not self.config.plugin.enabled:
+            return False, "插件已禁用", 2
+        if not self.config.crawler.allow_sync_command:
+            return False, "同步命令已在配置中关闭", 2
+        denied = self._sync_denied(kwargs)
+        if denied:
+            return False, denied, 2
+        if self._sync_task and not self._sync_task.done():
+            return False, "已有同步/补歌词任务在跑，发送「/歌词 取消」可中止", 2
+        limit = self._matched_int(kwargs, "limit", text, 2)
+        limit = limit or int(self.config.crawler.sync_batch_limit)
+        # 命令在群里谁都能发，显式条数夹到上限
+        if limit > _MAX_SYNC_LIMIT:
+            limit = _MAX_SYNC_LIMIT
+        self._refetch_stop = False
+        self._sync_stream = stream_id or ""
+        self._sync_task = asyncio.create_task(self._run_refetch_bilibili(limit))
+        return await self._reply(
+            stream_id,
+            f"已开始回填 B站标识（本批最多 {limit} 首，只写 B站两列，不动歌词）… "
+            "完成后回报结果；发送「/歌词 取消」可中止。",
+        )
+
+    async def _run_refetch_bilibili(self, limit: int) -> None:
+        """后台批量回填 B站标识。结果通过 _sync_stream 回报。"""
+        try:
+            names = self.store.songs_missing_bilibili(limit)
+        except RuntimeError as exc:
+            if self._sync_stream:
+                await self.ctx.send.text(f"歌曲库不可用：{exc}", self._sync_stream)
+            self._sync_stream = ""
+            return
+        if not names:
+            if self._sync_stream:
+                await self.ctx.send.text(
+                    "库里所有歌曲都已有 B站标识，无需回填。", self._sync_stream
+                )
+            self._sync_stream = ""
+            return
+        # 网络抓取整体丢到线程，避免阻塞事件循环（与补歌词同一做法）
+        try:
+            result = await asyncio.to_thread(self._refetch_bilibili_worker, names)
+        except Exception as exc:  # noqa: BLE001 - 回填失败要回报，不能静默
+            self.ctx.logger.exception("VCPedia: 回填 B站标识异常: %s", exc)
+            if self._sync_stream:
+                await self.ctx.send.text(f"回填 B站标识异常：{exc}", self._sync_stream)
+            self._sync_stream = ""
+            self._refetch_stop = False
+            return
+        self._refetch_stop = False
+        try:
+            remaining = self.store.count_missing_bilibili()
+        except Exception:  # noqa: BLE001 - 统计失败不影响主结果回报
+            remaining = -1
+        parts = [
+            f"B站标识回填完成：检查 {result['tried']} 首，回填 {result['filled']} 首，"
+            f"页面确无 bb_id {result['no_id']} 首"
+        ]
+        if result["errors"]:
+            parts[0] += f"，失败 {result['errors']} 首"
+        if result["stopped"]:
+            parts[0] += "（已手动中止）"
+        if remaining > 0:
+            parts.append(f"库里仍缺 {remaining} 首，再发一次本命令可继续。")
+        elif remaining == 0:
+            parts.append("全覆盖：库里已无缺 B站标识的条目。")
+        if self._sync_stream:
+            await self.ctx.send.text("\n".join(parts), self._sync_stream)
+        self._sync_stream = ""
+
+    def _refetch_bilibili_worker(self, names: List[str]) -> dict:
+        """线程内逐首抓 wikitext，只取 bb_id 写两列。返回统计。"""
+        tried = filled = no_id = errors = 0
+        client = self._get_client()
+        for name in names:
+            if self._refetch_stop:
+                break
+            tried += 1
+            if tried % 10 == 0:
+                self.ctx.logger.info("B站标识回填进度: %d/%d", tried, len(names))
+            try:
+                source = client.fetch_wikitext(name)
+            except Exception as exc:  # noqa: BLE001 - 单首失败不影响整批
+                self.ctx.logger.warning("回填 B站标识 %s 抓取失败: %s", name, exc)
+                errors += 1
+                continue
+            if not source:
+                errors += 1
+                continue
+            bili = parse_bilibili_id(source)
+            if not (bili.get("aid") or bili.get("bvid")):
+                no_id += 1
+                continue
+            try:
+                if self.store.update_bilibili(name, bili.get("aid"), bili.get("bvid") or ""):
+                    filled += 1
+                else:
+                    no_id += 1
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.warning("回填 B站标识 %s 写入失败: %s", name, exc)
+                errors += 1
+        return {
+            "tried": tried,
+            "filled": filled,
+            "no_id": no_id,
+            "errors": errors,
+            "stopped": self._refetch_stop,
+        }
 
     def _refill_cooldown(self) -> float:
         """补歌词的跳过窗口（秒）。配置单位是天，这里换算并做类型兜底。"""
