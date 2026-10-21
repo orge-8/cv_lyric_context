@@ -1,0 +1,354 @@
+"""VCPedia B站视频标识（bb_id）解析与落库的回归测试。
+
+背景：`song` 表从 v1 起就有 `bilibili_aid` / `bilibili_bvid` 两列，但**从未
+被写入过**——抓取侧没有解析代码。要让点歌插件按原曲 BV 精确取流，先把这两列
+填上。
+
+页面结构的事实边界（2026-10-21 实抓 7 个词条确认，样本内联在下方夹具里）：
+
+    | 词条       | Songbox 数 | 首个 bb_id      | 说明                        |
+    |------------|-----------|-----------------|-----------------------------|
+    | 权御天下    | 2         | av2075941       | 第 2 个是洛天依官方重制版     |
+    | 达拉崩吧    | 3         | av9372087       | 第 2/3 个是翻唱              |
+    | 世末歌者    | 2         | BV1Qs411k7Qv    | 第 2 个是同 UP 的另一投稿     |
+    | 万古生香    | 1         | av78977256      | —                           |
+    | 大氿歌      | 1         | av45020985      | —                           |
+    | 普通DISCO   | **0**     | （无）          | 退回首个 BilibiliVideo=2129461 |
+
+两条铁律：
+1. **首个 Songbox 才是原曲**——后续 Songbox 属于重制版/翻唱，取错会播错版本；
+2. Songbox 参数里有嵌套模板（`再生 = {{bilibiliCount|id=9372087}}`），
+   块切分必须按 `{{ }}` 深度做，朴素找最近的 `}}` 会切在最内层。
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from vcpedia_store import SongStore
+from vcpedia_wikitext_parser import (
+    normalize_bilibili_ref,
+    parse_bilibili_id,
+    parse_wikitext,
+)
+
+# ── 夹具：贴近实抓结构的片段（保留嵌套模板与多 Songbox）──────────────────
+
+QUANYU = """{{tabs/core
+|label1=原版　
+|text1={{anchor|原版}}
+{{VOCALOID_Songbox
+|image = 封面-权御天下.jpg
+|演唱 = [[洛天依]]
+|歌曲名称 = 权御天下
+|UP主 = [[乌龟Sui]]
+|bb_id = av2075941
+|wyy_id = 30854398
+|其他资料 = 2015年2月18日首公开<br>再生数为{{BilibiliCount|id=2075941}}
+}}
+{{VOCALOID_Songbox
+|歌曲名称 = 权御天下
+|UP主 = [[洛天依]]官方账号
+|bb_id = BV1FwuyzAEsw
+}}
+"""
+
+DALA = """{{VOCALOID_Songbox
+|演唱     = [[洛天依]]、[[言和]]
+|歌曲名称 = 达拉崩吧
+|UP主     = [[ilem]]
+|bb_id    = av9372087
+|投稿时间 = 2017年3月25日
+|再生     = {{bilibiliCount|id=9372087}}
+}}
+{{VOCALOID_Songbox
+|歌曲名称 = 达拉崩吧 王浩然视角
+|UP主     = [[栗央Kurio]]
+|bb_id    = av9878039
+}}
+{{VOCALOID_Songbox
+|歌曲名称 = 吃鸡有神仙
+|UP主     = [[折腾5号]]
+|bb_id    = av17017664
+}}
+"""
+
+SHIMO = """{{VOCALOID_Songbox
+|歌曲名称 = 世末歌者
+|UP主 = [[COP]]
+|bb_id = BV1Qs411k7Qv
+}}
+{{VOCALOID_Songbox
+|歌曲名称 = 世末歌者
+|UP主 = [[COP]]
+|bb_id = av13787072
+}}
+"""
+
+PUTONG = """{{tabs/core|label1=原版}}
+== 简介 ==
+《'''普通DISCO'''》是[[ilem]]于2015年3月21日投稿至[[bilibili]]的原创曲。
+{{BilibiliVideo|id=2129461}}
+另有{{Hide|翻唱|{{BilibiliVideo|id=2130097}}}}
+"""
+
+
+# ── 解析：正常样本 ────────────────────────────────────────────
+
+
+def test_first_songbox_wins_over_later_remake() -> None:
+    """权御天下：必须取首个 Songbox 的原版，不能取洛天依官方重制版。"""
+    got = parse_bilibili_id(QUANYU)
+    assert got["aid"] == 2075941, got
+    assert got["bvid"] == ""
+    assert got["source"] == "songbox"
+
+
+def test_first_songbox_wins_over_covers() -> None:
+    """达拉崩吧：三个 Songbox 里只认 ilem 原曲。"""
+    got = parse_bilibili_id(DALA)
+    assert got["aid"] == 9372087, got
+
+
+def test_bv_form_is_preserved() -> None:
+    """bb_id 写成 BV 号时保留 bvid、aid 留空（世末歌者首个是 BV）。"""
+    got = parse_bilibili_id(SHIMO)
+    assert got["bvid"] == "BV1Qs411k7Qv", got
+    assert got["aid"] is None
+
+
+def test_nested_template_does_not_break_block_split() -> None:
+    """Songbox 参数里的嵌套模板不能把块切碎，否则第二个 bb_id 会串位。"""
+    # DALA 的第 6 行是 `|再生 = {{bilibiliCount|id=9372087}}`：
+    # 若按最近的 }} 切块，首个块会在 9372087 处结束，bb_id 仍在块内 —— 但
+    # 第二个 Songbox 的块边界会错位，导致 av9878039 被当成首个结果。
+    assert parse_bilibili_id(DALA)["aid"] == 9372087
+
+
+def test_falls_back_to_first_bilibili_video() -> None:
+    """无 Songbox 时退回正文首个 BilibiliVideo（普通DISCO 的原曲 2129461）。"""
+    got = parse_bilibili_id(PUTONG)
+    assert got["aid"] == 2129461, got
+    assert got["source"] == "bilibili_video"
+
+
+def test_no_bilibili_info_returns_empty() -> None:
+    """完全没有 B站信息时返回空结果（不能返回 {"aid": None} 糊弄调用方）。"""
+    assert parse_bilibili_id("{{消歧义}}\n* '''[[九九八十一(乐正绫)]]'''") == {
+        "aid": None,
+        "bvid": "",
+        "source": "",
+    }
+
+
+def test_empty_source_is_safe() -> None:
+    assert parse_bilibili_id("")["aid"] is None
+    assert parse_bilibili_id(None)["aid"] is None  # type: ignore[arg-type]
+
+
+# ── 归一化：值形态 ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("av2075941", {"aid": 2075941, "bvid": ""}),
+        ("AV2075941", {"aid": 2075941, "bvid": ""}),
+        ("2075941", {"aid": 2075941, "bvid": ""}),
+        ("BV1zs411S7sz", {"aid": None, "bvid": "BV1zs411S7sz"}),
+        ("[[https://www.bilibili.com/video/av2130097 av2130097]]", {"aid": 2130097, "bvid": ""}),
+        ("", {}),
+        ("—", {}),
+        ("待补充", {}),
+    ],
+)
+def test_normalize_bilibili_ref(raw: str, expected: dict) -> None:
+    assert normalize_bilibili_ref(raw) == expected
+
+
+def test_bv_wins_over_digits_inside_it() -> None:
+    """BV 号里有数字，不能先被 av 数字规则吃掉。"""
+    assert normalize_bilibili_ref("BV1zs411S7sz")["bvid"] == "BV1zs411S7sz"
+    assert normalize_bilibili_ref("BV1zs411S7sz")["aid"] is None
+
+
+# ── parse_wikitext 集成 ──────────────────────────────────────
+
+
+def test_parse_wikitext_exposes_bilibili_fields() -> None:
+    parsed = parse_wikitext("权御天下", QUANYU)
+    assert parsed["bilibili_aid"] == 2075941
+    assert parsed["bilibili_bvid"] == ""
+    assert parsed["bilibili_source"] == "songbox"
+
+
+# ── 落库：写入与单调累积 ─────────────────────────────────────
+
+
+def _read_bili(db_path: Path, name: str) -> tuple:
+    # 必须显式 close：sqlite3.Connection 的上下文管理器只 commit/rollback，
+    # **不关闭连接**；Windows 上未关闭的连接会持有文件锁，导致临时目录清理失败。
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT bilibili_aid, bilibili_bvid FROM song WHERE name = ?", (name,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, f"{name} 未入库"
+    return row["bilibili_aid"], row["bilibili_bvid"]
+
+
+def test_upsert_writes_bilibili_columns() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = SongStore(Path(tmp) / "t.db")
+        store.upsert(
+            {"name": "权御天下", "bilibili_aid": 2075941, "bilibili_bvid": ""}
+        )
+        assert _read_bili(store.db_path, "权御天下") == (2075941, "")
+
+
+def test_upsert_bv_form_is_stored() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = SongStore(Path(tmp) / "t.db")
+        store.upsert(
+            {"name": "世末歌者", "bilibili_aid": None, "bilibili_bvid": "BV1Qs411k7Qv"}
+        )
+        assert _read_bili(store.db_path, "世末歌者") == (None, "BV1Qs411k7Qv")
+
+
+def test_upsert_keeps_old_bilibili_when_new_is_empty() -> None:
+    """单调累积：重抓解析不到 bb_id 时不能把已采集的抹掉。
+
+    这是与 9 个创作者字段「整体覆盖」语义的唯一分歧点。全量重抓上万个词条时，
+    页面模板改动 / 被改成消歧义页都会让新值为空，BV 号本身不会变。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        store = SongStore(Path(tmp) / "t.db")
+        store.upsert(
+            {"name": "权御天下", "bilibili_aid": 2075941, "bilibili_bvid": "BV1FwuyzAEsw"}
+        )
+        # 第二次抓取什么都没解析出来
+        store.upsert({"name": "权御天下", "introduction": "改过简介"})
+        assert _read_bili(store.db_path, "权御天下") == (2075941, "BV1FwuyzAEsw")
+
+
+def test_upsert_overwrites_bilibili_when_new_value_present() -> None:
+    """有值时必须能更新（词条把 bb_id 改正了要能生效）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = SongStore(Path(tmp) / "t.db")
+        store.upsert({"name": "达拉崩吧", "bilibili_aid": 111})
+        store.upsert({"name": "达拉崩吧", "bilibili_aid": 9372087})
+        assert _read_bili(store.db_path, "达拉崩吧")[0] == 9372087
+
+
+def test_upsert_ignores_invalid_aid() -> None:
+    """脏 aid（非数字 / 0 / 负数）不落库也不抛异常，单首坏数据不该中断同步。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = SongStore(Path(tmp) / "t.db")
+        store.upsert({"name": "脏数据", "bilibili_aid": "av-something", "bilibili_bvid": ""})
+        assert _read_bili(store.db_path, "脏数据") == (None, "")
+        store.upsert({"name": "零值", "bilibili_aid": 0})
+        assert _read_bili(store.db_path, "零值") == (None, "")
+
+
+# ── 跨插件只读 API：get_song_bilibili ───────────────────────────
+#
+# 点歌插件要按原曲 BV 精确取流，靠这个 API 拿标识。契约与
+# `get_recent_songs` 同一套：零网络、结构永远完整、不抛异常。
+# 特别地，`store` 是 property，未初始化时**抛 RuntimeError**——
+# `getattr(self, "store", None)` 拦不住（default 只对 AttributeError 生效），
+# 所以这条路径必须有独立用例守着。
+
+import asyncio  # noqa: E402
+import importlib  # noqa: E402
+import logging  # noqa: E402
+import sys  # noqa: E402
+
+_PLUGIN_DIR = Path(__file__).resolve().parent.parent
+for _p in (str(_PLUGIN_DIR), str(_PLUGIN_DIR.parent)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+_MOD = importlib.import_module(_PLUGIN_DIR.name)
+if not hasattr(_MOD, "create_plugin"):
+    _MOD = importlib.import_module(f"{_PLUGIN_DIR.name}.plugin")
+
+_API_KEYS = {"schema_version", "reason", "found", "name", "aid", "bvid"}
+
+
+class _Ctx:
+    def __init__(self) -> None:
+        self.logger = logging.getLogger("test-bili-api")
+
+
+def _plugin(tmp_path, records=None, *, started=True):
+    plug = _MOD.create_plugin()
+    plug.set_plugin_config({})
+    plug._ctx = _Ctx()
+    plug._store = SongStore(Path(tmp_path) / "lib.db") if started else None
+    for record in records or []:
+        plug._store.upsert(record)
+    return plug
+
+
+def test_api_returns_aid(tmp_path) -> None:
+    plug = _plugin(tmp_path, [{"name": "权御天下", "bilibili_aid": 2075941}])
+    out = asyncio.run(plug.api_get_song_bilibili(name="权御天下"))
+    assert set(out) == _API_KEYS, out
+    assert out["found"] is True
+    assert out["aid"] == 2075941
+    assert out["reason"] == ""
+
+
+def test_api_returns_bvid(tmp_path) -> None:
+    plug = _plugin(tmp_path, [{"name": "世末歌者", "bilibili_bvid": "BV1Qs411k7Qv"}])
+    out = asyncio.run(plug.api_get_song_bilibili(name="世末歌者"))
+    assert out["found"] is True
+    assert out["bvid"] == "BV1Qs411k7Qv"
+    assert out["reason"] == ""
+
+
+def test_api_distinguishes_song_without_bilibili(tmp_path) -> None:
+    """歌在库里但没采集到标识：found=True + reason 说明，调用方应回退搜索。"""
+    plug = _plugin(tmp_path, [{"name": "旧歌"}])
+    out = asyncio.run(plug.api_get_song_bilibili(name="旧歌"))
+    assert out["found"] is True
+    assert out["bvid"] == "" and out["aid"] is None
+    assert "尚未采集" in out["reason"], out
+
+
+def test_api_unknown_song(tmp_path) -> None:
+    plug = _plugin(tmp_path, [])
+    out = asyncio.run(plug.api_get_song_bilibili(name="根本不存在的歌"))
+    assert out["found"] is False
+    assert "没有这首歌" in out["reason"]
+
+
+def test_api_blank_name(tmp_path) -> None:
+    plug = _plugin(tmp_path, [])
+    out = asyncio.run(plug.api_get_song_bilibili(name="   "))
+    assert out["found"] is False
+    assert "name" in out["reason"]
+
+
+def test_api_degrades_when_store_not_ready(tmp_path) -> None:
+    """曲库未初始化时 store property 抛 RuntimeError，API 必须降级而不是抛出。"""
+    plug = _plugin(tmp_path, started=False)
+    out = asyncio.run(plug.api_get_song_bilibili(name="权御天下"))
+    assert set(out) == _API_KEYS
+    assert out["found"] is False
+    assert "未就绪" in out["reason"], out
+
+
+def test_api_name_is_normalized(tmp_path) -> None:
+    """歌名带标点/空格时按 safe_name 归一化仍能命中。"""
+    plug = _plugin(tmp_path, [{"name": "权御天下", "bilibili_aid": 2075941}])
+    out = asyncio.run(plug.api_get_song_bilibili(name="权御天下！"))
+    assert out["found"] is True, out
+    assert out["aid"] == 2075941
