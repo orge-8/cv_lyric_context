@@ -832,3 +832,77 @@ def test_punctuation_only_query_resolves(tmp_path) -> None:
     store = _store_with(tmp_path, ["Say No"])
     ref = store.bilibili_ref("Say No!")
     assert ref is not None and ref["name"] == "Say No"
+
+
+# ── LIKE 通配符转义（全检补充覆盖）──────────────────────────────
+#
+# base 层用 `name LIKE ? ESCAPE` 做前缀粗筛，歌名里的 `%` / `_` 必须被转义，
+# 否则一条查询就能捞出整个曲库（`%` 匹配任意串、`_` 匹配任意单字）。
+
+
+def test_like_wildcards_in_song_name_are_escaped(tmp_path) -> None:
+    """库里有 `100%_ Pure`，查 `100%` 不能命中它（% 不是通配符）。"""
+    store = _store_with(tmp_path, ["100% Pure", "普通DISCO"])
+    ref = store.bilibili_ref("100%")
+    assert ref is None, "百分号应被当作普通字符，不该通配命中"
+
+
+def test_underscore_is_not_single_char_wildcard(tmp_path) -> None:
+    store = _store_with(tmp_path, ["A_B", "普通DISCO"])
+    # `AXB` 若把 _ 当通配符就会命中 A_B
+    assert store.bilibili_ref("AXB") is None
+    assert store.bilibili_ref("A_B") is not None
+
+
+def test_escape_like_helper() -> None:
+    from vcpedia_store import _escape_like
+
+    assert "\\" in _escape_like("100%")
+    assert "\\" in _escape_like("a_b")
+    assert _escape_like("普通DISCO") == "普通DISCO"
+
+
+def test_wildcard_query_does_not_dump_library(tmp_path) -> None:
+    """直接把 `%` 当查询串，也不该一次捞出一堆歌。"""
+    store = SongStore(Path(tmp_path) / "wild.db")
+    for index in range(10):
+        store.upsert({"name": f"歌{index}", "bilibili_aid": 1000 + index})
+    assert store.bilibili_ref("%") is None
+    assert store.bilibili_ref("_") is None
+
+
+# ── LIKE 通配符转义（全检补充覆盖）──────────────────────────────
+#
+# base 层用 `name LIKE ? ESCAPE` 做前缀粗筛，歌名里的 `%` / `_` 必须被转义，
+# 否则一条查询就能捞出整个曲库（`%` 匹配任意串、`_` 匹配任意单字）。
+
+
+def test_like_wildcards_in_song_name_are_escaped(tmp_path) -> None:
+    """库里有 `100%_ Pure`，查 `100%` 不能命中它（% 不是通配符）。"""
+    store = _store_with(tmp_path, ["100% Pure", "普通DISCO"])
+    ref = store.bilibili_ref("100%")
+    assert ref is None, "百分号应被当作普通字符，不该通配命中"
+
+
+def test_underscore_is_not_single_char_wildcard(tmp_path) -> None:
+    store = _store_with(tmp_path, ["A_B", "普通DISCO"])
+    # `AXB` 若把 _ 当通配符就会命中 A_B
+    assert store.bilibili_ref("AXB") is None
+    assert store.bilibili_ref("A_B") is not None
+
+
+def test_escape_like_helper() -> None:
+    from vcpedia_store import _escape_like
+
+    assert "\\" in _escape_like("100%")
+    assert "\\" in _escape_like("a_b")
+    assert _escape_like("普通DISCO") == "普通DISCO"
+
+
+def test_wildcard_query_does_not_dump_library(tmp_path) -> None:
+    """直接把 `%` 当查询串，也不该一次捞出一堆歌。"""
+    store = SongStore(Path(tmp_path) / "wild.db")
+    for index in range(10):
+        store.upsert({"name": f"歌{index}", "bilibili_aid": 1000 + index})
+    assert store.bilibili_ref("%") is None
+    assert store.bilibili_ref("_") is None
