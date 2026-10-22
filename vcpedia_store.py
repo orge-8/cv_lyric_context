@@ -13,10 +13,13 @@ check_same_thread=True，跨线程复用会抛 ProgrammingError）。
 
 from __future__ import annotations
 
+import logging
+import re
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from vcpedia_schema import (
     CONTENT_ROLE_CODES,
@@ -91,6 +94,112 @@ def _coerce_year(value: Any) -> Optional[int]:
     return None
 
 
+def _coerce_aid(value: Any) -> Optional[int]:
+    """B站 aid 归一化为正整数；无法识别返回 None。
+
+    不抛异常：单首脏数据不该中断整批同步（与 `_coerce_year` 同一原则）。
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+# ── 歌名匹配（供跨插件按歌名查 B站标识）─────────────────────────────
+#
+# 真实曲库里歌名形态很杂（3412 首样本统计）：
+#   - 大小写混杂：`a fairy of dreams` / `ADVENTURE` / `Aloud`；
+#   - 带括号补充：`Binary Life(二元生命)` / `九尾妖狐(PoKeR)` / `10（From bottom to the top）`
+#     —— 占 1%（20/3412）；
+#   - 点歌侧传来的常是「歌名 歌手」整串（`普通DISCO 洛天依`）。
+#
+# 而 `safe_song_name` **不转小写**，只做精确匹配的话「普通disco」命中不了
+# 「普通DISCO」。这里按「精确 → 忽略大小写 → 去括号 → 剥尾部 token」逐级放宽，
+# **每一级都要求唯一命中**：多候选不猜，返回空让调用方回退平台搜索。
+# 宁可回退，也不能放错版本——这是与 search_rank.py 同一条纪律。
+
+logger = logging.getLogger(__name__)
+
+#: 只剥「末尾完整括号段」：`9(:D` 这种没有配对的括号不动
+_RE_BRACKET_TAIL = re.compile(r"[\(（][^\(（\)）]*[\)）]\s*$")
+
+#: 精确 / 忽略大小写匹配（`COLLATE NOCASE` 只对 ASCII 有效，中文无大小写，无害）。
+#: 注意：**不要把这些条件并成一个 OR**——真机库里 `Say No` 与 `SAY NO!` 的
+#: 归一化键相同，并起来查 `SAY NO!` 会命中两条而被判成歧义。逐层查，
+#: 精确命中优先（见 `_lookup_song_rows`）。
+_SELECT_SONG = "SELECT id, name, bilibili_aid, bilibili_bvid FROM song WHERE deleted_at IS NULL AND ("
+_BASE_SQL = (
+    _SELECT_SONG + " name LIKE ? ESCAPE '\\'"
+    ") ORDER BY id"
+)
+
+
+def _strip_trailing_brackets(text: str) -> str:
+    """剥掉歌名末尾的括号补充：`Binary Life(二元生命)` → `Binary Life`。"""
+    return _RE_BRACKET_TAIL.sub("", str(text or "")).strip()
+
+
+def _lookup_song_rows(conn: sqlite3.Connection, query: str) -> tuple[List[sqlite3.Row], str]:
+    """按歌名逐层匹配，返回 (候选行, 命中层级)。
+
+    **必须分层**，不能把所有条件并成一个 OR：真机库（7753 首）里同时存在
+    `Say No` 与 `SAY NO!`，两者的归一化键都是 `SAY NO`(NOCASE)。并成一个 OR
+    时查 `SAY NO!` 会命中两条 → 被判成歧义而拒绝，可用户输入的**完全等于**
+    其中一条。分层后精确命中优先，只有同一层内出现多候选才算歧义。
+
+    层级（由严到宽，命中即返回）：
+        1. `name` 完全相等；
+        2. `safe_name` 完全相等（忽略标点）；
+        3. `name` / `safe_name` 忽略大小写；
+        4. 去末尾括号补充（双向）。
+    """
+    text = str(query or "").strip()
+    if not text:
+        return [], ""
+    safe = safe_song_name(text)
+
+    rows = conn.execute(_SELECT_SONG + " name = ?) ORDER BY id", (text,)).fetchall()
+    if rows:
+        return list(rows), "exact"
+
+    if safe:
+        rows = conn.execute(
+            _SELECT_SONG + " safe_name = ?) ORDER BY id", (safe,)
+        ).fetchall()
+        if rows:
+            return list(rows), "exact"
+
+    rows = conn.execute(
+        _SELECT_SONG + " name = ? COLLATE NOCASE OR safe_name = ? COLLATE NOCASE) ORDER BY id",
+        (text, safe),
+    ).fetchall()
+    if rows:
+        return list(rows), "exact"
+
+    # 基名：查询自带括号补充时剥掉它，否则**查询本身就是基名**——
+    # 后者不能跳过，否则「库里叫 `Binary Life(二元生命)`、用户点 `Binary Life`」
+    # 这种最常见的形态永远命不中。
+    base = _strip_trailing_brackets(text) or text
+    if base != text:
+        # 反向：查询带括号补充、库里存的是基名
+        base_safe = safe_song_name(base)
+        rows = conn.execute(
+            _SELECT_SONG
+            + " name = ? OR name = ? COLLATE NOCASE OR safe_name = ? COLLATE NOCASE) ORDER BY id",
+            (base, base, base_safe),
+        ).fetchall()
+        if rows:
+            return list(rows), "base"
+    # 正向：库里是「基名 + 括号」。LIKE 前缀只做粗筛，再用「剥括号后必须等于基名」
+    # 精筛——否则 `Binary Life` 会把 `Binary Life 2` 这类无关项也捞进来。
+    rows = conn.execute(_BASE_SQL, (_escape_like(base) + "%",)).fetchall()
+    matched = [row for row in rows if _strip_trailing_brackets(row["name"]) == base]
+    return matched, "base" if matched else ""
+
+
 class SongStore:
     """歌曲库读写。
 
@@ -104,13 +213,34 @@ class SongStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.migration_stats: Optional[dict] = None
-        with self._connect() as conn:
+        with self._session() as conn:
             self.migration_stats = ensure_schema(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30)
         conn.row_factory = sqlite3.Row
         return conn
+
+    @contextmanager
+    def _session(self) -> Iterator[sqlite3.Connection]:
+        """一次操作一个连接，退出时**必定关闭**。
+
+        不能直接用 `with sqlite3.connect(...)`：Python 的 `Connection.__exit__`
+        只提交/回滚事务，**不关闭连接**。生产表现是句柄缓慢累积；Windows 上更
+        直接——未关闭的连接持有文件锁，库文件无法被替换或删除，全量重抓上万词条
+        时尤其明显（`tests/test_vcpedia_bilibili.py` 的临时目录清理即因此失败）。
+
+        提交/回滚语义与原写法一致：正常退出 commit，异常 rollback 后重抛。
+        """
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _resolve_song_id(self, conn: sqlite3.Connection, name: str) -> Optional[int]:
         """按歌名或归一化歌名定位歌曲 id（与 get() 的匹配顺序一致）。"""
@@ -142,7 +272,7 @@ class SongStore:
             result = self._write_song(conn, record, name, safe)
             conn.commit()
             return result
-        with self._connect() as own:
+        with self._session() as own:
             return self._write_song(own, record, name, safe)
 
     @staticmethod
@@ -156,15 +286,20 @@ class SongStore:
         lyrics = str(record.get("lyrics") or "")
         categories = split_multi(record.get("categories"))
         credits = {code: record.get(code) for code in CONTENT_ROLE_CODES}
+        bili_aid = _coerce_aid(record.get("bilibili_aid"))
+        bili_bvid = str(record.get("bilibili_bvid") or "").strip()
 
         row = conn.execute(
-            "SELECT id, name, introduction, year FROM song WHERE safe_name = ?", (safe,)
+            "SELECT id, name, introduction, year, bilibili_aid, bilibili_bvid "
+            "FROM song WHERE safe_name = ?",
+            (safe,),
         ).fetchone()
         if row is None:
             cur = conn.execute(
-                "INSERT INTO song (name, safe_name, year, introduction, fetched_at, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (name, safe, year, introduction, now, now, now),
+                "INSERT INTO song (name, safe_name, year, introduction, bilibili_aid, "
+                "bilibili_bvid, fetched_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (name, safe, year, introduction, bili_aid, bili_bvid, now, now, now),
             )
             song_id = int(cur.lastrowid)
             created = True
@@ -174,10 +309,16 @@ class SongStore:
             record_revision(conn, song_id, "name", row["name"], name, now)
             record_revision(conn, song_id, "year", row["year"], year, now)
             record_revision(conn, song_id, "introduction", row["introduction"], introduction, now)
+            # B站标识是**单调累积**字段，与上面三个「整体覆盖」字段不同：
+            # 页面模板改动、词条被改成消歧义页、解析器升级前的旧数据，都会让
+            # 本次解析结果为空——但 BV 号本身不会变，不能因此把已采集的抹掉。
+            keep_aid = bili_aid if bili_aid is not None else row["bilibili_aid"]
+            keep_bvid = bili_bvid or str(row["bilibili_bvid"] or "")
             conn.execute(
-                "UPDATE song SET name = ?, year = ?, introduction = ?, fetched_at = ?, "
+                "UPDATE song SET name = ?, year = ?, introduction = ?, "
+                "bilibili_aid = ?, bilibili_bvid = ?, fetched_at = ?, "
                 "updated_at = ? WHERE id = ?",
-                (name, year, introduction, now, now, song_id),
+                (name, year, introduction, keep_aid, keep_bvid, now, now, song_id),
             )
 
         write_credits(conn, song_id, credits, now)
@@ -202,7 +343,7 @@ class SongStore:
         if not keys:
             return set()
         found: set[str] = set()
-        with self._connect() as conn:
+        with self._session() as conn:
             for i in range(0, len(keys), 500):
                 chunk = keys[i:i + 500]
                 placeholders = ",".join("?" * len(chunk))
@@ -222,7 +363,7 @@ class SongStore:
         keys = [(stamp, safe) for stamp, safe in keys if safe]
         if not keys:
             return 0
-        with self._connect() as conn:
+        with self._session() as conn:
             cur = conn.executemany(
                 "UPDATE song SET lyrics_checked_at = ? WHERE safe_name = ?", keys
             )
@@ -231,7 +372,7 @@ class SongStore:
     # ── 查询 ────────────────────────────────────────────────────
 
     def count(self) -> int:
-        with self._connect() as conn:
+        with self._session() as conn:
             return int(
                 conn.execute("SELECT COUNT(*) FROM song WHERE deleted_at IS NULL").fetchone()[0]
             )
@@ -243,7 +384,7 @@ class SongStore:
         传 skip_checked_within 则只数「近期还没确认过」的待补条目。
         """
         where, params = self._empty_lyrics_where(skip_checked_within)
-        with self._connect() as conn:
+        with self._session() as conn:
             return int(
                 conn.execute(f"SELECT COUNT(*) FROM song s WHERE {where}", params).fetchone()[0]
             )
@@ -260,7 +401,7 @@ class SongStore:
         if limit and limit > 0:
             sql += " LIMIT ?"
             params = [*params, limit]
-        with self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [str(r["name"]) for r in rows]
 
@@ -285,12 +426,134 @@ class SongStore:
 
     def get(self, name: str) -> Optional[Dict[str, Any]]:
         """按歌名精确查（先精确匹配，再归一化匹配）。"""
-        with self._connect() as conn:
+        with self._session() as conn:
             row = conn.execute(
                 "SELECT * FROM songs WHERE name = ? OR safe_name = ? ORDER BY id LIMIT 1",
                 (name, safe_song_name(name)),
             ).fetchone()
         return dict(row) if row else None
+
+    def bilibili_ref(self, name: str) -> Optional[Dict[str, Any]]:
+        """按歌名取原曲 B站标识（多级匹配，**唯一命中**才采纳）。
+
+        逐级放宽：精确（含忽略大小写）→ 去括号补充 → 剥掉尾部 token
+        （点歌侧常传「歌名 歌手」整串，如 `普通DISCO 洛天依`）。
+
+        **每一级都要求唯一命中**：命中 0 条或多条都返回 None。多条时不猜——
+        `九尾妖狐(PoKeR)` 与 `九尾妖狐(肯德龟)` 这类同名不同版本，猜错就是
+        播错歌；让调用方回退到平台搜索才是安全边界。
+
+        返回 `None` 表示**没有可用的唯一匹配**（库里没这首，或存在歧义）；
+        返回 dict 但 `bvid` / `aid` 都为空，表示**歌在库里但没有 B站标识**
+        （v2.14.0 起才采集，旧数据可能为空）。调用方需要区分这两种情况。
+
+        Returns:
+            `{"name": str, "aid": int|None, "bvid": str, "match": str}`
+            （`match` ∈ `exact` / `base` / `prefix`），或 `None`。
+        """
+        raw = str(name or "").strip()
+        if not raw:
+            return None
+        rows: List[sqlite3.Row] = []
+        level = ""
+        with self._session() as conn:
+            rows, level = _lookup_song_rows(conn, raw)
+            if not rows:
+                tokens = raw.split()
+                # 从长到短试前缀：`普通DISCO 洛天依` → `普通DISCO`
+                for cut in range(len(tokens) - 1, 0, -1):
+                    rows, level = _lookup_song_rows(conn, " ".join(tokens[:cut]))
+                    if rows:
+                        level = "prefix"
+                        break
+        if not rows:
+            return None
+        if len(rows) > 1:
+            logger.info(
+                "bilibili_ref: 「%s」匹配到 %d 条记录（%s），存在歧义，不猜测",
+                raw, len(rows), "; ".join(str(row["name"]) for row in rows[:3]),
+            )
+            return None
+        row = rows[0]
+        return {
+            "name": row["name"],
+            "aid": row["bilibili_aid"],
+            "bvid": str(row["bilibili_bvid"] or ""),
+            "match": level,
+        }
+
+    def songs_missing_bilibili(self, limit: int) -> List[str]:
+        """取缺 B站标识的歌曲名（供回填任务分批取用）。
+
+        已填过的条目不再满足条件，所以第二次跑只会处理「确实没有 bb_id」的
+        那一小部分——不需要额外的冷却时间戳。
+
+        Args:
+            limit: 本批上限（<=0 返回空列表）。
+
+        Returns:
+            歌名列表（按 id 升序，稳定可续跑）。
+        """
+        if limit <= 0:
+            return []
+        with self._session() as conn:
+            rows = conn.execute(
+                "SELECT name FROM song WHERE deleted_at IS NULL "
+                "AND bilibili_aid IS NULL AND (bilibili_bvid IS NULL OR bilibili_bvid = '') "
+                "ORDER BY id LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [str(row["name"]) for row in rows]
+
+    def count_missing_bilibili(self) -> int:
+        """缺 B站标识的条目总数（用于回报「还剩多少」）。"""
+        with self._session() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM song WHERE deleted_at IS NULL "
+                "AND bilibili_aid IS NULL AND (bilibili_bvid IS NULL OR bilibili_bvid = '')"
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def update_bilibili(self, name: str, aid: Any, bvid: str) -> bool:
+        """只写 B站标识两列，**不碰歌词 / 创作者 / 分类**。
+
+        与 `upsert` 的关键区别：回填 B站标识时不该把已经同步好的歌词和 9 个
+        创作者字段整体覆盖一遍（那是 `upsert` 的语义，且会顺带刷新
+        `fetched_at`，让「多久没抓过」的判断失真）。这里保持最小写入面。
+
+        单调累积：新值为空时保留旧值——BV 号不会变，页面模板改动却会让
+        新解析结果为空。
+
+        Returns:
+            True 表示确实写入了至少一个标识；False 表示定位不到歌，
+            或新旧值相同（无变化）。
+        """
+        text = str(name or "").strip()
+        if not text:
+            return False
+        new_aid = _coerce_aid(aid)
+        new_bvid = str(bvid or "").strip()
+        with self._session() as conn:
+            row = conn.execute(
+                "SELECT id, bilibili_aid, bilibili_bvid FROM song "
+                "WHERE (name = ? OR safe_name = ?) AND deleted_at IS NULL "
+                "ORDER BY id LIMIT 1",
+                (text, safe_song_name(text)),
+            ).fetchone()
+            if row is None:
+                return False
+            old_aid = row["bilibili_aid"]
+            old_bvid = str(row["bilibili_bvid"] or "")
+            keep_aid = new_aid if new_aid is not None else old_aid
+            keep_bvid = new_bvid or old_bvid
+            if keep_aid == old_aid and keep_bvid == old_bvid:
+                return False
+            conn.execute(
+                "UPDATE song SET bilibili_aid = ?, bilibili_bvid = ?, updated_at = ? "
+                "WHERE id = ?",
+                (keep_aid, keep_bvid, time.time(), row["id"]),
+            )
+        return True
 
     def search(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
         """按歌名/歌手/UP主模糊搜索。"""
@@ -300,7 +563,7 @@ class SongStore:
         # 关键词来自用户输入，% 和 _ 在 LIKE 里是通配符：不转义时
         # 「/歌词 搜索 %」会匹配到全库任何一条记录。
         like = f"%{_escape_like(kw)}%"
-        with self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(
                 "SELECT * FROM songs WHERE name LIKE ? ESCAPE '\\' "
                 "OR singers LIKE ? ESCAPE '\\' OR uploader LIKE ? ESCAPE '\\' "
@@ -314,7 +577,7 @@ class SongStore:
         kw = (snippet or "").strip()
         if not kw:
             return []
-        with self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(
                 "SELECT * FROM songs WHERE lyrics LIKE ? ESCAPE '\\' "
                 "ORDER BY LENGTH(name) LIMIT ?",
@@ -326,7 +589,7 @@ class SongStore:
 
     def credits_of(self, name: str) -> Dict[str, List[str]]:
         """取某首歌的创作者分工，返回 {角色 code: [人名]}（只含非空角色）。"""
-        with self._connect() as conn:
+        with self._session() as conn:
             song_id = self._resolve_song_id(conn, name)
             if song_id is None:
                 return {}
@@ -345,7 +608,7 @@ class SongStore:
 
     def singers_of(self, name: str) -> List[Dict[str, Optional[str]]]:
         """取某首歌的演唱者，含各自引擎/声库（未知则为 None）。"""
-        with self._connect() as conn:
+        with self._session() as conn:
             song_id = self._resolve_song_id(conn, name)
             if song_id is None:
                 return []
@@ -363,7 +626,7 @@ class SongStore:
 
     def tags_of(self, name: str, kind: str = TAG_KIND_CATEGORY) -> List[str]:
         """取某首歌的某类标签（默认分类），保序。"""
-        with self._connect() as conn:
+        with self._session() as conn:
             song_id = self._resolve_song_id(conn, name)
             if song_id is None:
                 return []
@@ -393,7 +656,7 @@ class SongStore:
             params.append(role_code)
         sql += ") ORDER BY s.id LIMIT ?"
         params.append(max(1, int(limit)))
-        with self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
@@ -402,7 +665,7 @@ class SongStore:
         target = (singer or "").strip()
         if not target:
             return []
-        with self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(
                 "SELECT s.* FROM songs s WHERE s.id IN ("
                 "SELECT ss.song_id FROM song_singer ss JOIN singer si ON si.id = ss.singer_id "
@@ -413,7 +676,7 @@ class SongStore:
 
     def role_breakdown(self) -> Dict[str, int]:
         """各角色有分工记录的歌曲数，用于体检数据完整度。"""
-        with self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(
                 "SELECT r.code AS code, COUNT(DISTINCT sc.song_id) AS n FROM song_credit sc "
                 "JOIN credit_role r ON r.id = sc.role_id GROUP BY r.code"
@@ -433,7 +696,7 @@ class SongStore:
             "song", "artist", "singer", "song_credit", "song_singer",
             "lyrics", "tag", "song_tag", "song_external_link", "song_revision",
         )
-        with self._connect() as conn:
+        with self._session() as conn:
             return {t: int(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]) for t in tables}
 
     # ── 情绪标签（v2.5.0 氛围选歌）──────────────────────────────
@@ -477,7 +740,7 @@ class SongStore:
         if cap:
             sql += " LIMIT ?"
             params.append(cap)
-        with self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [
             {
@@ -491,7 +754,7 @@ class SongStore:
 
     def all_annotated_songs(self, limit: int = 200) -> List[Dict[str, Any]]:
         """已标注歌曲全量（无标签过滤，供无匹配回退时随机选歌）。"""
-        with self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(
                 "SELECT s.name AS name, s.introduction AS introduction, "
                 f"{_SINGERS_SUBQUERY} AS singers, {_EMOTION_SUBQUERY} AS emotion "
@@ -516,7 +779,7 @@ class SongStore:
             return False
         values = self.parse_emotion(self.join_emotion(tags))
         now = time.time()
-        with self._connect() as conn:
+        with self._session() as conn:
             row = conn.execute(
                 "SELECT id FROM song WHERE safe_name = ? AND deleted_at IS NULL", (safe,)
             ).fetchone()
@@ -531,7 +794,7 @@ class SongStore:
         """按歌名（或归一化歌名）设置情绪标签，供命令行维护用。"""
         values = self.parse_emotion(self.join_emotion(tags))
         now = time.time()
-        with self._connect() as conn:
+        with self._session() as conn:
             song_id = self._resolve_song_id(conn, name)
             if song_id is None:
                 return False
@@ -553,7 +816,7 @@ class SongStore:
         保证刚爬到的歌先被标上；离线脚本保持默认的 id 正序，慢慢排空存量。
         """
         order = "s.id DESC" if newest_first else "s.id ASC"
-        with self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(
                 "SELECT s.name AS name, s.safe_name AS safe_name, "
                 f"l.plain_text AS lyrics, {_SINGERS_SUBQUERY} AS singers "
@@ -566,7 +829,7 @@ class SongStore:
 
     def emotion_stats(self) -> Dict[str, int]:
         """情绪标签覆盖统计：总数 / 已标注 / 各标签命中数。"""
-        with self._connect() as conn:
+        with self._session() as conn:
             stats: Dict[str, int] = {
                 "total": int(
                     conn.execute("SELECT COUNT(*) FROM song WHERE deleted_at IS NULL").fetchone()[0]
@@ -588,12 +851,12 @@ class SongStore:
     # ── 同步元信息 ──────────────────────────────────────────────
 
     def meta_get(self, key: str, default: str = "") -> str:
-        with self._connect() as conn:
+        with self._session() as conn:
             row = conn.execute("SELECT value FROM sync_meta WHERE key = ?", (key,)).fetchone()
         return str(row["value"]) if row else default
 
     def meta_set(self, key: str, value: str) -> None:
-        with self._connect() as conn:
+        with self._session() as conn:
             conn.execute(
                 "INSERT INTO sync_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -601,7 +864,7 @@ class SongStore:
             )
 
     def all_titles(self) -> List[str]:
-        with self._connect() as conn:
+        with self._session() as conn:
             return [
                 str(r["name"])
                 for r in conn.execute("SELECT name FROM song WHERE deleted_at IS NULL")

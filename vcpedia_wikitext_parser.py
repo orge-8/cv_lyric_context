@@ -529,6 +529,110 @@ def parse_lyrics(source: str) -> str:
 _HEADING_RE = re.compile(r"(={2,4})([^=]*)(={2,4})")
 _MAX_HEADING_CHARS = 200
 
+# ── B站视频标识（bb_id）────────────────────────────────────────────
+#
+# VCPedia 把原曲投稿写在主信息框 {{VOCALOID_Songbox|...|bb_id=av2075941}} 里。
+# 同一个页面可能出现多个 Songbox：权御天下第二个是洛天依官方账号的重制版，
+# 达拉崩吧第二三个是翻唱（王浩然视角 / 吃鸡有神仙）。**首个才是原曲**——
+# 这是本模块取数规则的唯一依据，改动前先看 tests 里的样本。
+_RE_SONGBOX_TEMPLATE = "VOCALOID_Songbox"
+_RE_BVID_SEARCH = re.compile(r"(BV[0-9A-Za-z]{10})")
+_RE_AVID_SEARCH = re.compile(r"\bav(\d{1,12})\b", re.I)
+_RE_BILIBILI_VIDEO_TPL = re.compile(
+    r"\{\{\s*BilibiliVideo\s*\|\s*id\s*=\s*([^\n|}]+)", re.I
+)
+
+
+def _split_template_blocks(source: str, template_name: str) -> List[str]:
+    """按 `{{ }}` 深度切出所有以 `{{template_name` 开头的模板块（含外层括号）。
+
+    必须按深度切而不是找最近的 `}}`：Songbox 的参数里有嵌套模板
+    （`再生 = {{bilibiliCount|id=9372087}}`），朴素匹配会把块切在最内层。
+    """
+    blocks: List[str] = []
+    needle = "{{" + template_name
+    pos = 0
+    while True:
+        start = source.find(needle, pos)
+        if start < 0:
+            return blocks
+        depth = 0
+        i = start
+        end = len(source)
+        while i < len(source) - 1:
+            pair = source[i:i + 2]
+            if pair == "{{":
+                depth += 1
+                i += 2
+            elif pair == "}}":
+                depth -= 1
+                i += 2
+                if depth == 0:
+                    end = i
+                    break
+            else:
+                i += 1
+        blocks.append(source[start:end])
+        pos = end
+
+
+def _template_param(block: str, param: str) -> str:
+    """取模板块里 `|param = value` 的值（值不含嵌套模板时最稳）。"""
+    m = re.search(rf"\|\s*{re.escape(param)}\s*=\s*([^\n|}}]*)", block)
+    return m.group(1).strip() if m else ""
+
+
+def normalize_bilibili_ref(raw: Any) -> Dict[str, Any]:
+    """把 VCPedia 里的 B站视频标识归一化。
+
+    接受 `av2075941` / `2075941` / `BV1zs411S7sz`，也容忍被 wiki 链接包裹的写法。
+
+    Returns:
+        `{"aid": int, "bvid": ""}` 或 `{"aid": None, "bvid": "BV..."}`；
+        无法识别时返回空 dict（**不是** `{"aid": None}`，否则调用方无法区分
+        「没有」与「解析失败」）。
+    """
+    value = str(raw or "").strip()
+    if not value:
+        return {}
+    # BV 号先判：否则 "BV1zs411S7sz" 里的数字会被 av 规则吃掉
+    m = _RE_BVID_SEARCH.search(value)
+    if m:
+        return {"aid": None, "bvid": m.group(1)}
+    m = _RE_AVID_SEARCH.search(value)
+    if m:
+        return {"aid": int(m.group(1)), "bvid": ""}
+    if value.isdigit() and 0 < int(value) < 10 ** 12:
+        return {"aid": int(value), "bvid": ""}
+    return {}
+
+
+def parse_bilibili_id(source: str) -> Dict[str, Any]:
+    """提取原曲的 B站视频标识（aid / bvid 二者之一）。
+
+    取数优先级：
+        1. **首个** `{{VOCALOID_Songbox}}` 的 `|bb_id=` —— 主信息框即原曲；
+        2. 无 Songbox 时取正文**首个** `{{BilibiliVideo|id=...}}` —— 正文按
+           「原曲 → 翻唱」顺序书写，首个即原曲（如《普通DISCO》没有 Songbox，
+           首个 BilibiliVideo 的 id=2129461 与 music-request 实际取到的
+           BV1zs411S7sz 是同一 cid）。
+
+    Returns:
+        `{"aid": int|None, "bvid": str, "source": "songbox"|"bilibili_video"|""}`。
+        `source` 用于事后审计：`bilibili_video` 属推断值，覆盖率报表要能分开看。
+    """
+    text = str(source or "")
+    for block in _split_template_blocks(text, _RE_SONGBOX_TEMPLATE):
+        parsed = normalize_bilibili_ref(_template_param(block, "bb_id"))
+        if parsed:
+            return {**parsed, "source": "songbox"}
+    m = _RE_BILIBILI_VIDEO_TPL.search(text)
+    if m:
+        parsed = normalize_bilibili_ref(m.group(1))
+        if parsed:
+            return {**parsed, "source": "bilibili_video"}
+    return {"aid": None, "bvid": "", "source": ""}
+
 
 def _heading_title(line: str) -> str:
     """是 wikitext 标题行则返回标题文本，否则返回空串。复杂度与行长线性相关。"""
@@ -567,10 +671,14 @@ def parse_introduction(source: str) -> str:
 
 
 def parse_wikitext(name: str, source: str) -> Dict[str, Any]:
-    """解析词条 wikitext，返回 {name, credits, introduction, lyrics}。"""
+    """解析词条 wikitext，返回 {name, credits, introduction, lyrics, bilibili_*}。"""
+    bili = parse_bilibili_id(source)
     return {
         "name": name,
         "credits": parse_credits(source.splitlines()),
         "introduction": parse_introduction(source),
         "lyrics": parse_lyrics(source),
+        "bilibili_aid": bili.get("aid"),
+        "bilibili_bvid": bili.get("bvid") or "",
+        "bilibili_source": bili.get("source") or "",
     }

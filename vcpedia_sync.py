@@ -83,6 +83,9 @@ def build_record(name: str, parsed: dict, category: str = "") -> dict:
         "introduction": clean_introduction(parsed.get("introduction") or ""),
         "lyrics": clean_lyrics(parsed.get("lyrics") or ""),
         "categories": category,
+        # B站原曲标识（解析不出时为 None / 空串，由 store 层决定是否保留旧值）
+        "bilibili_aid": parsed.get("bilibili_aid"),
+        "bilibili_bvid": str(parsed.get("bilibili_bvid") or ""),
     }
 
 

@@ -36,7 +36,9 @@ if not hasattr(_MOD, "create_plugin"):
 
 from vcpedia_store import SongStore  # noqa: E402
 
-_DEFAULT_HOST = "C:/Users/38160/AppData/Roaming/MaiBotOneKeyDesktop/e6a2be8e69ae/modules/MaiBot"
+# 宿主检出目录：默认只放占位示例，不写任何真实用户名/部署布局。
+# 实际运行前用环境变量 MAIBOT_HOST_DIR 指向自己的 MaiBot 检出；找不到会 skip。
+_DEFAULT_HOST = "C:/Users/<USER>/path/to/MaiBot"
 #: 页面上由输入框喂值的参数，必须声明成 string（见模块 docstring）
 _STRING_ONLY_PARAMS = {"limit", "skip_days"}
 

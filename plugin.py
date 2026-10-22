@@ -1720,6 +1720,80 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             "songs": songs,
         }
 
+    @API(
+        "get_song_bilibili",
+        version="1",
+        public=True,
+        description="按歌名取原曲 B站视频标识（只读曲库，零网络）",
+    )
+    async def api_get_song_bilibili(self, name: str = "", **kwargs: Any) -> dict[str, Any]:
+        """按歌名返回原曲的 B站标识，供点歌插件按 bvid/aid 精确取流。
+
+        契约：
+        - 纯只读：只查本地曲库，零网络、零写盘；
+        - 结构永远完整：找不到/曲库未就绪也返回同样形状的 dict，不抛异常；
+        - `found=True` 但 `bvid` 与 `aid` 都为空，表示「歌在库里但没采集到
+          B站标识」——调用方应回退到平台搜索，而不是当作取流失败。
+
+        参数：
+            name: 歌名（会按 `safe_song_name` 归一化后匹配）。
+
+        返回字段：`schema_version` / `reason` / `found` / `name` / `aid` / `bvid` /
+        `match` / `singers`。
+
+        `match` 表示歌名命中的层级（`exact` / `base` / `prefix`），供排查用：
+        查不到时能区分「库里真没有」与「匹配上了但没采集标识」。
+
+        `singers` 是原曲演唱者名单。**调用方用它判断用户点的是原曲还是翻唱**：
+        `prefix` 层级意味着查询串带了歌名之外的 token，如果那个 token 正是原曲
+        歌手（「世末积雨云 洛天依」），说明用户要的就是原曲；如果不是
+        （「普通DISCO 三无」），就是点名翻唱，应回退平台搜索。
+        """
+        empty = {
+            "schema_version": 1,
+            "reason": "",
+            "found": False,
+            "name": str(name or ""),
+            "aid": None,
+            "bvid": "",
+            "match": "",
+            "singers": [],
+        }
+        query = str(name or "").strip()
+        if not query:
+            return {**empty, "reason": "缺少歌名参数 name"}
+        # 注意：`store` 是 property，未初始化时**抛 RuntimeError** 而不是返回 None，
+        # `getattr(self, "store", None)` 的 default 拦不住（只对 AttributeError 生效）。
+        try:
+            store = self.store
+        except Exception:  # noqa: BLE001 - 未就绪属于预期状态，降级而非抛出
+            return {**empty, "reason": "曲库尚未就绪（插件未完成启动）"}
+        try:
+            ref = store.bilibili_ref(query)
+        except Exception as exc:  # noqa: BLE001 - 查询失败降级而非抛给调用方
+            self.ctx.logger.warning("get_song_bilibili 查询失败（%s）：%r", query, exc)
+            return {**empty, "reason": f"曲库查询失败：{exc}"}
+        if ref is None:
+            return {**empty, "reason": "曲库里没有这首歌（或存在同名歧义）"}
+        try:
+            singers = [
+                str(row.get("name") or "")
+                for row in store.singers_of(ref["name"])
+                if str(row.get("name") or "").strip()
+            ]
+        except Exception:  # noqa: BLE001 - 歌手查询失败不该让整个 API 失败
+            singers = []
+        return {
+            "schema_version": 1,
+            "reason": "" if (ref["bvid"] or ref["aid"]) else "该曲目尚未采集 B站标识",
+            "found": True,
+            "name": ref["name"],
+            "aid": ref["aid"],
+            "bvid": ref["bvid"],
+            "match": str(ref.get("match") or ""),
+            "singers": singers,
+        }
+
     @HookHandler(
         "chat.receive.after_process",
         name="cv_lyric_detect_receive",
