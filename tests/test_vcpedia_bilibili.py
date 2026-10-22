@@ -788,3 +788,47 @@ def test_api_singers_empty_for_unknown_song(tmp_path) -> None:
     out = asyncio.run(plug.api_get_song_bilibili(name="根本不存在"))
     assert out["singers"] == []
     assert set(out) == _API_KEYS
+
+
+# ── 匹配分层：精确命中优先于归一化命中（v2.14.4）──────────────
+#
+# 真机库（7753 首）实盘点：库里同时存在 `Say No` 与 `SAY NO!`，两者归一化键
+# 都是 `SAY NO`(NOCASE)。此前把所有条件并成一个 OR，查 `SAY NO!` 会命中两条
+# → 被判成歧义而返回 None，可用户输入**完全等于**其中一条。
+# 修法：逐层查、命中即返回，只有同一层内多候选才算歧义。
+
+
+def test_exact_name_beats_colliding_safe_name(tmp_path) -> None:
+    """`SAY NO!` 精确命中同名记录，不被另一条同归一化键的歌挤成歧义。"""
+    store = _store_with(tmp_path, ["Say No", "SAY NO!"])
+    ref = store.bilibili_ref("SAY NO!")
+    assert ref is not None, "精确同名不该被判成歧义"
+    assert ref["name"] == "SAY NO!"
+    assert ref["match"] == "exact"
+
+
+def test_other_spelling_still_resolves(tmp_path) -> None:
+    """查 `Say No` 时同样只命中它自己。"""
+    store = _store_with(tmp_path, ["Say No", "SAY NO!"])
+    ref = store.bilibili_ref("Say No")
+    assert ref is not None and ref["name"] == "Say No"
+
+
+def test_nocase_layer_still_ambiguous(tmp_path) -> None:
+    """同一层内出现多个候选仍然算歧义——分层不能破坏唯一性保护。
+
+    构造真实存在的形态：`ABC` 与 `abc` 是两条独立记录（safe_name 不同，
+    能共存），NOCASE 层会同时命中；而查询 `Abc` 对两者的精确度一样 → 不猜。
+    """
+    store = _store_with(tmp_path, ["ABC", "abc"])
+    assert store.bilibili_ref("Abc") is None
+    # 精确写法则各自命中
+    assert store.bilibili_ref("ABC")["name"] == "ABC"
+    assert store.bilibili_ref("abc")["name"] == "abc"
+
+
+def test_punctuation_only_query_resolves(tmp_path) -> None:
+    """只有标点差异时走 safe_name 层，仍能命中。"""
+    store = _store_with(tmp_path, ["Say No"])
+    ref = store.bilibili_ref("Say No!")
+    assert ref is not None and ref["name"] == "Say No"

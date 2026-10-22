@@ -126,13 +126,11 @@ logger = logging.getLogger(__name__)
 #: 只剥「末尾完整括号段」：`9(:D` 这种没有配对的括号不动
 _RE_BRACKET_TAIL = re.compile(r"[\(（][^\(（\)）]*[\)）]\s*$")
 
-#: 精确 / 忽略大小写匹配（`COLLATE NOCASE` 只对 ASCII 有效，中文无大小写，无害）
+#: 精确 / 忽略大小写匹配（`COLLATE NOCASE` 只对 ASCII 有效，中文无大小写，无害）。
+#: 注意：**不要把这些条件并成一个 OR**——真机库里 `Say No` 与 `SAY NO!` 的
+#: 归一化键相同，并起来查 `SAY NO!` 会命中两条而被判成歧义。逐层查，
+#: 精确命中优先（见 `_lookup_song_rows`）。
 _SELECT_SONG = "SELECT id, name, bilibili_aid, bilibili_bvid FROM song WHERE deleted_at IS NULL AND ("
-_MATCH_SQL = (
-    _SELECT_SONG
-    + " name = ? OR safe_name = ? OR name = ? COLLATE NOCASE OR safe_name = ? COLLATE NOCASE"
-    ") ORDER BY id"
-)
 _BASE_SQL = (
     _SELECT_SONG + " name LIKE ? ESCAPE '\\'"
     ") ORDER BY id"
@@ -145,15 +143,39 @@ def _strip_trailing_brackets(text: str) -> str:
 
 
 def _lookup_song_rows(conn: sqlite3.Connection, query: str) -> tuple[List[sqlite3.Row], str]:
-    """按一层歌名匹配规则查库，返回 (候选行, 命中层级)。
+    """按歌名逐层匹配，返回 (候选行, 命中层级)。
 
-    层级：`exact`（含忽略大小写）/ `base`（去括号补充）。都没有就返回空。
+    **必须分层**，不能把所有条件并成一个 OR：真机库（7753 首）里同时存在
+    `Say No` 与 `SAY NO!`，两者的归一化键都是 `SAY NO`(NOCASE)。并成一个 OR
+    时查 `SAY NO!` 会命中两条 → 被判成歧义而拒绝，可用户输入的**完全等于**
+    其中一条。分层后精确命中优先，只有同一层内出现多候选才算歧义。
+
+    层级（由严到宽，命中即返回）：
+        1. `name` 完全相等；
+        2. `safe_name` 完全相等（忽略标点）；
+        3. `name` / `safe_name` 忽略大小写；
+        4. 去末尾括号补充（双向）。
     """
     text = str(query or "").strip()
     if not text:
         return [], ""
     safe = safe_song_name(text)
-    rows = conn.execute(_MATCH_SQL, (text, safe, text, safe)).fetchall()
+
+    rows = conn.execute(_SELECT_SONG + " name = ?) ORDER BY id", (text,)).fetchall()
+    if rows:
+        return list(rows), "exact"
+
+    if safe:
+        rows = conn.execute(
+            _SELECT_SONG + " safe_name = ?) ORDER BY id", (safe,)
+        ).fetchall()
+        if rows:
+            return list(rows), "exact"
+
+    rows = conn.execute(
+        _SELECT_SONG + " name = ? COLLATE NOCASE OR safe_name = ? COLLATE NOCASE) ORDER BY id",
+        (text, safe),
+    ).fetchall()
     if rows:
         return list(rows), "exact"
 
@@ -164,7 +186,11 @@ def _lookup_song_rows(conn: sqlite3.Connection, query: str) -> tuple[List[sqlite
     if base != text:
         # 反向：查询带括号补充、库里存的是基名
         base_safe = safe_song_name(base)
-        rows = conn.execute(_MATCH_SQL, (base, base_safe, base, base_safe)).fetchall()
+        rows = conn.execute(
+            _SELECT_SONG
+            + " name = ? OR name = ? COLLATE NOCASE OR safe_name = ? COLLATE NOCASE) ORDER BY id",
+            (base, base, base_safe),
+        ).fetchall()
         if rows:
             return list(rows), "base"
     # 正向：库里是「基名 + 括号」。LIKE 前缀只做粗筛，再用「剥括号后必须等于基名」
