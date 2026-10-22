@@ -279,7 +279,7 @@ _MOD = importlib.import_module(_PLUGIN_DIR.name)
 if not hasattr(_MOD, "create_plugin"):
     _MOD = importlib.import_module(f"{_PLUGIN_DIR.name}.plugin")
 
-_API_KEYS = {"schema_version", "reason", "found", "name", "aid", "bvid", "match"}
+_API_KEYS = {"schema_version", "reason", "found", "name", "aid", "bvid", "match", "singers"}
 
 
 class _Ctx:
@@ -708,3 +708,83 @@ def test_command_pattern_matches_aliases() -> None:
         assert re.match(pattern, text), text
     for text in ("/歌词 补歌词", "/歌词", "/歌词 补BVx", "/歌词 搜索 权御天下"):
         assert not re.match(pattern, text), text
+
+
+# ── API 返回原曲歌手（v2.14.3）────────────────────────────────
+#
+# 调用方（点歌插件）用它判断「用户点的是原曲还是翻唱」：
+# prefix 层级意味着查询串带了歌名之外的 token，若那个 token 正是原曲歌手
+# （「世末积雨云 洛天依」）就该采纳原曲；若不是（「普通DISCO 三无」）就是
+# 点名翻唱，应回退平台搜索。没有这个字段，调用方只能二选一：要么误杀
+# 原曲歌手，要么误播原曲——真机 2026-10-22 两者都发生过。
+
+
+def _api_plugin_with_singers(tmp_path, *, name: str, singers: list[str],
+                             aid: int | None = 1579079):
+    plug = _MOD.create_plugin()
+    plug.set_plugin_config({})
+    plug._ctx = _Ctx()
+    plug._store = SongStore(Path(tmp_path) / "singers.db")
+    plug._store.upsert({
+        "name": name,
+        "bilibili_aid": aid,
+        "singers": "、".join(singers),
+    })
+    return plug
+
+
+def test_api_returns_singers(tmp_path) -> None:
+    plug = _api_plugin_with_singers(
+        tmp_path, name="世末积雨云", singers=["洛天依"]
+    )
+    out = asyncio.run(plug.api_get_song_bilibili(name="世末积雨云 洛天依"))
+    assert out["found"] is True
+    assert out["match"] == "prefix"
+    assert out["singers"] == ["洛天依"], out
+
+
+def test_api_singers_empty_for_unknown_song(tmp_path) -> None:
+    plug = _api_plugin_with_singers(tmp_path, name="别的歌", singers=[])
+    out = asyncio.run(plug.api_get_song_bilibili(name="根本不存在"))
+    assert out["singers"] == []
+    assert set(out) == _API_KEYS
+
+
+# ── API 返回原曲歌手（v2.14.3）────────────────────────────────
+#
+# 调用方（点歌插件）用它判断「用户点的是原曲还是翻唱」：
+# prefix 层级意味着查询串带了歌名之外的 token，若那个 token 正是原曲歌手
+# （「世末积雨云 洛天依」）就该采纳原曲；若不是（「普通DISCO 三无」）就是
+# 点名翻唱，应回退平台搜索。没有这个字段，调用方只能二选一：要么误杀
+# 原曲歌手，要么误播原曲——真机 2026-10-22 两者都发生过。
+
+
+def _api_plugin_with_singers(tmp_path, *, name: str, singers: list[str],
+                             aid: int | None = 1579079):
+    plug = _MOD.create_plugin()
+    plug.set_plugin_config({})
+    plug._ctx = _Ctx()
+    plug._store = SongStore(Path(tmp_path) / "singers.db")
+    plug._store.upsert({
+        "name": name,
+        "bilibili_aid": aid,
+        "singers": "、".join(singers),
+    })
+    return plug
+
+
+def test_api_returns_singers(tmp_path) -> None:
+    plug = _api_plugin_with_singers(
+        tmp_path, name="世末积雨云", singers=["洛天依"]
+    )
+    out = asyncio.run(plug.api_get_song_bilibili(name="世末积雨云 洛天依"))
+    assert out["found"] is True
+    assert out["match"] == "prefix"
+    assert out["singers"] == ["洛天依"], out
+
+
+def test_api_singers_empty_for_unknown_song(tmp_path) -> None:
+    plug = _api_plugin_with_singers(tmp_path, name="别的歌", singers=[])
+    out = asyncio.run(plug.api_get_song_bilibili(name="根本不存在"))
+    assert out["singers"] == []
+    assert set(out) == _API_KEYS

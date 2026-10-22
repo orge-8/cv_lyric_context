@@ -1738,10 +1738,16 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         参数：
             name: 歌名（会按 `safe_song_name` 归一化后匹配）。
 
-        返回字段：`schema_version` / `reason` / `found` / `name` / `aid` / `bvid` / `match`。
+        返回字段：`schema_version` / `reason` / `found` / `name` / `aid` / `bvid` /
+        `match` / `singers`。
 
         `match` 表示歌名命中的层级（`exact` / `base` / `prefix`），供排查用：
         查不到时能区分「库里真没有」与「匹配上了但没采集标识」。
+
+        `singers` 是原曲演唱者名单。**调用方用它判断用户点的是原曲还是翻唱**：
+        `prefix` 层级意味着查询串带了歌名之外的 token，如果那个 token 正是原曲
+        歌手（「世末积雨云 洛天依」），说明用户要的就是原曲；如果不是
+        （「普通DISCO 三无」），就是点名翻唱，应回退平台搜索。
         """
         empty = {
             "schema_version": 1,
@@ -1751,6 +1757,7 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             "aid": None,
             "bvid": "",
             "match": "",
+            "singers": [],
         }
         query = str(name or "").strip()
         if not query:
@@ -1768,6 +1775,14 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             return {**empty, "reason": f"曲库查询失败：{exc}"}
         if ref is None:
             return {**empty, "reason": "曲库里没有这首歌（或存在同名歧义）"}
+        try:
+            singers = [
+                str(row.get("name") or "")
+                for row in store.singers_of(ref["name"])
+                if str(row.get("name") or "").strip()
+            ]
+        except Exception:  # noqa: BLE001 - 歌手查询失败不该让整个 API 失败
+            singers = []
         return {
             "schema_version": 1,
             "reason": "" if (ref["bvid"] or ref["aid"]) else "该曲目尚未采集 B站标识",
@@ -1776,6 +1791,7 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             "aid": ref["aid"],
             "bvid": ref["bvid"],
             "match": str(ref.get("match") or ""),
+            "singers": singers,
         }
 
     @HookHandler(
