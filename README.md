@@ -37,6 +37,7 @@
 - [dashboard 自定义页面](#dashboard-自定义页面v2120-新增)
 - [本地测试](#本地测试)
 - [代码结构](#代码结构)
+- [更新日志](CHANGELOG.md) —— 各版本的变更与根因记录（独立文件）
 
 ## 安装
 
@@ -1006,48 +1007,9 @@ v1.1.0 真机踩过。顶栏最多直显 2 个工作区 tab，超出的在「更
 - 输入框长 label 精简（协议没有 hint/placeholder，说明下沉为旁挂 text 节点）。
 - 配置页：19 个字段改手工 label（自动推导的 12 字硬切会产出 dangling 括号 / 「的」收尾），
   11 个格式敏感字段补 placeholder 示例，爬取/选歌/标注/联动四个配套节默认收起
-  （v2.13.0 起 `crawler` 不再收起——它含管理员配置，收起等于藏起来，见下）。
+  （v2.13.0 起 `crawler` 不再收起——它含管理员配置，收起等于藏起来）。
 
-**v2.13.0 配置页可用性轮**（来自用户反馈「配置项含混、找了很久才找到填管理员的地方」）：
-
-- 配置按三个页签分组（`layout: tabs`）：识别与注入 / 同步与权限 / 扩展功能。
-  此前 5 个配置节平铺一页，权限项混在 13 个爬取参数里。
-- 「管理员 QQ 号」等三项权限字段提到 `[crawler]` 节最前面，节标题由
-  「VCPedia 爬取」改为「同步与命令权限」。
-- `[crawler]` 节默认展开（它现在独占页签，且含唯一必须配的开关）。
-- 字段文案改成用户语言：`sync_admin_ids` 的 label 由「可触发重任务的 QQ 号」
-  改为「管理员 QQ 号（谁能触发同步）」，hint 首句就说清留空即禁用、只读命令不受限。
-- 命令被拒时的提示改为给出可视化路径（页签 → 字段名），不再只丢
-  `crawler.sync_admin_ids` 这种内部键名。
-
-**v2.13.1 修复轮**（来自用户反馈「识别歌曲插入的消息被设置为 system 消息了，
-这会使得一个请求有两个 system 报错」）：
-
-- 根因：注入逻辑无条件**追加**一条 `role=system`（items 路径则是新增一个
-  `SystemMessageItem`），而宿主请求本身已带一条 system（人设 / 工具说明），
-  于是一次请求出现两条 system，被 LLM 供应商直接报错。
-- 修复：改为**并入**已有 system——messages 路径把文本并进已有那条 system 的
-  content（多模态 list content 则追加一个 text part），items 路径并进已有
-  `SystemMessageItem` 的 parts；只有在完全没有 system 时才新增一条。
-- 纪律固化：`_merge_system_into_messages` / `_merge_system_into_items` 两个
-  单一入口承担全部注入改写，planner 与 replyer 两条链路共用，
-  由 `tests/test_single_system_injection.py`（13 项）把「system 数恒为 1」钉死。
-
-**v2.15.0 缓存友好注入**（来自成本分析：上下文长度与 prompt cache 命中率的关系）：
-
-- 背景：供应商的 prompt cache 按「从第 0 个 token 开始的最长公共前缀」命中，
-  前缀任何一处变化都会让其后全部按未命中价计费。而宿主请求的第一条恒为 system，
-  v2.13.1 起把歌词并进那一条 —— 歌单一换，整段历史全部失效。
-- 真机实测（2026-10-27~29，778 个 prompt 快照）：17.5% 的 replyer 请求、
-  11.8% 的 planner 请求**完全没有可复用前缀**；逐例归因 48/48 全部是首条
-  `SystemMessageItem` 变化，差异位置固定落在字符 959 处的【歌词识别】标记。
-- 改动：新增配置项 `plugin.inject_position`，**默认 `tail`** —— 注入改为在请求
-  末尾追加一条 `UserMessageItem`（messages 路径追加一条 `user` 消息），
-  已有的 system 与全部历史**一个都不动**，前缀因此 100% 可复用；换歌只改末条。
-- 回退：`inject_position = "system"` 恢复 v2.14.x 行为；取值缺失或非法时
-  一律按 `tail` 处理并只警告一次。
-- 纪律：`tests/test_tail_injection.py`（13 项）把「注入后前 N 项与注入前逐项相等」
-  钉死，并覆盖换歌前缀稳定性、幂等、配置分流与日志外显。
+> 各版本的变更摘要与根因记录见 [**CHANGELOG.md**](CHANGELOG.md)。
 
 **要求**：宿主 **1.3.6+**（协议 v2 起点；1.3.5 及更早会拒绝声明并**连累整个插件加载失败**），
 且 dashboard 前端包含插件页面路由。`@API` 组件自 SDK 2.1.0 起可用（本插件已声明该下限）。
