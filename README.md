@@ -37,6 +37,7 @@
 - [dashboard 自定义页面](#dashboard-自定义页面v2120-新增)
 - [本地测试](#本地测试)
 - [代码结构](#代码结构)
+- [更新日志](CHANGELOG.md) —— 各版本的变更与根因记录（独立文件）
 
 ## 安装
 
@@ -1006,32 +1007,9 @@ v1.1.0 真机踩过。顶栏最多直显 2 个工作区 tab，超出的在「更
 - 输入框长 label 精简（协议没有 hint/placeholder，说明下沉为旁挂 text 节点）。
 - 配置页：19 个字段改手工 label（自动推导的 12 字硬切会产出 dangling 括号 / 「的」收尾），
   11 个格式敏感字段补 placeholder 示例，爬取/选歌/标注/联动四个配套节默认收起
-  （v2.13.0 起 `crawler` 不再收起——它含管理员配置，收起等于藏起来，见下）。
+  （v2.13.0 起 `crawler` 不再收起——它含管理员配置，收起等于藏起来）。
 
-**v2.13.0 配置页可用性轮**（来自用户反馈「配置项含混、找了很久才找到填管理员的地方」）：
-
-- 配置按三个页签分组（`layout: tabs`）：识别与注入 / 同步与权限 / 扩展功能。
-  此前 5 个配置节平铺一页，权限项混在 13 个爬取参数里。
-- 「管理员 QQ 号」等三项权限字段提到 `[crawler]` 节最前面，节标题由
-  「VCPedia 爬取」改为「同步与命令权限」。
-- `[crawler]` 节默认展开（它现在独占页签，且含唯一必须配的开关）。
-- 字段文案改成用户语言：`sync_admin_ids` 的 label 由「可触发重任务的 QQ 号」
-  改为「管理员 QQ 号（谁能触发同步）」，hint 首句就说清留空即禁用、只读命令不受限。
-- 命令被拒时的提示改为给出可视化路径（页签 → 字段名），不再只丢
-  `crawler.sync_admin_ids` 这种内部键名。
-
-**v2.13.1 修复轮**（来自用户反馈「识别歌曲插入的消息被设置为 system 消息了，
-这会使得一个请求有两个 system 报错」）：
-
-- 根因：注入逻辑无条件**追加**一条 `role=system`（items 路径则是新增一个
-  `SystemMessageItem`），而宿主请求本身已带一条 system（人设 / 工具说明），
-  于是一次请求出现两条 system，被 LLM 供应商直接报错。
-- 修复：改为**并入**已有 system——messages 路径把文本并进已有那条 system 的
-  content（多模态 list content 则追加一个 text part），items 路径并进已有
-  `SystemMessageItem` 的 parts；只有在完全没有 system 时才新增一条。
-- 纪律固化：`_merge_system_into_messages` / `_merge_system_into_items` 两个
-  单一入口承担全部注入改写，planner 与 replyer 两条链路共用，
-  由 `tests/test_single_system_injection.py`（13 项）把「system 数恒为 1」钉死。
+> 各版本的变更摘要与根因记录见 [**CHANGELOG.md**](CHANGELOG.md)。
 
 **要求**：宿主 **1.3.6+**（协议 v2 起点；1.3.5 及更早会拒绝声明并**连累整个插件加载失败**），
 且 dashboard 前端包含插件页面路由。`@API` 组件自 SDK 2.1.0 起可用（本插件已声明该下限）。

@@ -937,6 +937,14 @@ class PluginSection(PluginConfigBase):
         ),
     )
     ttl_seconds: int = Field(default=600, ge=30, le=86400, description="命中结果的有效期（秒），过期不再注入")
+    inject_position: str = Field(
+        default="tail",
+        description=(
+            "注入位置：tail=追加到请求末尾（默认，推荐）；system=并入 system 消息（v2.14.x 及更早的旧行为）。"
+            "供应商按「从第一个 token 起的最长公共前缀」计缓存，system 位于最前，"
+            "一旦歌单变化整段历史都会按未命中价计费；放末尾则前面的 system 与历史前缀保持不变"
+        ),
+    )
     max_inject: int = Field(default=3, ge=1, le=10, description="单次注入最多携带的歌曲数")
     inject_context_lines: int = Field(
         default=2, ge=0, le=5,
@@ -1233,6 +1241,8 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         self._probed_request = False
         self._probed_planner = False
         self._probed_command = False
+        # 注入位置取值非法只提示一次（见 _inject_position）
+        self._warned_bad_position = False
 
     # ---------- 生命周期 ----------
 
@@ -2109,6 +2119,59 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             "parts": [{"type": "text", "text": text}],
         }
 
+    @staticmethod
+    def _build_user_item(text: str) -> dict[str, Any]:
+        """构造一个 UserMessageItem 快照（Context Item schema v1）。"""
+        return {
+            "item_type": "UserMessageItem",
+            "meta": {
+                "item_id": uuid.uuid4().hex,
+                "logical_turn_id": None,
+                "timestamp": datetime.now().isoformat(),
+            },
+            "parts": [{"type": "text", "text": text}],
+        }
+
+    def _inject_position(self) -> str:
+        """注入位置，取值 tail / system；缺失或非法一律回退 tail。
+
+        回退而不抛错：注入位置只影响成本，不影响正确性，不该因此中断主流程。
+        非法值只警告一次，避免每轮每条消息刷屏。
+        """
+        raw = str(getattr(self.config.plugin, "inject_position", "") or "").strip().lower()
+        if raw in ("tail", "system"):
+            return raw
+        if raw and not self._warned_bad_position:
+            self._warned_bad_position = True
+            self.ctx.logger.warning(
+                "inject_position=%r 不是 tail/system，已按 tail 处理", raw
+            )
+        return "tail"
+
+    # ---------------- 末尾注入（缓存友好） ----------------
+    #
+    # 供应商的 prompt cache 按「从第 0 个 token 开始的最长公共前缀」命中，中间或
+    # 前面任何一处变化都会让其后全部失效。宿主请求的第一条恒为 system（人设/工具
+    # 说明），把歌词并进去等于把动态内容放到了最前面：歌单一换，整段历史全按未命中价
+    # 计费。真机实测（2026-10-27~29，778 个 prompt 快照）：17.5% 的 replyer 请求、
+    # 11.8% 的 planner 请求因此完全没有可复用前缀，差异位置固定落在 system 的
+    # 【歌词识别】标记处。
+    #
+    # 改成在末尾追加一条 UserMessageItem：前面的 system 与全部历史原样不动，
+    # 前缀 100% 可复用；换歌只会改写最后这一条。宿主 replyer 的 items 末尾本来就
+    # 并排着多条 UserMessageItem（reply_act / 当前时间与目标消息 / 风格要求），
+    # 追加同型 item 不改变载荷结构。
+
+    @classmethod
+    def _append_tail_user_item(cls, items: list[Any], text: str) -> list[Any]:
+        """在 items 末尾追加一条 UserMessageItem，已有 item 一律不动。"""
+        return list(items) + [cls._build_user_item(text)]
+
+    @staticmethod
+    def _append_tail_user_message(messages: list[Any], text: str) -> list[Any]:
+        """在 messages 末尾追加一条 user 消息（旧版回退路径用）。"""
+        return list(messages) + [{"role": "user", "content": text}]
+
     # ---------------- 单 system 纪律 ----------------
     #
     # 不少 LLM 供应商（OpenAI 兼容层、部分国内网关）只接受**一条** system 消息，
@@ -2200,15 +2263,17 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             return {"action": "continue"}
 
         modified: dict[str, Any] = {}
+        tail = self._inject_position() == "tail"
 
         # 方式 1: planner 请求带 prompt 字段 → 在 prompt 末尾追加（最常见）
+        # 字符串尾部追加本身就是缓存友好的，无需分流
         prompt = kwargs.get("prompt")
         if isinstance(prompt, str):
             if INJECT_MARKER in prompt:
                 return {"action": "continue"}
             modified["prompt"] = f"{prompt}\n\n{planner_text}"
 
-        # 方式 2: planner 请求带 messages → 追加一条 system
+        # 方式 2: planner 请求带 messages
         messages = kwargs.get("messages")
         if isinstance(messages, list):
             if any(
@@ -2216,15 +2281,21 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
                 for m in messages
             ):
                 return {"action": "continue"}
-            # 并入已有 system，不新增第二条（见「单 system 纪律」）
-            modified["messages"] = self._merge_system_into_messages(messages, planner_text)
+            if tail:
+                modified["messages"] = self._append_tail_user_message(messages, planner_text)
+            else:
+                # 并入已有 system，不新增第二条（见「单 system 纪律」）
+                modified["messages"] = self._merge_system_into_messages(messages, planner_text)
 
         # 方式 3: planner 请求带 items（Context Item schema v1）
         items = kwargs.get("items")
         if isinstance(items, list):
             if INJECT_MARKER in self._item_texts(items):
                 return {"action": "continue"}
-            modified["items"] = self._merge_system_into_items(items, planner_text)
+            if tail:
+                modified["items"] = self._append_tail_user_item(items, planner_text)
+            else:
+                modified["items"] = self._merge_system_into_items(items, planner_text)
             modified["item_schema_version"] = kwargs.get(
                 "item_schema_version", CONTEXT_ITEM_SCHEMA_VERSION
             )
@@ -2237,7 +2308,9 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             return {"action": "continue"}
 
         self.ctx.logger.info(
-            "已向规划器注入歌曲信息（%s）", "/".join(sorted(modified))
+            "已向规划器注入歌曲信息（%s，位置=%s）",
+            "/".join(sorted(modified)),
+            "tail" if tail else "system",
         )
         return {"action": "continue", "modified_kwargs": modified}
 
@@ -2268,13 +2341,17 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             return {"action": "continue"}
 
         modified: dict[str, Any] = {}
+        tail = self._inject_position() == "tail"
 
         # 路径 A（当前版本）: 改写 Context Items
         items = kwargs.get("items")
         if isinstance(items, list):
             if INJECT_MARKER in self._item_texts(items):
                 return {"action": "continue"}
-            modified["items"] = self._merge_system_into_items(items, system_text)
+            if tail:
+                modified["items"] = self._append_tail_user_item(items, system_text)
+            else:
+                modified["items"] = self._merge_system_into_items(items, system_text)
             modified["item_schema_version"] = kwargs.get(
                 "item_schema_version", CONTEXT_ITEM_SCHEMA_VERSION
             )
@@ -2287,8 +2364,11 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
                 for m in messages
             ):
                 return {"action": "continue"}
-            # 并入已有 system，不新增第二条（见「单 system 纪律」）
-            modified["messages"] = self._merge_system_into_messages(messages, system_text)
+            if tail:
+                modified["messages"] = self._append_tail_user_message(messages, system_text)
+            else:
+                # 并入已有 system，不新增第二条（见「单 system 纪律」）
+                modified["messages"] = self._merge_system_into_messages(messages, system_text)
 
         if not modified:
             self.ctx.logger.info(
@@ -2297,7 +2377,9 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             return {"action": "continue"}
 
         self.ctx.logger.info(
-            "已向 LLM 上下文注入歌曲信息（%s）", "/".join(sorted(modified))
+            "已向 LLM 上下文注入歌曲信息（%s，位置=%s）",
+            "/".join(sorted(modified)),
+            "tail" if tail else "system",
         )
         return {"action": "continue", "modified_kwargs": modified}
 
