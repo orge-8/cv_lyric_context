@@ -44,16 +44,20 @@ class _Ctx:
         self.logger = logging.getLogger("test-single-system")
 
 
-def _plugin():
+def _plugin(position: str | None = None):
     plug = _MOD.create_plugin()
     plug.set_plugin_config({})
     plug._ctx = _Ctx()
+    # v2.15.0 起默认注入位置是 tail；本文件专测「并入 system」这条旧路径的纪律，
+    # 因此显式固定 inject_position="system"。tail 路径见 test_tail_injection.py。
+    if position:
+        plug.config.plugin.inject_position = position
     return plug
 
 
-def _hit_plugin():
+def _hit_plugin(position: str | None = None):
     """装一条 TTL 内的歌词命中，让 _build_system_text 有输出。"""
-    plug = _plugin()
+    plug = _plugin(position)
     plug._hits = {"s1": deque([(time.time(), "测试歌词", "测试曲")], maxlen=20)}
     plug._meta_by_name = {}
     plug._song_record = lambda name: {}  # type: ignore[assignment]
@@ -180,7 +184,7 @@ def test_merge_items_does_not_mutate_input():
 # ---------------------------------------------------------------- Hook 端到端
 
 def test_replyer_hook_keeps_single_system_in_messages():
-    plug = _hit_plugin()
+    plug = _hit_plugin("system")
     messages = [
         {"role": "system", "content": HOST_SYSTEM},
         {"role": "user", "content": "测试歌词"},
@@ -195,7 +199,7 @@ def test_replyer_hook_keeps_single_system_in_messages():
 
 
 def test_replyer_hook_keeps_single_system_item():
-    plug = _hit_plugin()
+    plug = _hit_plugin("system")
     items = [
         {"item_type": "SystemMessageItem", "meta": {"item_id": "host-sys"},
          "parts": [{"type": "text", "text": HOST_SYSTEM}]},
@@ -209,7 +213,7 @@ def test_replyer_hook_keeps_single_system_item():
 
 
 def test_replyer_hook_appends_one_system_when_payload_has_none():
-    plug = _hit_plugin()
+    plug = _hit_plugin("system")
     res = asyncio.run(
         plug.inject_song_context(session_id="s1", messages=[{"role": "user", "content": "测试歌词"}])
     )
@@ -219,7 +223,7 @@ def test_replyer_hook_appends_one_system_when_payload_has_none():
 
 def test_replyer_hook_is_idempotent():
     """已注入过的载荷必须原样放行，不能并第二次。"""
-    plug = _hit_plugin()
+    plug = _hit_plugin("system")
     messages = [
         {"role": "system", "content": HOST_SYSTEM + "\n" + INJECT_MARKER},
         {"role": "user", "content": "测试歌词"},
@@ -229,7 +233,7 @@ def test_replyer_hook_is_idempotent():
 
 
 def test_planner_hook_keeps_single_system_in_messages():
-    plug = _hit_plugin()
+    plug = _hit_plugin("system")
     messages = [
         {"role": "system", "content": HOST_SYSTEM},
         {"role": "user", "content": "测试歌词"},
