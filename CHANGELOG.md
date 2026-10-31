@@ -9,6 +9,58 @@
 
 ---
 
+## [2.15.1] - 2026-10-31
+
+### 修复
+
+- **回复器把歌词注入块当成用户发言（v2.15.0 回归，线上事故级）**。
+  真机 replyer 的 thinking 原文：`User says lyric recognition block with lyric
+  "这样下去的话" and instruct natural reply.` —— 它去回答歌词块，而不是回答真正
+  说话的那个人（同轮的 `@鸣澜 晚安` 被当成「上一句可见的话」跳过了）。
+
+  根因：v2.15.0 为了让注入落在请求尾部（缓存友好），自己往 `items` 末尾追加了一条
+  `UserMessageItem`。那条 item 没有任何宿主赋予的框语义，又与宿主自己的三条脚手架
+  （`reply_act` / 当前时间与目标消息 / 风格要求）并排，模型无法分辨哪条是真消息。
+
+  修法：回复侧改走**宿主原生通道 `extra_prompt`**（参考 `life-frequency` v1.25.3
+  的真机做法）。该字段由宿主折进「回复要求」，位置本就在请求尾部——缓存收益一分不少，
+  语义却由宿主框住。**插件不再改写 `items` / `messages`**。
+  同时把 hook 从 `maisaka.replyer.before_model_request` 换到
+  `maisaka.replyer.before_request`：官方 hook 字段表里 `extra_prompt` 只存在于后者。
+
+### 变更
+
+- 新增 `_MAX_EXTRA_PROMPT_CHARS = 1500` 预算。`extra_prompt` 是与别的插件共享的通道，
+  超预算时**截断自己的文本**（丢 STAFF 尾巴）而不是放弃注入（丢整条识别结果），
+  更不挤掉别人的内容；已占满则本轮跳过并留日志。
+- `_build_system_text` → `_build_reply_text`：它已不代表任何一条具体的消息。
+- `plugin.inject_position` 语义收窄为**只影响规划器**（回复侧固定走尾部通道），
+  配置说明与 README 同步更新。
+- 日志改为 `已向 LLM 上下文注入歌曲信息（extra_prompt，N/M 字）`，N<M 即被截断；
+  契约不匹配（载荷里没有 `extra_prompt`）打 WARNING。
+
+### 已知遗留（不在本次范围）
+
+- **规划器侧仍自拼 `UserMessageItem`**（同样的角色可辨识性问题，优先级较低：planner
+  只做工具决策，不产出正文）。`life-frequency` 对 planner 用的是带 marker 的
+  `SystemMessageItem`，可作为下一版方案，但缓存落点尚未在真机验证。
+- 命中行仍按**整行**加「」高亮，用户只发行内片段时模型会误判「下一句」是哪句
+  （同一条 thinking 里用了三段纠结这一点）。属文本格式问题，与注入位置解耦。
+
+### 测试
+
+- 新增 `tests/test_replyer_extra_prompt.py`（10 项）：只写 `extra_prompt`、
+  不动 `items`/`messages`、保留他人内容、marker 幂等、预算截断与占满跳过、
+  缺字段告警、日志含通道名，以及一条**静态契约**——`plugin.py` 里不许再出现
+  字符串字面量 `"maisaka.replyer.before_model_request"`。
+- `tests/test_tail_injection.py` 收窄为规划器侧（4 项改为 planner 版）。
+- `tests/test_single_system_injection.py` 的 4 项回复器用例合并为 1 项
+  「回复侧不参与 system 之争」。
+- 全量：**167 passed / 8 skipped**；`gate.sh` PASS 2 / FAIL 0（check_plugin 36 PASS / 4 WARN，
+  4 条 WARN 均为既有项：装饰器名与 def 名不同源 ×3、`llm.generate` 静态未检出 ×1）。
+
+---
+
 ## [2.15.0] - 2026-10-29
 
 ### 变更

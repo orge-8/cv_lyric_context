@@ -168,7 +168,7 @@ allow_local_operator = true        # 本机控制台不受白名单限制
    │                        吃鱼" -> 《我的悲伤是水做的》）
    │                        命中 -> 按会话登记 (时间戳, 歌词, 歌名)
    │
-   └─ HookHandler (maisaka.planner.before_request + maisaka.replyer.before_model_request,
+   └─ HookHandler (maisaka.planner.before_request + maisaka.replyer.before_request,
                    均 BLOCKING)
                             把 TTL 内的命中同时注入到规划器与回复器两条 LLM 链路：
                             · 规划器: 决定调用哪些工具前先看到歌词语境
@@ -841,11 +841,12 @@ verify_ssl = false
 | `收到歌词导入命令: raw=… stream_id=…` | 命令已触发；`stream_id=<空>` 说明取不到会话，回复发不出去 |
 | `歌词导入结果已回复: sent=True/False` | 结果是否发出去；False 时插件会退回让 bot 自己接话 |
 | `命令载荷里没有 stream_id，无法回复结果` | 命令触发了但回不了话，把字段列表反馈给开发者 |
-| `[诊断] before_model_request 字段: [...]` | 回复器注入 hook 的实际字段名 |
+| `[诊断] replyer.before_request 字段: [...]` | 回复器注入 hook 的实际字段名 |
 | `[诊断] planner.before_request 字段: [...]` | 规划器注入 hook 的实际字段名 |
-| `已向 LLM 上下文注入歌曲信息（items）` | 回复器注入成功 |
+| `已向 LLM 上下文注入歌曲信息（extra_prompt，N/M 字）` | 回复器注入成功；M 明显大于 N 说明被预算截断 |
 | `已向规划器注入歌曲信息（prompt/messages/items）` | 规划器注入成功 |
-| `歌词命中但请求载荷中没有 items/messages` | 回复器侧既无 items 也无 messages，把字段名反馈给开发者 |
+| `歌词注入未生效：replyer.before_request 载荷里没有 extra_prompt` | hook 契约不匹配，把字段名反馈给开发者 |
+| `歌词命中但 extra_prompt 预算已满` | 别的插件已占满共享通道，本轮跳过 |
 | `歌词命中但 planner 请求载荷中没有 prompt/messages/items` | 规划器侧无可用载荷，把字段名反馈给开发者 |
 | `歌词收件箱导入: 成功 N 个 / 失败 M 个` | 本次加载扫过收件箱的结果 |
 | `歌词文件已入库: xxx.txt -> 《歌名》（新增 N 句）` | 某个歌词文件导入成功 |
@@ -1095,8 +1096,10 @@ python test_annotate_llm.py
 - 幂等保护：同一请求中若已注入过（内容含 `【歌词识别】` 标记），重试时不会重复叠加。
   规划器与回复器两条链路各自独立判重，互不影响。
 - 注入覆盖两条链路：规划器（`maisaka.planner.before_request`，影响工具调用决策）
-  与回复器（`maisaka.replyer.before_model_request`，影响最终回复）。若某条链路
+  与回复器（`maisaka.replyer.before_request` 的 `extra_prompt`，影响最终回复）。若某条链路
   没有日志出现，说明该版本 MaiBot 未触发对应 hook 点。
+- 回复器**不改写** `items` / `messages`：自拼的 UserMessageItem 没有宿主框语义，
+  会被当成用户发言（v2.15.0 真机事故）。`inject_position` 只影响规划器。
 - 同一会话内相同文本 10 秒内重复到达只登记一次，避免两套监听重复计数。
 - 同步是增量且可中止的：已入库的歌会跳过，`/歌词 取消` 可随时停。
 

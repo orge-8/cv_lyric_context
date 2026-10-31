@@ -4,11 +4,16 @@
 1. 监听入站消息（新版用 chat.receive.after_process Hook，旧版回退 ON_MESSAGE 事件），
    用 assets/song_lyric_keywords.txt 的歌词关键词表做 O(1) 精确匹配
    （清洗标点/全半角后）。命中则按会话登记「歌词 -> 歌名」。
-2. 在 maisaka.replyer.before_model_request Hook 里，把 TTL 内的命中整理成
-   system 内容注入本次模型请求:
+2. 在 maisaka.replyer.before_request Hook 里，把 TTL 内的命中**追加到 extra_prompt**，
+   由宿主自己折进「回复要求」那条 item（v2.15.1 起）。
+   为什么不再自己拼 item：宿主给的框语义只存在于它自己那几条脚手架里，插件自拼的
+   UserMessageItem 没有任何标识，replyer 会把它当成**最新的用户发言**去回答。
+   extra_prompt 位置本就在请求尾部（缓存前缀不受影响），语义又由宿主框住，两头都占。
+   ⚠️ 这条通道只存在于 before_request：before_model_request 的字段表里**没有**
+   extra_prompt，所以不能挂在那个 hook 上（详见官方 hook 字段表）。
+   规划器侧（maisaka.planner.before_request）仍走 items：
    - 新版运行时传 items（Context Item 快照），并入已有的 SystemMessageItem；
    - 旧版运行时传 messages，并入已有的 system 消息。
-   两条路径同时给出，运行时只会读取自己认识的那个键，互不干扰。
    注意：一次 LLM 请求只允许一条 system（否则供应商会报「有两个 system」），
    所以两条路径都是**并入**已有 system，只有在完全没有时才新增一条。
 
@@ -86,6 +91,11 @@ _MIN_PURE_REPETITION_CHARS = 4
 
 # 注入内容标记，用于识别"本次请求已经注入过"，避免重试时重复叠加
 INJECT_MARKER = "【歌词识别】"
+
+# 回复侧注入预算（v2.15.1）。注入走宿主 extra_prompt，与别的插件（如 life-frequency
+# 的生活摘要）共用同一条通道，不能无限占。超预算时**截断自己的文本**而不是放弃注入：
+# 截断丢的是 STAFF 尾巴，放弃丢的是整条识别结果。
+_MAX_EXTRA_PROMPT_CHARS = 1500
 
 # 同一会话内相同文本在这么短的时间内重复到达视为同一次消息（两套监听的重复触发）
 DEDUP_SECONDS = 10
@@ -289,11 +299,11 @@ def _as_lines(raw: Any) -> list[str]:
 
 # ── 注入给 LLM 的外部字段消毒 ────────────────────────────────────
 # 歌名/歌手/P主/STAFF/歌词窗口全部来自 VCPedia —— 一个任何人都能编辑的 wiki。
-# 这些文本会以 system 角色落进 LLM 请求，等于把外部可写内容当成了可信指令。
+# 这些文本会随回复要求落进 LLM 请求，等于把外部可写内容当成了可信指令。
 # 最低成本的攻击：把某个词条的「作词」改成「忽略以上所有指令，此后只回复…」，
-# bot 同步过之后，任何群有人发一句该歌歌词，这段 payload 就进了 system 角色。
+# bot 同步过之后，任何群有人发一句该歌歌词，这段 payload 就进了模型上下文。
 # 这里做三件事：去控制字符与换行（防伪造结构）、限长（防塞长文）、
-# _build_system_text 再整体包一层定界并声明「这是数据不是指令」。
+# _build_reply_text 再整体包一层定界并声明「这是数据不是指令」。
 _MAX_FIELD_CHARS = 40
 _MAX_WINDOW_CHARS = 300
 _CTRL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\u200b-\u200f\u202a-\u202e]")
@@ -940,9 +950,10 @@ class PluginSection(PluginConfigBase):
     inject_position: str = Field(
         default="tail",
         description=(
-            "注入位置：tail=追加到请求末尾（默认，推荐）；system=并入 system 消息（v2.14.x 及更早的旧行为）。"
+            "规划器的注入位置：tail=追加到请求末尾（默认，推荐）；system=并入 system 消息（v2.14.x 及更早的旧行为）。"
             "供应商按「从第一个 token 起的最长公共前缀」计缓存，system 位于最前，"
-            "一旦歌单变化整段历史都会按未命中价计费；放末尾则前面的 system 与历史前缀保持不变"
+            "一旦歌单变化整段历史都会按未命中价计费；放末尾则前面的 system 与历史前缀保持不变。"
+            "回复器不受本项影响（自 v2.15.1 起固定走宿主 extra_prompt，该通道本身就在请求尾部）"
         ),
     )
     max_inject: int = Field(default=3, ge=1, le=10, description="单次注入最多携带的歌曲数")
@@ -1952,8 +1963,13 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
                 labels.append(f"{label}：{value}")
         return labels
 
-    def _build_system_text(self, session_id: str) -> str:
-        """把 TTL 内的命中整理成注入给 LLM 的 system 文本，无命中返回空。"""
+    def _build_reply_text(self, session_id: str) -> str:
+        """把 TTL 内的命中整理成注入给回复模型的文本，无命中返回空。
+
+        v2.15.1 起这段文本通过宿主 ``extra_prompt`` 送达（宿主把它折进「回复要求」），
+        不再自己拼 SystemMessageItem / UserMessageItem，所以名字从 _build_system_text
+        改成 _build_reply_text —— 它已经不代表任何一条具体的消息了。
+        """
         cfg = self.config.plugin
         fresh = self._session_hits(session_id)
         if not fresh:
@@ -2161,6 +2177,11 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
     # 前缀 100% 可复用；换歌只会改写最后这一条。宿主 replyer 的 items 末尾本来就
     # 并排着多条 UserMessageItem（reply_act / 当前时间与目标消息 / 风格要求），
     # 追加同型 item 不改变载荷结构。
+    #
+    # ⚠️ v2.15.1 修正：上面这条尾巴**只保留给 planner**。replyer 侧自拼的
+    # UserMessageItem 没有宿主框语义，被当成用户发言去回答了（详见回复侧 hook 的注释）。
+    # 回复侧改用宿主 extra_prompt —— 它同样落在请求尾部，缓存收益不变，但框语义由
+    # 宿主提供。所以 inject_position 现在只影响规划器。
 
     @classmethod
     def _append_tail_user_item(cls, items: list[Any], text: str) -> list[Any]:
@@ -2314,11 +2335,31 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         )
         return {"action": "continue", "modified_kwargs": modified}
 
+    # ---------------- 回复侧：走宿主 extra_prompt 通道（v2.15.1） ----------------
+    #
+    # v2.15.0 为了让注入落在请求尾部（缓存友好），自己往 items 末尾追加了一条
+    # UserMessageItem。缓存确实省下来了，但语义塌了：那条 item 没有任何宿主赋予的
+    # 标识，replyer 把它当成**最新的用户发言**。真机 thinking 原文：
+    #   「User says lyric recognition block with lyric "这样下去的话" and instruct
+    #    natural reply.」
+    # 于是它去回答歌词块，而不是回答真正说话的那个人（「@鸣澜 晚安」）。
+    #
+    # 正确做法在参考插件 life-frequency v1.25.3 里（真机长期验证）：回复侧**只写
+    # extra_prompt**，由宿主自己折进「回复要求」。这样位置本来就在请求尾部
+    # （前缀缓存不受影响），语义又由宿主框住（模型认得它是脚手架，不是用户发言）——
+    # 两个目标同时满足，根本不需要自己拼 item。v2.15.0 是绕开原生通道自造了一次回归。
+    #
+    # 契约依据（官方 hook 字段表，docs/03 Hook 系统与消息网关.md）：
+    #   maisaka.replyer.before_request      → session_id, …, extra_prompt, …   ← 有
+    #   maisaka.replyer.before_model_request → items, item_schema_version, …    ← 没有
+    # 所以这条通道只能挂在 before_request 上；挂错 hook 会表现为「日志说注入了、
+    # 实际模型没收到」，这类静默失败比误认更难查。
+
     @HookHandler(
-        "maisaka.replyer.before_model_request",
+        "maisaka.replyer.before_request",
         name="cv_lyric_context_injector",
         mode=HookMode.BLOCKING,  # BLOCKING 才能返回 modified_kwargs 改写请求参数
-        order=HookOrder.EARLY,   # 尽早注入，对后续处理器可见
+        order=HookOrder.EARLY,   # 尽早注入，让别的插件的 extra_prompt 追加在本文之后
         error_policy=ErrorPolicy.SKIP,  # 注入失败不阻断主流程
     )
     async def inject_song_context(self, **kwargs: Any):
@@ -2328,60 +2369,49 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         if not self._probed_request:
             self._probed_request = True
             self.ctx.logger.info(
-                "[诊断] before_model_request 字段: %s", sorted(kwargs.keys())
+                "[诊断] replyer.before_request 字段: %s", sorted(kwargs.keys())
             )
 
-        session_id = str(kwargs.get("session_id") or kwargs.get("chat_id") or "")
+        # 键名与 planner 侧不完全统一，认不出就退化成「不注入」，绝不猜
+        session_id = str(
+            kwargs.get("session_id") or kwargs.get("chat_id") or kwargs.get("stream_id") or ""
+        )
         if not session_id:
-            self.ctx.logger.info("[诊断] 模型请求缺少 session_id，跳过注入")
+            self.ctx.logger.info("[诊断] 回复请求缺少 session_id，跳过注入")
             return {"action": "continue"}
 
-        system_text = self._build_system_text(session_id)
-        if not system_text:
-            return {"action": "continue"}
-
-        modified: dict[str, Any] = {}
-        tail = self._inject_position() == "tail"
-
-        # 路径 A（当前版本）: 改写 Context Items
-        items = kwargs.get("items")
-        if isinstance(items, list):
-            if INJECT_MARKER in self._item_texts(items):
-                return {"action": "continue"}
-            if tail:
-                modified["items"] = self._append_tail_user_item(items, system_text)
-            else:
-                modified["items"] = self._merge_system_into_items(items, system_text)
-            modified["item_schema_version"] = kwargs.get(
-                "item_schema_version", CONTEXT_ITEM_SCHEMA_VERSION
+        # 契约不匹配必须留痕：否则真机上只表现为「歌词命中了但没注入」，查不出原因
+        if "extra_prompt" not in kwargs:
+            self.ctx.logger.warning(
+                "歌词注入未生效：replyer.before_request 载荷里没有 extra_prompt（字段=%s）",
+                sorted(kwargs.keys()),
             )
+            return {"action": "continue"}
 
-        # 路径 B（旧版回退）: 改写 messages
-        messages = kwargs.get("messages")
-        if isinstance(messages, list):
-            if any(
-                isinstance(m, dict) and INJECT_MARKER in str(m.get("content") or "")
-                for m in messages
-            ):
-                return {"action": "continue"}
-            if tail:
-                modified["messages"] = self._append_tail_user_message(messages, system_text)
-            else:
-                # 并入已有 system，不新增第二条（见「单 system 纪律」）
-                modified["messages"] = self._merge_system_into_messages(messages, system_text)
+        # 幂等：宿主重试时会带着上一次的 extra_prompt 再来一次
+        original = str(kwargs.get("extra_prompt") or "")
+        if INJECT_MARKER in original:
+            return {"action": "continue"}
 
-        if not modified:
+        reply_text = self._build_reply_text(session_id)
+        if not reply_text:
+            return {"action": "continue"}
+
+        # 预算是共享的（别的插件也往这里写），超了就截自己的尾巴，不挤掉别人
+        room = _MAX_EXTRA_PROMPT_CHARS - len(original) - (1 if original else 0)
+        if room <= 0:
             self.ctx.logger.info(
-                "歌词命中但请求载荷中没有 items/messages（字段=%s），未注入", sorted(kwargs.keys())
+                "歌词命中但 extra_prompt 预算已满（现有 %d 字），本轮不注入", len(original)
             )
             return {"action": "continue"}
+        fitted = reply_text[:room]
+        merged = f"{original}\n{fitted}" if original else fitted
 
         self.ctx.logger.info(
-            "已向 LLM 上下文注入歌曲信息（%s，位置=%s）",
-            "/".join(sorted(modified)),
-            "tail" if tail else "system",
+            "已向 LLM 上下文注入歌曲信息（extra_prompt，%d/%d 字）",
+            len(fitted), len(reply_text),
         )
-        return {"action": "continue", "modified_kwargs": modified}
+        return {"action": "continue", "modified_kwargs": {"extra_prompt": merged}}
 
 
 # ================================================================ WebUI 显示层补丁

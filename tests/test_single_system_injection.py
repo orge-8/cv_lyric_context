@@ -10,8 +10,10 @@ system」被供应商直接报错。
 2. messages 里没有 system → 才新增一条，且全场只有一条 system；
 3. items 里已有 SystemMessageItem → 并进它的 parts，item 数不变；
 4. 不就地改动调用方传入的对象（返回新列表/新 dict）；
-5. 端到端：inject_song_context / inject_planner_context 返回的载荷里
-   system 数量恒为 1。
+5. 端到端：inject_planner_context 返回的载荷里 system 数量恒为 1。
+
+⚠️ v2.15.1：回复侧已改走宿主 extra_prompt，**完全不碰 items / messages**，
+所以「回复器的单 system」不再是本文件的命题（见 test_replyer_extra_prompt.py）。
 """
 
 import asyncio
@@ -183,53 +185,20 @@ def test_merge_items_does_not_mutate_input():
 
 # ---------------------------------------------------------------- Hook 端到端
 
-def test_replyer_hook_keeps_single_system_in_messages():
+def test_replyer_hook_leaves_payload_untouched():
+    """v2.15.1：回复侧不参与 system 之争 —— 它只写 extra_prompt。"""
     plug = _hit_plugin("system")
     messages = [
         {"role": "system", "content": HOST_SYSTEM},
         {"role": "user", "content": "测试歌词"},
     ]
-    res = asyncio.run(plug.inject_song_context(session_id="s1", messages=messages))
-
-    modified = res.get("modified_kwargs") or {}
-    assert "messages" in modified
-    assert _count_system(modified["messages"]) == 1, "修复后仍出现两条 system"
-    assert len(modified["messages"]) == 2
-    assert INJECT_MARKER in modified["messages"][0]["content"]
-
-
-def test_replyer_hook_keeps_single_system_item():
-    plug = _hit_plugin("system")
-    items = [
-        {"item_type": "SystemMessageItem", "meta": {"item_id": "host-sys"},
-         "parts": [{"type": "text", "text": HOST_SYSTEM}]},
-    ]
-    res = asyncio.run(plug.inject_song_context(session_id="s1", items=items))
-
-    modified = res.get("modified_kwargs") or {}
-    assert "items" in modified
-    assert _count_system_items(modified["items"]) == 1
-    assert len(modified["items"]) == 1
-
-
-def test_replyer_hook_appends_one_system_when_payload_has_none():
-    plug = _hit_plugin("system")
     res = asyncio.run(
-        plug.inject_song_context(session_id="s1", messages=[{"role": "user", "content": "测试歌词"}])
+        plug.inject_song_context(session_id="s1", messages=messages, extra_prompt="")
     )
+
     modified = res.get("modified_kwargs") or {}
-    assert _count_system(modified["messages"]) == 1
-
-
-def test_replyer_hook_is_idempotent():
-    """已注入过的载荷必须原样放行，不能并第二次。"""
-    plug = _hit_plugin("system")
-    messages = [
-        {"role": "system", "content": HOST_SYSTEM + "\n" + INJECT_MARKER},
-        {"role": "user", "content": "测试歌词"},
-    ]
-    res = asyncio.run(plug.inject_song_context(session_id="s1", messages=messages))
-    assert "modified_kwargs" not in res
+    assert set(modified) == {"extra_prompt"}
+    assert _count_system(messages) == 1
 
 
 def test_planner_hook_keeps_single_system_in_messages():
