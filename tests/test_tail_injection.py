@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""末尾注入（缓存友好）的回归测试（v2.15.0）。
+"""末尾注入（缓存友好）的回归测试（v2.15.0，v2.15.1 收窄到规划器）。
 
 背景：供应商的 prompt cache 按「从第 0 个 token 开始的最长公共前缀」命中。
 宿主请求的第一条恒为 system（人设/工具说明），v2.14.x 把歌词并进那一条，
@@ -9,6 +9,10 @@
 - 17.5% 的 replyer 请求、11.8% 的 planner 请求完全没有可复用前缀；
 - 逐例归因 48/48 全部是首条 SystemMessageItem 变化，差异位置固定落在
   字符 959 处的【歌词识别】标记。
+
+⚠️ v2.15.1：本文件覆盖**规划器**侧。回复侧改走宿主 extra_prompt
+（见 tests/test_replyer_extra_prompt.py）——自拼 UserMessageItem 会被 replyer
+当成最新用户发言，那是 v2.15.0 的真机事故。
 
 修复契约：
 1. tail 模式下，已有的 item / message **一个都不改**（内容、顺序、数量），
@@ -171,24 +175,7 @@ def test_custom_system_mode_still_merges():
     assert INJECT_MARKER in out[0]["parts"][-1]["text"]
 
 
-# ---------------------------------------------------------------- Hook 端到端
-
-def test_replyer_hook_tail_appends_and_keeps_system_item():
-    plug = _hit_plugin("tail")
-    items = _host_items()
-    snapshot = copy.deepcopy(items)
-
-    res = asyncio.run(plug.inject_song_context(session_id="s1", items=items))
-    modified = res.get("modified_kwargs") or {}
-
-    out = modified["items"]
-    assert len(out) == len(snapshot) + 1
-    assert out[: len(snapshot)] == snapshot, "system/历史被改动，缓存前缀断裂"
-    assert out[-1]["item_type"] == "UserMessageItem"
-    assert INJECT_MARKER in out[-1]["parts"][0]["text"]
-    # 仍然只有一条 system —— 单 system 纪律不受影响
-    assert sum(1 for i in out if i.get("item_type") == "SystemMessageItem") == 1
-
+# ---------------------------------------------------------------- Hook 端到端（规划器）
 
 def test_planner_hook_tail_appends_and_keeps_system_item():
     plug = _hit_plugin("tail")
@@ -200,11 +187,13 @@ def test_planner_hook_tail_appends_and_keeps_system_item():
 
     out = modified["items"]
     assert len(out) == len(snapshot) + 1
-    assert out[: len(snapshot)] == snapshot
+    assert out[: len(snapshot)] == snapshot, "system/历史被改动，缓存前缀断裂"
     assert INJECT_MARKER in out[-1]["parts"][0]["text"]
+    # 仍然只有一条 system —— 单 system 纪律不受影响
+    assert sum(1 for i in out if i.get("item_type") == "SystemMessageItem") == 1
 
 
-def test_replyer_hook_tail_messages_keeps_system():
+def test_planner_hook_tail_messages_keeps_system():
     plug = _hit_plugin("tail")
     messages = [
         {"role": "system", "content": HOST_SYSTEM},
@@ -212,7 +201,7 @@ def test_replyer_hook_tail_messages_keeps_system():
     ]
     snapshot = copy.deepcopy(messages)
 
-    res = asyncio.run(plug.inject_song_context(session_id="s1", messages=messages))
+    res = asyncio.run(plug.inject_planner_context(session_id="s1", messages=messages))
     out = (res.get("modified_kwargs") or {})["messages"]
 
     assert out[: len(snapshot)] == snapshot
@@ -220,21 +209,21 @@ def test_replyer_hook_tail_messages_keeps_system():
     assert INJECT_MARKER in out[-1]["content"]
 
 
-def test_tail_hook_is_idempotent():
+def test_planner_tail_hook_is_idempotent():
     """已注入过的载荷必须原样放行，不能追加第二次。"""
     plug = _hit_plugin("tail")
     items = plug._append_tail_user_item(_host_items(), TEXT_A)
 
-    res = asyncio.run(plug.inject_song_context(session_id="s1", items=items))
+    res = asyncio.run(plug.inject_planner_context(session_id="s1", items=items))
 
     assert "modified_kwargs" not in res
 
 
-def test_tail_hook_reports_position_in_log(caplog):
+def test_planner_tail_hook_reports_position_in_log(caplog):
     """注入日志必须报出实际位置，便于真机核对是否生效。"""
     plug = _hit_plugin("tail")
     with caplog.at_level(logging.INFO):
-        asyncio.run(plug.inject_song_context(session_id="s1", items=_host_items()))
+        asyncio.run(plug.inject_planner_context(session_id="s1", items=_host_items()))
 
     # getMessage() 已完成 % 格式化，不要再叠加 record.args（会二次格式化）
     assert any("位置=tail" in r.getMessage() for r in caplog.records), "注入日志缺少位置标记"
