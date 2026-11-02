@@ -53,7 +53,7 @@ def _plugin(with_hit: bool = True):
     plug.set_plugin_config({})
     plug._ctx = _Ctx()
     if with_hit:
-        plug._hits = {"s1": deque([(time.time(), "测试歌词", "测试曲")], maxlen=20)}
+        plug._hits = {"s1": deque([(time.time(), "测试歌词", "测试曲", True)], maxlen=20)}
         plug._meta_by_name = {}
         plug._song_record = lambda name: {}  # type: ignore[assignment]
     return plug
