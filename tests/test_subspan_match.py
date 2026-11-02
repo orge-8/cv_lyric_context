@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""子串匹配（v2.10.0）回归测试。
+"""子串匹配（v2.10.0，v2.16.0 改为最长共享段取胜）回归测试。
 
 背景（真机 2026-10-06）：群友把《我的悲伤是水做的》的「其实也并不喜欢吃鱼」
 记成「可是我并不喜欢吃鱼」，整句精确匹配接不住。子串匹配在整句未命中时
 按 N 字滑窗查片段索引兜底。本文件守住三层语义：
 
 1. 索引侧：_add_subspans_into 只在整句准入后写片段，归属歌数超限不登记；
-2. 匹配侧：_subspan_find 同歌重叠窗口去重、闲聊黑名单/形态双重拦截；
+2. 匹配侧：按**最长连续共享段**取胜者（v2.16.0 之前是窗口位置先到先得，
+   真机 2026-11-02《绝体绝命》事故就死在这上面）；仅共享一个最小窗口
+   且多歌并列时判为歧义不猜；同歌多窗口合成一段、片段即共享段原文；
 3. 端到端：真实素材库上「可是我并不喜欢吃鱼」必须命中《我的悲伤是水做的》，
    且命中片段能被 _lyric_window 的包含匹配定位到歌词行。
 """
@@ -27,6 +29,7 @@ if not hasattr(_MOD, "create_plugin"):
 
 _AssetIndex = _MOD._AssetIndex
 _add_subspans_into = _MOD._add_subspans_into
+_index_song_into = _MOD._index_song_into
 _chatter_ngrams = _MOD._chatter_ngrams
 _subspan_find = _MOD._subspan_find
 _build_asset_index = _MOD._build_asset_index
@@ -91,10 +94,58 @@ def test_find_returns_hit_for_paraphrased_quote():
 def test_find_dedupes_overlapping_windows_same_song():
     index = _make_index(6)
     _add_subspans_into(index, _clean("其实也并不喜欢吃鱼"), "我的悲伤是水做的")
-    # 整句就是歌词原文：多个重叠窗口同歌，只记第一个
+    # 整句就是歌词原文：多个重叠窗口同歌，合成一段、只出一条命中
     hits = _subspan_find(_clean("其实也并不喜欢吃鱼"), 6, index.subspans_by_gram, frozenset())
     assert len(hits) == 1
     assert hits[0][1] == ["我的悲伤是水做的"]
+    # 片段是整段共享原文，不是 6 字窗口
+    assert hits[0][0] == _clean("其实也并不喜欢吃鱼")
+
+
+def test_find_winner_take_all_by_longest_shared_run():
+    """真机 2026-11-02 事故：跨两行的引用被邻居歌抢走。
+
+    「来来我最亲爱的朋友 请为我悼念悼念」在《绝体绝命》里是两行
+    （「来来 我最亲爱的朋友」/「请为我 悼念 悼念」），整句永远命不中；
+    它与《见字如面》共享 7 字、《光明的未来》共享 6 字。旧逻辑按窗口位置
+    先到先得，把结果判给了这两首邻居，真正的歌一次都没沾上。
+    """
+    index = _make_index(6)
+    _index_song_into(index, "绝体绝命", "洛天依", "阿良良木健",
+                     ["来来 我最亲爱的朋友", "请为我 悼念 悼念"])
+    _index_song_into(index, "见字如面", "", "", ["我最亲爱的朋友你在哪里"])
+    _index_song_into(index, "光明的未来", "", "", ["亲爱的朋友请跟我来"])
+    hits = _subspan_find(
+        _clean("来来我最亲爱的朋友 请为我悼念悼念"), 6, index.subspans_by_gram, frozenset(),
+    )
+    assert hits == [(_clean("来来我最亲爱的朋友"), ["绝体绝命"])]
+
+
+def test_find_tie_at_longer_run_keeps_all_songs():
+    """同一段长共享（多首歌同词）属真歧义，全部保留，交给调用方取 bucket 首位。"""
+    index = _make_index(6)
+    _index_song_into(index, "原曲", "", "", ["来来我最亲爱的朋友"])
+    _index_song_into(index, "翻唱", "", "", ["来来我最亲爱的朋友"])
+    hits = _subspan_find(_clean("来来我最亲爱的朋友"), 6, index.subspans_by_gram, frozenset())
+    assert len(hits) == 1
+    assert set(hits[0][1]) == {"原曲", "翻唱"}
+
+
+def test_find_minimal_window_tie_is_ambiguous():
+    """只共享一个最小窗口、且多首歌并列：证据为零，不猜。"""
+    index = _make_index(6)
+    _index_song_into(index, "歌A", "", "", ["我最亲爱的朋友"])
+    _index_song_into(index, "歌B", "", "", ["我最亲爱的朋友们"])
+    key = _clean("我最亲爱的朋")  # 只有 1 个 6 字窗口
+    assert _subspan_find(key, 6, index.subspans_by_gram, frozenset()) == []
+
+
+def test_find_minimal_window_single_owner_still_found():
+    """最小窗口但归属唯一：仍然接住（v2.10.0 的原始能力不能被这道歧义闸误伤）。"""
+    index = _make_index(6)
+    _index_song_into(index, "歌A", "", "", ["我最亲爱的朋友"])
+    hits = _subspan_find(_clean("我最亲爱的朋"), 6, index.subspans_by_gram, frozenset())
+    assert hits == [(_clean("我最亲爱的朋"), ["歌A"])]
 
 
 def test_find_skips_blocked_chatter_gram():

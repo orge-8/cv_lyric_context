@@ -434,25 +434,70 @@ def _subspan_find(key: str, n: int, subspans_by_gram: dict[str, list[str]],
                   blocked: frozenset[str]) -> list[tuple[str, list[str]]]:
     """在清洗后的候选 key 里滑窗找歌词片段，返回 [(片段, [歌名]), ...]（纯函数，可测）。
 
-    - 同一首歌的多个重叠窗口只记第一个：连续共享 8 字时 6 字窗会连中
-      3 次，登记 3 个同歌命中只会重复注入；
+    v2.16.0 起按「最长连续共享段」取胜者，不再按窗口位置先到先得。
+    动机（真机 2026-11-02）：「来来我最亲爱的朋友 请为我悼念悼念」是
+    《绝体绝命》跨两行的拼接，旧逻辑按位置把「我最亲爱的朋」判给《见字如面》、
+    把「亲爱的朋友请」判给《光明的未来》，真正的歌一个都没沾上——位置优先
+    等于让**最先撞上的通用片段**替整条消息定案。
+
+    - 每首歌的得分 = 与消息**连续共享**的字符数（n 字窗连续命中 k 个
+      => n+k-1 字共享），同一首歌多个不连续段取最长的一段；
+    - 只保留并列最高分的歌，片段取该歌最长共享段本身（不是 n 字窗），
+      注入侧 ``_lyric_window`` 的包含匹配因此能直接定位真实歌词行；
+    - 最高分并列且仅达最小窗口（== n）时判为歧义、直接不猜——6 字撞车
+      不构成「用户在引用这首歌」的证据；
     - 片段命中闲聊黑名单（blocked）或闲聊形态判定（_is_chatter_like，
-      兜住黑名单没覆盖的重复形态）的直接跳过；
-    - 顺序按片段在消息里出现的位置排，调用方自行限流（_MAX_SUBSPAN_HITS）。
+      兜住黑名单没覆盖的重复形态）的窗口不计分；
+    - 结果按共享段在消息里出现的位置排序，调用方自行限流（_MAX_SUBSPAN_HITS）。
     """
     if n <= 0 or len(key) < n:
         return []
-    found: list[tuple[str, list[str]]] = []
-    taken: set[str] = set()
+    # 逐窗口收集归属歌：空列表表示该窗口不可用（无索引 / 黑名单 / 闲聊形态）
+    windows: list[list[str]] = []
     for i in range(len(key) - n + 1):
         gram = key[i:i + n]
         songs = subspans_by_gram.get(gram)
         if not songs or gram in blocked or _is_chatter_like(gram):
+            windows.append([])
             continue
-        if any(song in taken for song in songs):
-            continue
-        taken.update(songs)
-        found.append((gram, songs))
+        windows.append(songs)
+
+    best_len: dict[str, int] = {}
+    best_start: dict[str, int] = {}
+    run: dict[str, int] = {}        # 歌名 -> 当前连续命中窗口数
+    run_start: dict[str, int] = {}  # 歌名 -> 当前连续段的起始窗口
+    for i, songs in enumerate(windows):
+        alive = set(songs)
+        for song in [s for s in run if s not in alive]:
+            del run[song]
+            run_start.pop(song, None)
+        for song in alive:
+            if song in run:
+                run[song] += 1
+            else:
+                run[song] = 1
+                run_start[song] = i
+            length = n + run[song] - 1
+            if length > best_len.get(song, 0):
+                best_len[song] = length
+                best_start[song] = run_start[song]
+    if not best_len:
+        return []
+    top = max(best_len.values())
+    winners = [song for song, score in best_len.items() if score == top]
+    if top <= n and len(winners) > 1:
+        return []  # 只共享一个最小窗口、且多首歌并列：证据为零，不猜
+    groups: dict[int, list[str]] = {}
+    for song in winners:
+        groups.setdefault(best_start[song], []).append(song)
+    found: list[tuple[str, list[str]]] = []
+    for start in sorted(groups):
+        names = groups[start]
+        bucket = windows[start]
+        # 保持索引里的歌名顺序（自定义/导入优先的语义在 bucket 顺序里）
+        ordered = [song for song in bucket if song in names]
+        ordered += [song for song in names if song not in ordered]
+        found.append((key[start:start + top], ordered))
     return found
 
 
@@ -599,9 +644,14 @@ def _fill_lyrics_from_db_into(db_path: Path, index: _AssetIndex,
                               intern: dict[str, str]) -> tuple[int, Optional[str]]:
     """把 knowledge_db.db 里有歌词、却没进关键词文件的歌补进索引。
 
-    关键词文件是预先生成的，和 db 不完全一致：db 里 3318 首有 lyrics，
-    关键词文件只覆盖了 3055 首，剩下的歌永远识别不到。db 自己就有歌词，
-    直接拿来补，不依赖任何外部数据。
+    关键词文件是预先生成的**残缺快照**，和 db 不完全一致：db 里 3318 首有
+    lyrics，关键词文件只覆盖了 3055 首，剩下的歌永远识别不到。db 自己就有
+    歌词，直接拿来补，不依赖任何外部数据。
+
+    v2.16.0 起不再按 ``indexed_names`` 跳过「已索引」的歌：词库文件对同一首
+    歌往往只收了十几行（《绝体绝命》只有 5 行，db 里是 95 行），一旦这几行
+    点亮了 indexed_names，整首歌更完整的歌词就被永久挡在门外。``_index_song_into``
+    按 (句, 歌) 去重，重复合并没有副作用。
 
     返回 (补入歌曲数, 错误信息)。边读边入索引（不 fetchall），加载期内存峰值减半。
     """
@@ -619,7 +669,7 @@ def _fill_lyrics_from_db_into(db_path: Path, index: _AssetIndex,
             "WHERE lyrics IS NOT NULL AND TRIM(lyrics) != ''"
         ):
             name = str(name or "").strip()
-            if not name or name in index.indexed_names:
+            if not name:
                 continue
             name = intern.setdefault(name, name)
             singers, uploader = index.meta_by_name.get(name, ("", ""))
@@ -639,10 +689,13 @@ def _load_song_db_into(db_path: Path, index: _AssetIndex,
                        intern: dict[str, str]) -> tuple[int, int, Optional[str]]:
     """读取一个含 songs(name, singers, uploader, lyrics) 的库并入索引。
 
-    返回 (新增歌曲数, 库内总行数, 错误信息)。
-    歌词已经索引过的歌跳过。注意判断依据是 indexed_names 不是 meta_by_name：
-    后者只说明"知道这首歌"，不代表歌词已入库，用它会把关键词文件漏掉的
-    那几百首一并放过。
+    返回 (贡献歌词的歌数, 库内总行数, 错误信息)。
+    v2.16.0 起不再跳过 ``indexed_names`` 里的歌（旧注释的理由是「歌词已经
+    索引过的歌跳过」，但判断依据错了：它只能证明**这首歌有句子进过索引**，
+    不能证明歌词已经收全）。真机实测：基础词库与 VCPedia 库的 2785 首交集里，
+    2086 首（74.9%）在同步库里有更多歌词行，累计 3.9 万行被这条短路永久丢弃，
+    《绝体绝命》就是标本——词库 5 行、库里 95 行，副歌两句全丢。
+    ``_index_song_into`` 按 (句, 歌) 去重，重复合并是安全且幂等的。
     """
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -671,12 +724,8 @@ def _load_song_db_into(db_path: Path, index: _AssetIndex,
             # 其余交给 _lyrics_lru 按需查库（VCPedia 库太大不常驻的设计本意）
             if _storable_lyrics(lines):
                 index.lyrics_by_name.setdefault(_clean(name), lines)
-            if name in index.indexed_names:
-                index.db_meta.setdefault(_clean(name), meta)
-                continue
-            # 只统计真正贡献了歌词句的歌。_index_song_into 对「歌词为空」或
-            # 「句太短/无汉字」的歌返回 0 且不标记已索引（留着等重抓补歌词），
-            # 无条件 +1 会让这批歌每次重建都被当成「新增」，数字稳定复现却毫无意义。
+            # 不按 indexed_names 短路：词库对单首歌的信息往往是残缺的，
+            # 合并进来只会补上缺失的句子（_index_song_into 内部按句去重）。
             if _index_song_into(index, name, meta[0], meta[1], lines):
                 added += 1
             index.db_meta.setdefault(_clean(name), meta)
@@ -882,14 +931,15 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str,
     else:
         logs.append(("warning", f"缺少歌词关键词文件: {txt_path}"))
 
-    # 关键词文件本身有漏：db 里 3318 首有歌词，关键词文件只覆盖了 3055 首。
-    # 剩下的歌用 db 自己的 lyrics 列补上，不用等爬虫。
+    # 关键词文件本身有漏：db 里 3318 首有歌词，关键词文件只覆盖了 3055 首；
+    # 即便覆盖到的歌，词库也常常只收了十几行（v2.16.0：改成按歌合并，不再
+    # 因为「这首歌已索引过」就整首跳过）。剩下的行用 db 自己的 lyrics 列补上。
     if db_path.exists():
         filled, err = _fill_lyrics_from_db_into(db_path, index, intern)
         if err:
             logs.append(("warning", err))
         elif filled:
-            logs.append(("info", f"基础词库歌词补漏: {filled} 首歌的歌词已补进索引"))
+            logs.append(("info", f"基础词库歌词补全: {filled} 首歌的歌词已并入索引"))
 
     user_count, err = _load_user_songs_into(index, Path(data_dir))
     if err:
@@ -909,9 +959,14 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str,
             logs.append(("warning", err))
             continue
         if added:
-            logs.append(("info", f"外部歌曲库 {extra_db.name}: 新增 {added} 首歌"))
+            logs.append((
+                "info",
+                f"外部歌曲库 {extra_db.name}: {added} 首歌贡献了歌词（新歌与补全合计）",
+            ))
         else:
-            logs.append(("info", f"外部歌曲库 {extra_db.name}: {rows} 首歌均已在基础库中，未新增"))
+            logs.append((
+                "info", f"外部歌曲库 {extra_db.name}: {rows} 首歌没有可用歌词行，未并入"
+            ))
         extra_count += added
     if extra_count:
         logs.append(("info", f"外部歌曲库已补充: {extra_count} 首歌"))
@@ -1364,7 +1419,7 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
     # ---------- 外部歌曲库（如 vcpedia-crawler 爬到的） ----------
 
     def _load_extra_dbs(self) -> int:
-        """从外部歌曲库补充歌词与元数据，返回新增的歌曲数。"""
+        """从外部歌曲库合并歌词与元数据，返回贡献了歌词的歌数。"""
         raw_cfg = str(self.config.plugin.extra_song_dbs or "")
         paths, warnings = _resolve_extra_db_paths(raw_cfg, str(self.ctx.paths.data_dir))
         for message in warnings:
@@ -1381,10 +1436,12 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
                 self.ctx.logger.warning("%s", err)
                 continue
             if added:
-                self.ctx.logger.info("外部歌曲库 %s: 新增 %d 首歌", db_path.name, added)
+                self.ctx.logger.info(
+                    "外部歌曲库 %s: %d 首歌贡献了歌词（新歌与补全合计）", db_path.name, added
+                )
             else:
                 self.ctx.logger.info(
-                    "外部歌曲库 %s: %d 首歌均已在基础库中，未新增", db_path.name, rows
+                    "外部歌曲库 %s: %d 首歌没有可用歌词行，未并入", db_path.name, rows
                 )
             total += added
         return total
@@ -1610,7 +1667,8 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         候选 = 整条消息 + 按空白切出的各段 + 按标点切出的各句。
         任一候选命中即登记，同一条消息里命中多句歌词会全部登记。
         整句未命中时再走子串匹配兜底（v2.10.0）：按滑窗片段查子串索引，
-        接得住「记岔开头/只记得半句」的引用，seg/key 记为命中片段本身，
+        接得住「记岔开头/只记得半句」的引用。v2.16.0 起按**最长连续共享段**
+        取胜者（不再位置先到先得），seg 记的是该歌与消息共享的那一段原文，
         注入侧 _lyric_window 用包含匹配就能定位到真实歌词行。
         """
         self._sweep_stale_sessions()
