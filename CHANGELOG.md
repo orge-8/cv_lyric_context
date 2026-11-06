@@ -9,6 +9,39 @@
 
 ---
 
+## [2.18.0] - 2026-11-06
+
+### 新增
+
+- **多来源字段级补全**：新增 `vcpedia_merge.py`（纯函数）与
+  `SongStore.merge_missing()`。参考 mohobot
+  `mohobot/music_knowledge/normalize.py` / `merge.py`（MIT License,
+  Copyright (c) 2026 CarefreeSongs712；许可声明见 `vcpedia_merge.py` 文件头），
+  落地两条数据原则：
+  1. 归一化名**只用于生成候选**，绝不当写入键——定位复用既有
+     `_lookup_song_rows` 的四层候选，命中多行即返回 `ambiguous` 并不写库；
+  2. **非空值永不被空值覆盖**，同字段多来源取值冲突时保留现值并记入
+     `conflicts`，不静默丢弃差异。
+- 版本名保护：`X(中文版)` 这类带版本标记的歌名只允许 `exact` 层命中；通过
+  去括号层命中原版 `X` 时返回 `version_name` 并拒绝合并，避免把两个版本并成一首。
+
+### 边界
+
+- `upsert()` 语义**不变**（仍是单来源全量覆盖，供 VCPedia 全量同步）；
+  `merge_missing()` 是 additive 入口，不新增歌曲、不改既有同步链路、当前无调用方。
+- 关系/正文类字段（创作者、歌姬、主歌词、分类）按**整块为空**才补，
+  避免 `write_*` 的整体替换语义抹掉 engine / voicebank / position 等细节。
+- `sdk.max_version` 保持 `2.16.99` 不动：官方 SDK 已到 2.21.0，按会话启动规则
+  只能实测后再 bump，禁止写 `2.99.99` 之类的占位大数。
+
+### 验证
+
+- `gate.sh` 全绿：check_plugin PASS 38 / WARN 5 / FAIL 0；pytest
+  **197 passed / 8 skipped**（含本次新增 8 条）。
+- 新增 `tests/test_vcpedia_merge.py`：归一化候选、版本名分类、字段合并语义、
+  只补空不覆盖、二次调用幂等、歧义拒绝、跨版本拒绝、not_found / invalid。
+- **未真机验证**：本方法目前只作为后续多来源同步的写入入口，尚未接入运行链路。
+
 ## [2.17.0] - 2026-11-02
 
 ### 修复

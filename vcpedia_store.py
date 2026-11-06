@@ -21,6 +21,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
+from vcpedia_merge import (
+    candidate_names,
+    is_empty,
+    is_version_name,
+    merge_fields,
+)
 from vcpedia_schema import (
     CONTENT_ROLE_CODES,
     EMOTION_SEPARATOR,
@@ -328,6 +334,129 @@ class SongStore:
         write_lyrics(conn, song_id, lyrics, now, source="vcpedia")
         write_tags(conn, song_id, TAG_KIND_CATEGORY, categories, now)
         return created
+
+    #: 字段级补全可直接判空的标量列（v2.18.0）。
+    _SCALAR_FILL_FIELDS = ("year", "introduction", "bilibili_aid", "bilibili_bvid")
+
+    def merge_missing(
+        self, record: Dict[str, Any], conn: Optional[sqlite3.Connection] = None
+    ) -> Dict[str, Any]:
+        """字段级补全入口（v2.18.0）：只补空、不覆盖、不猜歧义、不新增歌曲。
+
+        与 :meth:`upsert` 的区别：``upsert`` 是单来源全量覆盖（record 里缺失即
+        视为清空），供 VCPedia 全量同步使用；本方法是**多来源补全**入口，走
+        ``_lookup_song_rows`` 的分层候选定位，唯一命中才写入，且每个字段只在
+        库内为空时落值。归一化结果只用于生成候选，绝不当写入键——这是
+        mohobot ``normalize.py`` / ``merge.py`` 的两条核心原则（MIT，见
+        vcpedia_merge.py 与 CHANGELOG）。
+
+        返回 ``status`` ∈ ``filled`` / ``unchanged`` / ``not_found`` /
+        ``ambiguous`` / ``version_name`` / ``invalid``；``ambiguous`` 与
+        ``version_name`` 一律不写库，交调用方决定。
+        """
+        name = str(record.get("name") or "").strip()
+        if not name:
+            return {
+                "status": "invalid", "level": "", "filled": [], "conflicts": [],
+                "candidates": [], "version_name": False,
+            }
+        if conn is not None:
+            result = self._merge_missing_impl(conn, record, name)
+            conn.commit()
+            return result
+        with self._session() as own:
+            return self._merge_missing_impl(own, record, name)
+
+    def _merge_missing_impl(
+        self, conn: sqlite3.Connection, record: Dict[str, Any], name: str
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "status": "unchanged", "level": "", "filled": [], "conflicts": [],
+            "candidates": [], "version_name": is_version_name(name),
+        }
+        # 分层候选（精确 → safe_name → 忽略大小写 → 去括号），不是拿归一化键直接 UPDATE。
+        rows, level = _lookup_song_rows(conn, name)
+        result["level"] = level
+        if not rows:
+            result["status"] = "not_found"
+            return result
+        if len(rows) > 1:
+            # 与 bilibili_ref 同一安全边界：同名不同歌，猜错就是补错歌，不猜。
+            result["status"] = "ambiguous"
+            result["candidates"] = [str(row["name"]) for row in rows[:5]]
+            return result
+        if result["version_name"] and level != "exact":
+            # 「X(中文版)」通过去括号层命中「X」= 把两个版本合并，拒绝。
+            result["status"] = "version_name"
+            result["candidates"] = candidate_names(name)
+            return result
+
+        song_id = int(rows[0]["id"])
+        row = conn.execute(
+            "SELECT year, introduction, bilibili_aid, bilibili_bvid FROM song WHERE id = ?",
+            (song_id,),
+        ).fetchone()
+        existing = {
+            "year": row["year"],
+            "introduction": row["introduction"],
+            "bilibili_aid": row["bilibili_aid"],
+            "bilibili_bvid": row["bilibili_bvid"],
+        }
+        incoming = {
+            "year": _coerce_year(record.get("year")),
+            "introduction": str(record.get("introduction") or ""),
+            "bilibili_aid": _coerce_aid(record.get("bilibili_aid")),
+            "bilibili_bvid": str(record.get("bilibili_bvid") or "").strip(),
+        }
+        outcome = merge_fields(existing, incoming, self._SCALAR_FILL_FIELDS)
+        now = time.time()
+        if outcome.filled:
+            columns = ", ".join(f"{key} = ?" for key in outcome.filled)
+            conn.execute(
+                f"UPDATE song SET {columns}, fetched_at = ?, updated_at = ? WHERE id = ?",
+                tuple(outcome.values[key] for key in outcome.filled) + (now, now, song_id),
+            )
+            for key in outcome.filled:
+                record_revision(conn, song_id, key, existing[key], outcome.values[key], now)
+        filled = list(outcome.filled)
+
+        # 关系/正文类字段按「整块为空」补：write_* 是整体替换语义，库里已有值
+        # 就完全不碰，避免抹掉 engine / voicebank / position 等细节。
+        credits = {
+            code: record.get(code) for code in CONTENT_ROLE_CODES
+            if not is_empty(record.get(code))
+        }
+        has_credits = conn.execute(
+            "SELECT 1 FROM song_credit WHERE song_id = ? LIMIT 1", (song_id,)
+        ).fetchone()
+        if not has_credits and credits:
+            write_credits(conn, song_id, credits, now)
+            filled.append("credits")
+        if not conn.execute(
+            "SELECT 1 FROM song_singer WHERE song_id = ? LIMIT 1", (song_id,)
+        ).fetchone() and not is_empty(record.get("singers")):
+            write_singers(conn, song_id, record.get("singers"), now)
+            filled.append("singers")
+        if not conn.execute(
+            "SELECT 1 FROM lyrics WHERE song_id = ? AND is_translated = 0 "
+            "AND TRIM(plain_text) != '' LIMIT 1", (song_id,),
+        ).fetchone() and not is_empty(record.get("lyrics")):
+            write_lyrics(conn, song_id, record.get("lyrics"), now, source="merge")
+            filled.append("lyrics")
+        categories = split_multi(record.get("categories"))
+        has_category = conn.execute(
+            "SELECT 1 FROM song_tag st JOIN tag t ON t.id = st.tag_id "
+            "WHERE st.song_id = ? AND t.kind = ? LIMIT 1",
+            (song_id, TAG_KIND_CATEGORY),
+        ).fetchone()
+        if not has_category and categories:
+            write_tags(conn, song_id, TAG_KIND_CATEGORY, categories, now)
+            filled.append("categories")
+
+        result["status"] = "filled" if filled else "unchanged"
+        result["filled"] = filled
+        result["conflicts"] = list(outcome.conflicts)
+        return result
 
     def open_writer(self) -> sqlite3.Connection:
         """给批量同步复用的写入连接（调用方负责 close）。
