@@ -48,17 +48,41 @@
   `github.orge-8.music-request`（CHANGELOG 历史条目保留原文）。
 - README「点歌联动」节补 v2.19.0 加固说明、契约位置互链与探测降级排障行。
 
+### WebUI 显示优化（纯显示层，不改配置键与校验语义）
+
+- **节内字段分组（group 小标题）**：plugin 节 17 个字段按「上下文注入 /
+  曲库与导入 / 命令输出」分块，crawler 节按「爬取来源 / 请求与失败策略 /
+  SSL 证书」分块（权限三项仍居最前无标题块），emotion 节按「模型配置 /
+  时间控制」分块。此前整节平铺一屏，用户找不到功能边界。
+- **webui.json 删除 `placement:"workspace"`**：1.4.0 起该值已停用，宿主
+  归一化为 sidebar 并发 UserWarning；页面统一收进设置侧栏「插件扩展」。
+  `workspace_title` 保留（手机端分组标题）。
+- **声明式页面 UX Writing**：「配置的单次批量」→「单次同步批量」（与后台
+  任务说明文案对齐）；「演唱 / UP主」→「演唱 / UP 主」（表格列与详情弹窗
+  统一）；缺歌词清单 / 最近命中补空态引导文案。
+- 回归：`test_webui_display.py` 新增分组块与顺序不变量 2 项；
+  `test_webui_pages.py` 的 placement 断言从 1.3.x 语义（必须 workspace）
+  更正为 1.4.x 语义（归一化 sidebar + 原始声明不得含 placement）。
+  `audit_webui_json.py --host-dir`（v1.4.4 权威校验）**0 error / 0 warning**。
+- **修复测试间 sys.path 污染（上轮加固遗留的潜伏 bug）**：
+  `test_e2e_cv_music.py` 把对端 music-request 目录插到 sys.path 最前，
+  `test_webui_pages.py::test_bound_apis_are_registered` 的裸
+  `from plugin import create_plugin` 在全量跑时解析到**对端** plugin.py，
+  9 个页面 API 全部误报「未注册」（单独跑绿、全量跑红）。改用文件顶部
+  已加载的命名空间包模块 `_MOD`，不再受路径顺序影响。
+
 ### 验证
 
-- devkit venv（SDK 2.22.1）全量 pytest：**225 passed / 8 skipped**
-  （较 2.18.0 基线 +18：探测 17 项 + 契约转绿 1 项）；
+- devkit venv（SDK 2.22.1）全量 pytest：**235 passed**
+  （联动加固 +18：探测 17 项 + 契约转绿 1 项；WebUI 分组不变量 +2；
+  设 `MAIBOT_HOST_DIR` 后页面测试 8 项 skip 转绿）；
   契约相关 92 项、E2E 8 项全绿。
 - **新增 `tests/smoke_test.py`**（本仓库此前没有冒烟层）：生命周期 +
   组件注册（含两个 API 的 `timeout_ms=3000` metadata 断言）+ 契约形状 +
   帮助/状态命令 + 注入探测降级全链路，零网络。
 - `gate.sh` **PASS 4 / SKIP 0 / FAIL 0**：check_plugin PASS 38 / WARN 5 /
   FAIL 0（WARN 为存量：4 处装饰器命名风格、llm.generate 经 mixin 调用
-  静态扫描不到）；contracts PASS；smoke OK；pytest 225 passed / 8 skipped。
+  静态扫描不到）；contracts PASS；smoke OK；pytest 235 passed。
 - **官方最新实测（2026-11-14，交付准入依据）**：
   - 官方渠道核对：MaiBot **v1.4.4**（2026-11-14 发布，较上轮基线 1.4.3 新）、
     SDK **2.23.0**。v1.4.4 源码经 git tag 浅拉取 + archive 导出；
@@ -68,8 +92,10 @@
     **加载成功，28 组件 / 4 能力**；manifest 收紧后严格区间
     host 1.0.0~1.4.4 / sdk 2.1.0~2.23.0 无警告通过。
   - SDK 2.23.0 隔离 venv（Python 3.13.12 + pytest 9.2.0）：
-    pytest **225 passed / 8 skipped**、smoke OK、
+    pytest **235 passed**、smoke OK、
     `test_vcpedia_schema.py` **103/103**、`test_annotate_llm.py` **7/7**。
+  - WebUI 变更后复跑官方 v1.4.4 loader 探针：加载成功，28 组件 / 4 能力；
+    `audit_webui_json.py --host-dir` 权威校验 0 error / 0 warning。
   - 据此放宽 `_manifest.json`：host max 1.3.99→**1.4.4**、
     sdk max 2.16.99→**2.23.0**（实测后才 bump，未写占位大数）。
 - **未真机验证**：探测降级与超时收紧需真机回归（部署指南随交付给出）。

@@ -164,3 +164,41 @@ def test_admin_field_speaks_the_user_language():
     assert "只读" in hint, "hint 须说明只读命令不受限制，避免用户以为全都锁了"
     # 节标题要能指向权限，否则用户不会点进「爬取」里找
     assert "权限" in crawler["title"], f"节标题未体现权限: {crawler['title']}"
+
+
+def test_field_groups_render_subheadings():
+    """大节内按 group 分块渲染小标题；权限/启用开关留在最前的无标题块。"""
+    sections = _webui_sections()
+    plugin_fields = sections["plugin"]["fields"]
+    assert plugin_fields["inject_position"].get("group") == "上下文注入"
+    assert plugin_fields["extra_song_dbs"].get("group") == "曲库与导入"
+    assert plugin_fields["max_results"].get("group") == "命令输出"
+    for fname in ("min_line_len", "ttl_seconds", "meme_phrases"):
+        assert not plugin_fields[fname].get("group"), f"{fname} 应留在无标题首块"
+    crawler_fields = sections["crawler"]["fields"]
+    assert crawler_fields["base_url"].get("group") == "爬取来源"
+    assert crawler_fields["request_interval"].get("group") == "请求与失败策略"
+    assert crawler_fields["ca_bundle"].get("group") == "SSL 证书"
+    for fname in ("allow_sync_command", "sync_admin_ids", "allow_local_operator"):
+        assert not crawler_fields[fname].get("group"), f"权限字段 {fname} 应留在无标题首块"
+    emotion_fields = sections["emotion"]["fields"]
+    assert emotion_fields["llm_task"].get("group") == "模型配置"
+    assert emotion_fields["annotate_timeout_ms"].get("group") == "时间控制"
+    assert not emotion_fields["annotate_on_sync"].get("group")
+
+
+def test_group_blocks_follow_order():
+    """前端按 order 排序后依 group 首次出现顺序分块：权限块必须仍在最前。"""
+    crawler = _webui_sections()["crawler"]
+    ordered = sorted(
+        crawler["fields"].items(), key=lambda kv: kv[1].get("order") or 0
+    )
+    seen_groups: list = []
+    for _fname, field in ordered:
+        group = field.get("group") or ""
+        if group not in seen_groups:
+            seen_groups.append(group)
+    assert seen_groups[0] == "", "权限字段（无组）必须排第一块"
+    assert seen_groups[1:] == ["爬取来源", "请求与失败策略", "SSL 证书"], (
+        f"分组块顺序异常: {seen_groups}"
+    )

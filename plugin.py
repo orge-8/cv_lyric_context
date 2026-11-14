@@ -2672,8 +2672,8 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
 
 # ================================================================ WebUI 显示层补丁
 #
-# 可视化模式的 FieldRenderer（dashboard/src/routes/plugin-config.tsx:163-361，
-# 1.3.1 布局）按 ui_type 渲染控件时只输出 label / hint / placeholder，
+# 可视化模式的 FieldRenderer（dashboard/src/routes/plugin-config.tsx，
+# MaiBot v1.4.4 复核）按 ui_type 渲染控件时只输出 label / hint / placeholder，
 # **从不渲染 description**；本插件字段的填法说明都写在 description 里，
 # 不搬进 hint，用户在配置页上一个字都看不到（源代码模式才见得到）。
 # 这里只改展示元数据，不碰任何配置键与校验语义。
@@ -2700,6 +2700,44 @@ _WEBUI_TABS: tuple = (
 #: 用户反馈找了很久才找到——权限类字段必须排在被它约束的爬取参数之前。
 _WEBUI_FIELD_PRIORITY: dict = {
     "crawler": ("allow_sync_command", "sync_admin_ids", "allow_local_operator"),
+}
+
+#: 节内字段分组（键 = 节名，值 = 字段名 → 组名）。前端按 order 排序后
+#: 依 group 首次出现顺序分块渲染 h3 小标题（plugin-config.tsx SectionRenderer）；
+#: 未分组字段落在最前的无标题块。plugin 节 17 个字段、crawler 节 13 个字段，
+#: 不分组就是一整屏平铺，用户找不到「注入行为」和「爬取参数」的边界。
+_WEBUI_FIELD_GROUPS: dict = {
+    "plugin": {
+        "inject_position": "上下文注入",
+        "max_inject": "上下文注入",
+        "inject_context_lines": "上下文注入",
+        "inject_basic_credits": "上下文注入",
+        "inject_full_staff": "上下文注入",
+        "auto_import_inbox": "曲库与导入",
+        "max_lines_per_song": "曲库与导入",
+        "extra_song_dbs": "曲库与导入",
+        "max_results": "命令输出",
+        "detail_lyric_lines": "命令输出",
+        "lyric_preview_chars": "命令输出",
+    },
+    "crawler": {
+        "base_url": "爬取来源",
+        "categories": "爬取来源",
+        "category_depth": "爬取来源",
+        "request_interval": "请求与失败策略",
+        "timeout": "请求与失败策略",
+        "max_fail": "请求与失败策略",
+        "sync_batch_limit": "请求与失败策略",
+        "refill_cooldown_days": "请求与失败策略",
+        "verify_ssl": "SSL 证书",
+        "ca_bundle": "SSL 证书",
+    },
+    "emotion": {
+        "llm_task": "模型配置",
+        "llm_model": "模型配置",
+        "annotate_timeout_ms": "时间控制",
+        "annotate_budget_seconds": "时间控制",
+    },
 }
 
 #: 手工指定的 section 标题（键 = section 名）；仅在 SDK 输出标题等于
@@ -2840,6 +2878,7 @@ def _apply_webui_display_polish(schema: dict) -> dict:
             )
             if new_title and new_title != name:
                 section["title"] = new_title
+        groups = _WEBUI_FIELD_GROUPS.get(name) or {}
         for fname, field in (section.get("fields") or {}).items():
             if not isinstance(field, dict):
                 continue
@@ -2849,6 +2888,8 @@ def _apply_webui_display_polish(schema: dict) -> dict:
                 field["hint"] = field["description"]
             if not field.get("placeholder") and fname in _WEBUI_FIELD_PLACEHOLDERS:
                 field["placeholder"] = _WEBUI_FIELD_PLACEHOLDERS[fname]
+            if fname in groups and not field.get("group"):
+                field["group"] = groups[fname]
             # 手工 label 优先：自动推导只在前者缺席时兜底
             if fname in _WEBUI_LABEL_OVERRIDES:
                 field["label"] = _WEBUI_LABEL_OVERRIDES[fname]

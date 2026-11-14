@@ -94,9 +94,13 @@ def test_declaration_loads_under_host_schema():
     assert ext.schema_version == 2
     assert ext.required_capabilities == ["declarative_basic"]
     page = ext.pages[0]
-    # sidebar 页只在「设置」工作区可见（Layout.tsx:127-135），页面必须走 workspace
-    assert page.placement == "workspace"
-    assert (ext.workspace_title or "").strip(), "workspace 页必须配 workspace_title"
+    # 1.4.0 起所有插件页面统一收进设置侧栏「插件扩展」分组（Layout.tsx:106-118）；
+    # placement:"workspace" 已停用（宿主归一化 + UserWarning），声明里必须删掉，
+    # 归一化后恒为 sidebar。workspace_title 仅作手机端分组标题。
+    assert page.placement == "sidebar"
+    raw = json.loads((_PLUGIN_DIR / "webui.json").read_text(encoding="utf-8"))
+    assert "placement" not in raw["pages"][0], "1.4.x 已停用 placement，别再写 workspace"
+    assert (ext.workspace_title or "").strip(), "手机端分组标题仍用 workspace_title"
     assert page.auto_refresh is True, "检索框靠 auto_refresh 才能自动重查"
     assert page.icon == "database"
 
@@ -158,11 +162,12 @@ def test_numeric_params_declared_as_string():
 
 
 def test_bound_apis_are_registered():
-    from plugin import create_plugin
-
+    # 必须用文件顶部加载的 _MOD（命名空间包），不能 `from plugin import ...`：
+    # test_e2e_cv_music.py 会把对端 music-request 目录插到 sys.path 最前，
+    # 裸 `plugin` 会解析到对端的 plugin.py，9 个 API 全部「未注册」（假回归）。
     components = {
         (item.get("name"), str(item.get("metadata", {}).get("version", "1")))
-        for item in create_plugin().get_components()
+        for item in _MOD.create_plugin().get_components()
         if item.get("type") == "API"
         and item.get("metadata", {}).get("enabled") is True
         and item.get("metadata", {}).get("dynamic") is not True

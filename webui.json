@@ -7,7 +7,6 @@
       "id": "lyrics",
       "title": "歌词曲库",
       "description": "曲库规模与歌词覆盖率、检索、缺歌词清单、最近命中，以及同步/补歌词后台任务的触发与进度。",
-      "placement": "workspace",
       "icon": "database",
       "auto_refresh": true,
       "poll_interval_seconds": 3,
@@ -128,7 +127,7 @@
                 },
                 {
                   "type": "text",
-                  "label": "配置的单次批量",
+                  "label": "单次同步批量",
                   "value": { "scope": "query", "source": "task", "field": "sync_batch_limit" }
                 }
               ]
@@ -147,7 +146,7 @@
             },
             {
               "type": "text",
-              "value": "留空或 0 表示按「配置的单次批量」执行；配置为「不限」时按 50 首执行，避免误点触发全量任务"
+              "value": "留空或 0 表示按「单次同步批量」执行；配置为「不限」时按 50 首执行，避免误点触发全量任务"
             },
             {
               "type": "text",
@@ -275,7 +274,7 @@
               "value": { "scope": "query", "source": "search", "field": "rows" },
               "columns": [
                 { "field": "name", "label": "歌名" },
-                { "field": "singers", "label": "演唱 / UP主" },
+                { "field": "singers", "label": "演唱 / UP 主" },
                 { "field": "has_lyrics", "label": "有歌词" },
                 { "field": "lyrics_chars", "label": "歌词字数" },
                 { "field": "emotion", "label": "情感标签" }
@@ -298,7 +297,7 @@
             },
             {
               "type": "text",
-              "value": "跳过最近 N 天内已确认无歌词的条目，避免它们堵在队首被反复重抓"
+              "value": "跳过最近 N 天内已确认无歌词的条目，避免它们堵在队首被反复重抓。表格为空 = 当前没有缺歌词的歌"
             },
             {
               "type": "table",
@@ -314,6 +313,10 @@
           "label": "最近命中（群里聊到过的歌）",
           "default_open": true,
           "children": [
+            {
+              "type": "text",
+              "value": "群里聊到并被识别命中的歌会记在这里；表格为空说明还没有命中记录"
+            },
             {
               "type": "table",
               "value": { "scope": "query", "source": "recent", "field": "rows" },
@@ -337,7 +340,7 @@
             },
             {
               "type": "text",
-              "label": "演唱 / UP主",
+              "label": "演唱 / UP 主",
               "value": { "scope": "selection", "source": "picked_song", "field": "singers" }
             },
             {
