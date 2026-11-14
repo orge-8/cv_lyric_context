@@ -66,7 +66,7 @@ def _plugin(position: str | None = None):
 def _hit_plugin(position: str | None = None):
     """装一条 TTL 内的歌词命中，让 _build_system_text / _build_planner_text 有输出。"""
     plug = _plugin(position)
-    plug._hits = {"s1": deque([(time.time(), "测试歌词", "测试曲")], maxlen=20)}
+    plug._hits = {"s1": deque([(time.time(), "测试歌词", "测试曲", True)], maxlen=20)}
     plug._meta_by_name = {}
     plug._song_record = lambda name: {}  # type: ignore[assignment]
     return plug
