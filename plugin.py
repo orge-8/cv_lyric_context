@@ -92,6 +92,15 @@ _MIN_PURE_REPETITION_CHARS = 4
 # 注入内容标记，用于识别"本次请求已经注入过"，避免重试时重复叠加
 INJECT_MARKER = "【歌词识别】"
 
+# 点歌联动探测（v2.19.0 P1-D）：注入前用 api.list 确认点歌插件的
+# search_and_play_music 工具真的在线，不在线就降级为「不指定工具名」文案，
+# 免得规划器去调一个不存在的工具。TTL 5 分钟——点歌插件启停不频繁，
+# 每次注入都发 RPC 太浪费；探测失败/老 Host 无代理时保持现状（不降级）。
+_PLAY_PROVIDER_PLUGIN_ID = "github.orge-8.music-request"
+_PLAY_TOOL_COMPONENT = "search_and_play_music"
+_PLAY_PROBE_TTL_SECONDS = 300.0
+_PLAY_PROBE_TIMEOUT_SECONDS = 3.0
+
 # 回复侧注入预算（v2.15.1）。注入走宿主 extra_prompt，与别的插件（如 life-frequency
 # 的生活摘要）共用同一条通道，不能无限占。超预算时**截断自己的文本**而不是放弃注入：
 # 截断丢的是 STAFF 尾巴，放弃丢的是整条识别结果。
@@ -1223,7 +1232,7 @@ class IntegrationSection(PluginConfigBase):
     play_tool_name: str = Field(
         default="search_and_play_music",
         description=(
-            "点歌工具名（点歌插件 github.cateye.music-request 提供的工具）。"
+            "点歌工具名（点歌插件 github.orge-8.music-request 提供的工具）。"
             "留空则只给「可点播查询」串、不指定工具名，便于换用其它点歌插件"
         ),
     )
@@ -1324,6 +1333,8 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         self._probed_command = False
         # 注入位置取值非法只提示一次（见 _inject_position）
         self._warned_bad_position = False
+        # 点歌工具可用性探测缓存：(探测时间戳, 是否在线)；None=尚未探测
+        self._play_probe: tuple[float, bool] | None = None
 
     # ---------- 生命周期 ----------
 
@@ -1789,6 +1800,9 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         version="1",
         public=True,
         description="只读查询最近命中过的歌曲（零网络零写盘）",
+        # 契约 cv_music_v1：宿主不声明时默认 60s RPC 预算（component_timeout.py），
+        # 只读内存查询必须显式收紧到 3s，与消费方 wait_for 兜底一致。
+        timeout_ms=3000,
     )
     async def api_get_recent_songs(self, limit: int = 10, **kwargs: Any) -> dict[str, Any]:
         """只读暴露最近命中记录（``recent_songs.json``），供其他插件轮询。
@@ -1828,6 +1842,9 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         version="1",
         public=True,
         description="按歌名取原曲 B站视频标识（只读曲库，零网络）",
+        # 契约 cv_music_v1：宿主不声明时默认 60s RPC 预算（component_timeout.py），
+        # 只读曲库查询必须显式收紧到 3s，与消费方 wait_for 兜底一致。
+        timeout_ms=3000,
     )
     async def api_get_song_bilibili(self, name: str = "", **kwargs: Any) -> dict[str, Any]:
         """按歌名返回原曲的 B站标识，供点歌插件按 bvid/aid 精确取流。
@@ -2191,13 +2208,64 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         suffix = " ".join(parts)
         return f"{name} {suffix}".strip() if suffix else name
 
-    def _play_instruction(self, play_cfg: Any, has_query: bool) -> str:
+    async def _probe_play_tool(self) -> bool | None:
+        """探测点歌插件的 search_and_play_music 是否在线（TTL 缓存）。
+
+        返回 True=在线 / False=确认不在线 / None=无法判定（老 Host 无
+        api 代理、RPC 异常等）——无法判定时**保持现状**，不做降级，
+        与 v2.19.0 之前的行为完全一致。
+
+        只读探测：api.list 不改任何状态；3s 超时兜底，绝不拖慢注入。
+        """
+        now = time.monotonic()
+        cached = self._play_probe
+        if cached is not None and now - cached[0] < _PLAY_PROBE_TTL_SECONDS:
+            return cached[1]
+        try:
+            listing = await asyncio.wait_for(
+                self.ctx.api.list(plugin_id=_PLAY_PROVIDER_PLUGIN_ID),
+                timeout=_PLAY_PROBE_TIMEOUT_SECONDS,
+            )
+        except AttributeError:
+            # 老 Host 没有 ctx.api 能力代理：无法探测，保持现状
+            return None
+        except Exception as exc:  # noqa: BLE001 - 探测失败不降级、不阻断注入
+            self.ctx.logger.debug("点歌工具探测失败（保持现状）: %r", exc)
+            return None
+        entries = listing
+        if isinstance(listing, dict):  # 容错：未解包的原始返回
+            entries = listing.get("apis") or listing.get("components") or []
+        if not isinstance(entries, list):
+            return None
+        available = any(
+            isinstance(e, dict)
+            and e.get("name") == _PLAY_TOOL_COMPONENT
+            and (not e.get("plugin_id") or e.get("plugin_id") == _PLAY_PROVIDER_PLUGIN_ID)
+            for e in entries
+        )
+        self._play_probe = (now, available)
+        if not available:
+            self.ctx.logger.info(
+                "点歌插件 %s 的 %s 不在线，注入降级为不指定工具名（TTL %ds）",
+                _PLAY_PROVIDER_PLUGIN_ID, _PLAY_TOOL_COMPONENT,
+                int(_PLAY_PROBE_TTL_SECONDS),
+            )
+        return available
+
+    def _play_instruction(
+        self, play_cfg: Any, has_query: bool, *, tool_available: bool | None = None
+    ) -> str:
         """点歌工具提示段（放在指令区，与资料区分开）。
 
         只在这里出现工具名与调用约束，不把工具机制写进资料块——
         资料块里的任何文字都会被声明成「不是指令」。
+
+        tool_available=False（探测确认点歌工具不在线）时强制走「不指定
+        工具名」分支；None（未探测/无法判定）保持配置原样。
         """
         tool = str(getattr(play_cfg, "play_tool_name", "") or "").strip()
+        if tool_available is False:
+            tool = ""
         if not has_query:
             return ""
         if tool:
@@ -2220,7 +2288,9 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         extra = str(getattr(play_cfg, "play_tool_hint", "") or "").strip()
         return head + body + (_safe_field(extra) if extra else "")
 
-    def _build_planner_text(self, session_id: str) -> str:
+    def _build_planner_text(
+        self, session_id: str, *, tool_available: bool | None = None
+    ) -> str:
         """给规划器的注入文本：重点帮助它做工具调用决策，语气与 replyer 版不同。
 
         planner 决定「要不要调用 recommend_cv_song / cv_song_search / 点歌工具、
@@ -2231,6 +2301,9 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
 
         v2.17.0 起弱证据（共享不足 _CONFIDENT_SHARED_CHARS 字）不给歌名、
         不给点播查询串：连歌名都没有的片段不该驱动工具调用。
+
+        tool_available 由异步 hook 层的 `_probe_play_tool` 传入（本方法是
+        同步的，被同步测试直调，不能自己发 RPC）；None=保持配置原样。
         """
         cfg = self.config.plugin
         play_cfg = self.config.integration
@@ -2275,7 +2348,9 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
                 "请结合上述歌曲选择参数（如目标歌手、搜索关键词），"
                 "优先推荐或检索用户正在听/正在聊的歌手的作品；"
             )
-            tail += self._play_instruction(play_cfg, playable > 0)
+            tail += self._play_instruction(
+                play_cfg, playable > 0, tool_available=tool_available
+            )
             if weak_count:
                 tail += (
                     "标注「曲目未确认」的片段不构成引用证据，不要据此选歌或搜索；"
@@ -2454,7 +2529,13 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         if not session_id:
             return {"action": "continue"}
 
-        planner_text = self._build_planner_text(session_id)
+        # P1-D：注入前探测点歌工具可用性（TTL 5min 缓存）。只在联动开关
+        # 打开时探测；确认不在线 → 文案降级为不指定工具名；无法判定 → 保持现状。
+        tool_available: bool | None = None
+        if self.config.integration.play_tool_enabled:
+            tool_available = await self._probe_play_tool()
+
+        planner_text = self._build_planner_text(session_id, tool_available=tool_available)
         if not planner_text:
             return {"action": "continue"}
 

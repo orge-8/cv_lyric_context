@@ -1,0 +1,55 @@
+{
+  "contract": "cv_music",
+  "contract_version": 1,
+  "updated": "2026-11-14",
+  "description": "cv_lyric_context（提供方）与 music-request（消费方）之间的跨插件只读 API 契约。单一事实源：两侧测试都从本文件加载断言，改契约必须同批更新本文件与双侧测试。",
+  "provider_plugin_id": "org.mai-mai.cv-lyric-context",
+  "consumer_plugin_id": "github.orge-8.music-request",
+  "timeout_ms": 3000,
+  "apis": {
+    "get_song_bilibili": {
+      "api_version": "1",
+      "schema_version": 1,
+      "params": { "name": "str" },
+      "readonly": true,
+      "keys": {
+        "schema_version": "int",
+        "reason": "str",
+        "found": "bool",
+        "name": "str",
+        "aid": ["int", "null"],
+        "bvid": "str",
+        "match": "str",
+        "singers": "list[str]"
+      },
+      "match_enum": ["", "exact", "base", "prefix"],
+      "semantics": [
+        "found=False：库里没有这首歌或存在同名歧义，reason 说明；调用方回退平台搜索",
+        "found=True 且 bvid/aid 均为空：歌在库里但未采集 B站标识，调用方回退平台搜索",
+        "match=prefix：查询串带歌名之外的 token，调用方用 singers 判定原曲/翻唱",
+        "任何异常/超时/插件缺失：调用方静默回退，绝不阻塞点歌主链路"
+      ]
+    },
+    "get_recent_songs": {
+      "api_version": "1",
+      "schema_version": 1,
+      "params": { "limit": "int" },
+      "readonly": true,
+      "keys": {
+        "schema_version": "int",
+        "reason": "str",
+        "active": "bool",
+        "songs": "list[entry]"
+      },
+      "entry_keys": {
+        "name": "str",
+        "artist": "str",
+        "at": "float"
+      },
+      "semantics": [
+        "零网络零写盘；坏/空记录降级为 songs=[] + reason，不抛异常",
+        "limit 钳到 1..100，最新在前"
+      ]
+    }
+  }
+}

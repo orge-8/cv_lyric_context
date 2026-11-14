@@ -34,8 +34,15 @@ from recent_songs import (  # noqa: E402
     RecentSongsLog,
 )
 
-ALL_KEYS = {"schema_version", "reason", "active", "songs"}
-ENTRY_KEYS = {"name", "artist", "at"}
+# v2.19.0 联动加固：键集从契约单一事实源加载（devkit contracts/cv_music_v1.json）
+from contract_cv_music import (  # noqa: E402
+    api_keys as _contract_api_keys,
+    entry_keys as _contract_entry_keys,
+    validate_result,
+)
+
+ALL_KEYS = _contract_api_keys("get_recent_songs")
+ENTRY_KEYS = _contract_entry_keys("get_recent_songs")
 
 
 class _Ctx:
@@ -66,6 +73,7 @@ def _hit_plugin(tmp_path):
 def test_empty_degrades_with_reason(tmp_path):
     out = asyncio.run(_plugin(tmp_path).api_get_recent_songs())
     assert set(out) == ALL_KEYS
+    validate_result("get_recent_songs", out)  # 契约全量校验
     assert out["schema_version"] == 1
     assert out["songs"] == [] and out["active"] is True
     assert out["reason"] == "暂无歌曲命中记录"

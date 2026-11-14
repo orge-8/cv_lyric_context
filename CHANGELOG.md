@@ -9,6 +9,71 @@
 
 ---
 
+## [2.19.0] - 2026-11-14
+
+### 新增（点歌联动加固，与 music-request v1.8.0 配套）
+
+- **跨插件契约单一事实源（P0-A，治 G1/G4）**：`get_song_bilibili` /
+  `get_recent_songs` 的键集、类型、`schema_version`、match 枚举固化到 devkit
+  `tools/maibot-devkit/contracts/cv_music_v1.json`；本仓库
+  `tests/contracts/cv_music_v1.json` 为镜像，`tests/contract_cv_music.py`
+  提供加载器与 `sample_result` / `validate_result`。门禁新增 contracts 步骤
+  校验镜像与事实源**逐字节一致**（漂移即 FAIL，已反向验证）。
+- **真实对端端到端测试**：`tests/test_e2e_cv_music.py`（8 项）经 fakehost
+  包式加载**真实 music-request 插件模块**，`ctx.api.call` 直连本插件真实
+  `api_get_song_bilibili`，覆盖命中直连 / prefix 歌手采纳 / 点名翻唱回退 /
+  未收录回退 / 畸形返回回退。对端目录不存在时 skip（单仓库可跑）。
+- **注入前可用性探测（P1-D，治 G5）**：`play_tool_enabled` 打开时，注入前经
+  `ctx.api.list(plugin_id=github.orge-8.music-request)` 探测
+  `search_and_play_music` 是否在线；TTL 5 分钟缓存、3s 超时。确认不在线 →
+  注入文案降级为「可点播查询」串、不指定工具名；老 Host 无 `ctx.api` 代理
+  或探测异常 → 保持原行为，绝不阻断注入。新增 `tests/test_play_tool_probe.py`
+  （17 项：在线/离线/老 Host/超时/TTL 正负缓存/文案降级/hook 集成）。
+
+### 变更
+
+- **两个只读 `@API` 声明 `timeout_ms=3000`（P0-B，治 G2）**：此前未声明，
+  宿主按 `component_timeout.py` 默认 **60s** 等待；该 API 是纯本地曲库查询，
+  正常毫秒级。消费方（music-request）另有 3s `wait_for` 双保险。
+- `_manifest.json` capabilities 增加 `api.list`（探测用）。**改动 capabilities
+  需完整重启 MaiBot**。
+- 既有跨插件测试的手写假字典全部改为契约构造 + 全量形状校验
+  （`test_vcpedia_bilibili.py` 清理 3 处整段重复定义；`test_cross_plugin_api.py`
+  同步契约化）。
+
+### 修复
+
+- **文档漂移（P2-E，治 G6）**：manifest description、`IntegrationSection`
+  配置描述、README 中的 `github.cateye.music-request` 全部更正为
+  `github.orge-8.music-request`（CHANGELOG 历史条目保留原文）。
+- README「点歌联动」节补 v2.19.0 加固说明、契约位置互链与探测降级排障行。
+
+### 验证
+
+- devkit venv（SDK 2.22.1）全量 pytest：**225 passed / 8 skipped**
+  （较 2.18.0 基线 +18：探测 17 项 + 契约转绿 1 项）；
+  契约相关 92 项、E2E 8 项全绿。
+- **新增 `tests/smoke_test.py`**（本仓库此前没有冒烟层）：生命周期 +
+  组件注册（含两个 API 的 `timeout_ms=3000` metadata 断言）+ 契约形状 +
+  帮助/状态命令 + 注入探测降级全链路，零网络。
+- `gate.sh` **PASS 4 / SKIP 0 / FAIL 0**：check_plugin PASS 38 / WARN 5 /
+  FAIL 0（WARN 为存量：4 处装饰器命名风格、llm.generate 经 mixin 调用
+  静态扫描不到）；contracts PASS；smoke OK；pytest 225 passed / 8 skipped。
+- **官方最新实测（2026-11-14，交付准入依据）**：
+  - 官方渠道核对：MaiBot **v1.4.4**（2026-11-14 发布，较上轮基线 1.4.3 新）、
+    SDK **2.23.0**。v1.4.4 源码经 git tag 浅拉取 + archive 导出；
+    `plugin_runtime` 与 1.4.3 逐文件对比仅 9 个文件有实质差异，
+    **manifest_validator / plugin_loader 零变化**。
+  - 官方 v1.4.4 源码 PluginLoader 加载探针（`force_plugin_compatibility=False`）：
+    **加载成功，28 组件 / 4 能力**；manifest 收紧后严格区间
+    host 1.0.0~1.4.4 / sdk 2.1.0~2.23.0 无警告通过。
+  - SDK 2.23.0 隔离 venv（Python 3.13.12 + pytest 9.2.0）：
+    pytest **225 passed / 8 skipped**、smoke OK、
+    `test_vcpedia_schema.py` **103/103**、`test_annotate_llm.py` **7/7**。
+  - 据此放宽 `_manifest.json`：host max 1.3.99→**1.4.4**、
+    sdk max 2.16.99→**2.23.0**（实测后才 bump，未写占位大数）。
+- **未真机验证**：探测降级与超时收紧需真机回归（部署指南随交付给出）。
+
 ## [2.18.0] - 2026-11-06
 
 ### 新增
