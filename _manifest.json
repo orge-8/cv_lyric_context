@@ -16,7 +16,7 @@
   "license": "MIT",
   "host_application": {
     "min_version": "1.0.0",
-    "max_version": "1.4.4"
+    "max_version": "1.4.5"
   },
   "sdk": {
     "min_version": "2.1.0",

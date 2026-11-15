@@ -223,10 +223,17 @@ allow_local_operator = true        # 本机控制台不受白名单限制
 
 **只读素材**（随仓库分发，在插件目录 `assets/` 下；插件只会读它，不会写）
 
+v2.19.0 起以 **gzip 压缩**随包分发（合计 13.0MB → 4.3MB，减重 67%），加载期
+自动解压到数据目录 `asset_cache/` 缓存，识别逻辑与匹配语义零改动：
+
 | 文件 | 说明 |
 |---|---|
-| `assets/knowledge_db.db` | 内置基础库，3412 首中V歌曲（歌名、P主、歌手） |
-| `assets/song_lyric_keywords.txt` | 歌词句 -> 歌名 关键词表，57227 句（匹配源） |
+| `assets/knowledge_db.db.gz` | 内置基础库，3412 首中V歌曲（歌名、P主、歌手） |
+| `assets/song_lyric_keywords.txt.gz` | 歌词句 -> 歌名 关键词表，57227 句（匹配源） |
+
+> 解压缓存按源 `.gz` 的 mtime+size 校验失效：插件更新换了素材会自动重新解压。
+> 若 `assets/` 下存在**未压缩**的同名文件（旧部署/开发环境），优先直接用、不解压。
+> 损坏或缺失的素材只降级告警，不阻断插件启动。
 
 **用户数据**（全部落在宿主分配给本插件的**插件数据目录**，即 `ctx.paths.data_dir`）
 
@@ -237,6 +244,7 @@ allow_local_operator = true        # 本机控制台不受白名单限制
 | `vcpedia_songs.db` | VCPedia 同步下来的歌（SQLite，`songs` + `sync_meta` 表） |
 | `anubis_cookies.txt` | 反爬 cookie，失效自动重解，可安全删除 |
 | `recent_songs.json` | 最近命中过的歌（有界环形 30 条，v2.9.0 新增，供跨插件只读查询） |
+| `asset_cache/` | 只读素材的解压缓存（v2.19.0，可安全删除，下次加载自动重建） |
 
 > **为什么用户数据不在插件目录里**：整目录更新或重装插件会把 `assets/` 覆盖掉，
 > 用户的歌单和收件箱会一起丢。所以这些路径全部由数据目录推导，插件源码目录保持只读。
@@ -1108,7 +1116,7 @@ python test_annotate_llm.py
 | `vcpedia_text_clean.py` | wiki 标记清洗（`{{color}}`、`{{ruby}}`、`<ref>`、`[[链接\|文本]]`） |
 | `vcpedia_schema.py` | 知识库结构：规范化实体表 + 角色字典 + `songs` 兼容视图 + 老库自动迁移 |
 | `vcpedia_store.py` | 歌曲库 SQLite 读写（对外 API 不变，内部写规范化表；含关系型查询） |
-| `assets/knowledge_db.db`<br>`assets/song_lyric_keywords.txt` | 内置歌曲元数据库与歌词关键词表（只读素材） |
+| `assets/knowledge_db.db.gz`<br>`assets/song_lyric_keywords.txt.gz` | 内置歌曲元数据库与歌词关键词表（只读素材，gzip 压缩分发，加载期解压到 `asset_cache/`） |
 
 **辅助模块与自检脚本**（运行时模块与维护脚本的边界见下表；脚本式自检用例一律 `case_*` 命名，
 不被 pytest 收集，按 `python <脚本>` 跑而不是 `pytest <脚本>`）

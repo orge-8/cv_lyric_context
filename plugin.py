@@ -21,14 +21,18 @@
    插件加载时或收到「/加歌」命令时自动解析入库（写进同目录的 user_songs.json），
    成功后文件归档到 lyrics_inbox/imported/、失败的进 lyrics_inbox/failed/。
 
-数据: 只读素材在插件目录 assets/ ——
-      assets/knowledge_db.db (中文 VOCALOID 歌曲元数据) +
-      assets/song_lyric_keywords.txt (歌词句 -> 歌名 关键词表)
+数据: 只读素材在插件目录 assets/，v2.19.0 起以 gzip 压缩随包分发（13MB→4.3MB）——
+      assets/knowledge_db.db.gz (中文 VOCALOID 歌曲元数据) +
+      assets/song_lyric_keywords.txt.gz (歌词句 -> 歌名 关键词表)
+      加载期由 _resolve_asset 解压到数据目录 asset_cache/ 缓存（按源 mtime+size
+      校验失效）；未压缩文件若存在则优先直接用（兼容旧部署）。识别逻辑零改动。
       用户数据一律在宿主分配的插件数据目录 (ctx.paths.data_dir) ——
-      user_songs.json (自定义/导入的歌曲)、lyrics_inbox/、vcpedia_songs.db、cookie
+      user_songs.json (自定义/导入的歌曲)、lyrics_inbox/、vcpedia_songs.db、cookie、
+      asset_cache/（素材解压缓存）
       （源码目录会被更新/重装覆盖，不能放用户数据）
 """
 import asyncio
+import gzip
 import json
 import logging
 import re
@@ -884,6 +888,48 @@ def _migrate_legacy_user_data(data_dir: str) -> list[tuple[str, str]]:
     return logs
 
 
+def _resolve_asset(filename: str, data_dir: str) -> tuple[Optional[Path], Optional[str]]:
+    """定位一个只读素材文件，返回 (可用路径, 警告)。
+
+    分发包瘦身（v2.19.0）：素材随包以 gzip 压缩分发（``assets/<name>.gz``，
+    13MB→4.3MB），加载期解压到插件数据目录的 ``asset_cache/`` 缓存。识别逻辑
+    拿到的仍是普通文件路径，**匹配语义零改动**。
+
+    解析优先级：
+    1. 未压缩 ``assets/<name>`` 存在 → 直接用（兼容旧部署/开发环境，零解压开销）；
+    2. 否则解压 ``assets/<name>.gz`` 到 ``data_dir/asset_cache/<name>``。缓存按
+       源 ``.gz`` 的 mtime+size 校验失效：插件更新换了素材会自动重新解压；
+    3. 两者都没有 → 返回 (None, 警告)，沿用「素材缺失只降级、不阻断启动」。
+
+    纯函数（只读素材 + 写数据目录缓存），可在 worker 线程安全调用。解压失败
+    （截断的 .gz / 磁盘满）只返回警告，绝不抛异常打断索引构建。
+    """
+    raw = ASSET_DIR / filename
+    if raw.is_file():
+        return raw, None
+    gz = ASSET_DIR / (filename + ".gz")
+    if not gz.is_file():
+        return None, f"缺少素材文件: {raw}（也无 {gz.name}）"
+    cache_dir = Path(data_dir) / "asset_cache"
+    cache = cache_dir / filename
+    try:
+        st = gz.stat()
+        # 缓存有效：已存在且记录的源 mtime+size 与当前 .gz 一致
+        stamp = cache_dir / (filename + ".stamp")
+        expect = f"{int(st.st_mtime)}:{st.st_size}"
+        if cache.is_file() and stamp.is_file() and stamp.read_text(encoding="utf-8").strip() == expect:
+            return cache, None
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(cache.suffix + ".tmp")
+        with gzip.open(gz, "rb") as fin, open(tmp, "wb") as fout:
+            shutil.copyfileobj(fin, fout, length=1024 * 1024)
+        tmp.replace(cache)  # 原子替换，避免读到半截缓存
+        stamp.write_text(expect, encoding="utf-8")
+        return cache, None
+    except (OSError, gzip.BadGzipFile, EOFError) as exc:
+        return None, f"素材解压失败 {gz.name}: {exc}"
+
+
 def _build_asset_index(raw_extra_dbs: str, data_dir: str,
                        subspan_n: int = 0) -> tuple[_AssetIndex, list[tuple[str, str]]]:
     """构建歌词识别索引快照（knowledge_db + 关键词文件 + 自定义歌单 + 外部库）。
@@ -901,9 +947,14 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str,
     # 旧版把用户数据放在插件目录里，先搬走再读（幂等，无存量时只是一次 exists 判断）
     logs.extend(_migrate_legacy_user_data(data_dir))
 
-    db_path = ASSET_DIR / "knowledge_db.db"
-    txt_path = ASSET_DIR / "song_lyric_keywords.txt"
-    if db_path.exists():
+    # 素材定位：未压缩优先，否则解压 .gz 到数据目录缓存（v2.19.0 分发包瘦身）
+    db_path, db_warn = _resolve_asset("knowledge_db.db", data_dir)
+    txt_path, txt_warn = _resolve_asset("song_lyric_keywords.txt", data_dir)
+    if db_warn:
+        logs.append(("warning", db_warn))
+    if txt_warn:
+        logs.append(("warning", txt_warn))
+    if db_path is not None:
         # 素材库是 7MB 的二进制文件，整目录部署时若拷贝中断会留下截断的库，
         # sqlite3 读到一半才报错。这里兜住：元数据缺失只降级，不能让插件起不来。
         try:
@@ -925,10 +976,8 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str,
                 logs.append(("warning", f"歌曲元数据库读取失败，已跳过: {exc}"))
             finally:
                 conn.close()
-    else:
-        logs.append(("warning", f"缺少歌曲元数据库: {db_path}"))
 
-    if txt_path.exists():
+    if txt_path is not None:
         try:
             keyword_lines = txt_path.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeDecodeError) as exc:
@@ -952,13 +1001,11 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str,
                     bucket.append(song)
                     _add_subspans_into(index, key, song)
                 index.indexed_names.add(song)
-    else:
-        logs.append(("warning", f"缺少歌词关键词文件: {txt_path}"))
 
     # 关键词文件本身有漏：db 里 3318 首有歌词，关键词文件只覆盖了 3055 首；
     # 即便覆盖到的歌，词库也常常只收了十几行（v2.16.0：改成按歌合并，不再
     # 因为「这首歌已索引过」就整首跳过）。剩下的行用 db 自己的 lyrics 列补上。
-    if db_path.exists():
+    if db_path is not None:
         filled, err = _fill_lyrics_from_db_into(db_path, index, intern)
         if err:
             logs.append(("warning", err))

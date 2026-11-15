@@ -180,11 +180,19 @@ def test_chatter_ngrams_empty_when_n_zero():
 # ── 端到端（真实素材库）─────────────────────────────────────────
 
 @pytest.fixture(scope="module")
-def real_index():
-    """真实素材库构建的索引快照（与插件加载同一入口）。"""
-    if not (_PLUGIN_DIR / "assets" / "song_lyric_keywords.txt").exists():
+def real_index(tmp_path_factory):
+    """真实素材库构建的索引快照（与插件加载同一入口）。
+
+    v2.19.0 起素材以 .gz 压缩分发，未压缩与压缩两种形态都接受；
+    解压缓存写到临时目录，不污染源码目录。
+    """
+    assets = _PLUGIN_DIR / "assets"
+    has_raw = (assets / "song_lyric_keywords.txt").exists()
+    has_gz = (assets / "song_lyric_keywords.txt.gz").exists()
+    if not (has_raw or has_gz):
         pytest.skip("素材库不在本环境（CI/换机场景）")
-    index, _logs = _build_asset_index("", str(_PLUGIN_DIR / "data"), 6)
+    data_dir = tmp_path_factory.mktemp("cv_real_index")
+    index, _logs = _build_asset_index("", str(data_dir), 6)
     return index
 
 
