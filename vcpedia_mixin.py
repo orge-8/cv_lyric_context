@@ -100,6 +100,8 @@ class VCPediaMixin:
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.error("VCPedia: 歌曲库初始化失败: %s", exc)
             return
+        # v2.20.0：_clean_fn 由宿主（plugin.py）注入，供 get_by_clean_key
+        # 做大小写/标点无关回查；mixin 不反向依赖 plugin 模块（包式加载安全）。
         count = self._store.count()
         last = self._store.meta_get("last_sync_at")
         last_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(last))) if last else "从未同步"

@@ -562,6 +562,31 @@ class SongStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def get_by_clean_key(self, clean_key: str) -> Optional[Dict[str, Any]]:
+        """按 _clean 口径的归一化键查歌（v2.20.0，大小写/标点无关）。
+
+        背景：识别索引的歌名键是 _clean(name)（NFKC + 小写 + 只留字母数字
+        汉字），而 get() 的精确/safe_name 匹配区分大小写——英文与混合歌名
+        （如 TiMES → times）用清洗键查 get() 永远落空。旧版靠全量常驻歌词
+        掩盖了这个缺口；v2.20.0 歌词改按需查库后必须补上同口径回查。
+
+        实现：流式扫 songs 视图，用插件注入的 clean_fn（与索引侧完全同一
+        把尺子，NFKC/Unicode 折叠语义不漂移）逐首比对，取 id 最小命中
+        （与 get() 的 ORDER BY id LIMIT 1 同序）。只在 _lyrics_of 的
+        LRU 未命中时走，结果进 LRU，冷启动后同一首歌不再扫。
+        """
+        clean_fn = self._clean_fn
+        if not clean_key or clean_fn is None:
+            return None
+        with self._session() as conn:
+            for row in conn.execute("SELECT * FROM songs ORDER BY id"):
+                if clean_fn(str(row["name"] or "")) == clean_key:
+                    return dict(row)
+        return None
+
+    #: _clean 同口径函数，由插件注入（避免 store 反向依赖 plugin）。
+    _clean_fn = None
+
     def bilibili_ref(self, name: str) -> Optional[Dict[str, Any]]:
         """按歌名取原曲 B站标识（多级匹配，**唯一命中**才采纳）。
 

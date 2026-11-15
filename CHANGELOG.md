@@ -9,6 +9,73 @@
 
 ---
 
+## [2.20.0] - 2026-11-15
+
+### 运行时内存优化（真机 4GB / 可用 213MB 硬压力，识别/注入行为零变化）
+
+动机：真机物理内存 95% 已用、重度换页，插件 v2.19.0 常驻 RSS +374MB
+（索引 ~326MB，其中 98% 子串桶只含 1 首歌——大头是 Python dict/list/str
+对象开销而非数据）。本版把常驻索引压到 ~55MB（紧凑两表），存活数据合计
+~61MB，构建收尾把工作集还给 OS 后稳态 RSS 仅 ~4MB。决策与实测全过程见
+`docs/decisions-memory-optimization.md`。
+
+- **紧凑索引 `compact_index.py`（纯标准库，零新增依赖）**：整句索引
+  （241,235 键）与 6 字滑窗片段索引（1,508,873 键）从 `dict[str, list[str]]`
+  压实为「UTF-8 键 blob + `array('I')` 偏移/歌名 ID 表 + 歌名表」，二分查找；
+  两表 ~301MB → **55.3MB**（11.6 + 43.7）。增量写入走 overlay 小 dict +
+  桶视图（`setdefault` 返回可 insert/append 的视图），与旧 dict 语义逐操作
+  等价；同步/导入的增量合并路径不变。单歌桶快路径（98% 的桶）省去去重集合。
+- **常驻歌词按需化**：`lyrics_by_name` 7,808 首（~23MB）裁剪到 222 首
+  （0.4MB）——只保留「运行时库查不到」与「用户歌单覆盖」的；其余走既有
+  `_lyrics_of → _song_record`（200 条 LRU）→ SQLite 链路。裁剪判定与运行时
+  回查**同库同口径**（只认 `data_dir/vcpedia_songs.db`，与 extra_song_dbs
+  配置无关）。
+- **修复大小写回查缺口（按需化暴露的旧缺陷）**：索引歌名键是 `_clean(name)`
+  （NFKC+小写），而 `SongStore.get` 区分大小写——`TiMES→times` 永远落空，
+  旧版靠全量常驻歌词掩盖。新增 `SongStore.get_by_clean_key`（插件注入
+  `_clean_fn` 同口径流式精筛，取 id 最小命中），`_song_record` 落空兜底。
+- **重建峰值治理**：滑窗长度变更重建改 `release_first=True`——先释放旧索引
+  再构建（重建窗口期秒级识别暂停，完成后自动恢复），避免 4GB 真机上
+  新旧索引共存的瞬间峰值。启动路径不受影响。
+- **构建收尾工作集裁剪 `_trim_working_set`**：索引压实后旧 dict 虽已释放，
+  CPython/Windows 并不立即把页归还系统（稳态 RSS 仍挂 ~374MB）。收尾在
+  worker 线程 `gc.collect()` + `SetProcessWorkingSetSize(-1,-1)` 把已释放页
+  裁出工作集；非 Windows / API 失败静默降级。只裁已释放页，不动存活对象。
+
+### 实测（2026-11-15，SDK 2.23.0 隔离环境 + 官方 MaiBot v1.4.5 宿主源码）
+
+| 指标 | v2.19.0 基线 | v2.20.0 |
+|---|---:|---:|
+| 索引存活数据（deep size） | ~326 MB | **60.9 MB**（两表 55.3 + 歌词 0.4 + 元数据 5.2） |
+| 构建后稳态 RSS（进程增量） | +374 MB | **~4 MB**（收尾裁剪后） |
+| 热工作集（2 万次真实查询后） | — | ~118 MB，再裁剪回 ~2 MB |
+| 构建峰值 RSS | 429 MB | ~500 MB（dict 构建阶段固有，收尾即回落） |
+| 整句 get / 子串 get | dict O(1) | ~20 µs / ~21 µs（二分，毫秒级预算内） |
+| `_subspan_find` 端到端 | — | ~0.27 ms/条 |
+
+- **行为零变化验收（差分回归，同一真实素材 + 36MB 同步库）**：
+  241,235 整句键、1,508,873 片段键全量键值比对 **0 差异**；3,908 条语料
+  `_subspan_find` **0 差异**；1,200 条消息 `record_hit` + 1,194 条命中
+  证据强度（v2.17.0 分级语义）**0 差异**；7,808 首歌词回查逐行比对 **0 差异**。
+- 门禁（devkit run_gates，SDK 2.23.0）：**PASS 4 / SKIP 0 / FAIL 0**
+  （check 37 PASS + 5 WARN 存量、contracts 逐字节一致、smoke OK、
+  pytest **248 passed / 7 skipped**）；新增 `tests/test_compact_index.py` 9 项。
+- 官方最新实测：MaiBot **v1.4.5** PluginLoader 加载探针 **OK**
+  （loaded=1 / components=28 / caps=4）；SDK **2.23.0** 隔离全量 pytest 通过。
+  manifest 声明区间 host ≤1.4.5 / sdk ≤2.23.0 与实测一致。
+- 部署：**只替换插件目录即可生效**（纯标准库，无 pip 步骤）；无配置键变更、
+  无 capabilities 变更，但索引结构变化建议完整重启 MaiBot。
+
+### 已知取舍
+
+- 构建耗时增加（压实阶段 ~10s，本机串行实测总构建 ~18s vs 基线 ~8s；
+  构建在 worker 线程，不阻塞事件循环）——用启动/重建时间换常驻内存，
+  真机低频重建场景可接受。
+- 构建瞬间峰值 ~500MB 略高于基线 429MB（dict 构建阶段固有，压实收尾后
+  立即回落）；滑窗变更路径已用 release_first 消除新旧共存峰值。
+- 查询从 O(1) 哈希变为 O(log N) 二分（~20µs/次），在用户允许的毫秒级
+  延迟预算内；LRU 未命中的冷歌词回查多一次 SQLite 查询（毫秒级）。
+
 ## [2.19.0] - 2026-11-14
 
 ### 新增（点歌联动加固，与 music-request v1.8.0 配套）

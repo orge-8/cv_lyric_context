@@ -32,6 +32,7 @@
       （源码目录会被更新/重装覆盖，不能放用户数据）
 """
 import asyncio
+import gc
 import gzip
 import json
 import logging
@@ -55,6 +56,7 @@ from maibot_sdk import API, Command, EventHandler, Field, HookHandler, MaiBotPlu
 from maibot_sdk.types import ErrorPolicy, EventType, HookMode, HookOrder
 
 import lyrics_import
+from compact_index import CompactIndex
 from lyrics_import import ImportReport
 from recent_songs import DEFAULT_FLUSH_THROTTLE_SEC, RecentSongsLog
 from vcpedia_mixin import DB_FILE as VCPEDIA_DB_FILE, VCPediaMixin
@@ -930,6 +932,38 @@ def _resolve_asset(filename: str, data_dir: str) -> tuple[Optional[Path], Option
         return None, f"素材解压失败 {gz.name}: {exc}"
 
 
+def _trim_working_set() -> bool:
+    """构建收尾：GC 回收临时对象，并尽量把已释放内存还给 OS（v2.20.0）。
+
+    动机（真机 4GB / 可用内存仅 213MB，见 docs/decisions-memory-optimization.md）：
+    索引压实后旧 dict（峰值 ~400MB）虽已释放，CPython/Windows 并不立即把页
+    归还系统——稳态 RSS 仍挂着 ~374MB，其中真实存活数据只有 ~61MB，其余是
+    分配器保留的已释放页。SetProcessWorkingSetSize(-1,-1)（= EmptyWorkingSet）
+    把这些页裁出工作集；后续查询只按需换回真实热页（实测 2 万次真实查询后
+    工作集仅 ~9MB，再裁一次回到 ~1MB）。
+
+    安全性：只裁剪「已释放但未归还」的页，不动任何存活对象，识别数据零影响；
+    非 Windows / API 失败时静默降级（GC 仍生效，只是 RSS 数字不回落）。
+    在 worker 线程调用（构建收尾），不阻塞事件循环。
+    """
+    gc.collect()
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wt.HANDLE
+        k32.SetProcessWorkingSetSize.argtypes = [wt.HANDLE, ctypes.c_size_t, ctypes.c_size_t]
+        k32.SetProcessWorkingSetSize.restype = wt.BOOL
+        handle = k32.GetCurrentProcess()
+        # SIZE_T(-1) = 让系统按当前实际占用收缩工作集（EmptyWorkingSet 语义）
+        ok = k32.SetProcessWorkingSetSize(handle, ctypes.c_size_t(-1), ctypes.c_size_t(-1))
+        return bool(ok)
+    except Exception:
+        return False
+
+
 def _build_asset_index(raw_extra_dbs: str, data_dir: str,
                        subspan_n: int = 0) -> tuple[_AssetIndex, list[tuple[str, str]]]:
     """构建歌词识别索引快照（knowledge_db + 关键词文件 + 自定义歌单 + 外部库）。
@@ -1012,6 +1046,11 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str,
         elif filled:
             logs.append(("info", f"基础词库歌词补全: {filled} 首歌的歌词已并入索引"))
 
+    # v2.20.0 内存优化：用户自定义歌单的歌词优先于库里同名歌
+    # （_lyrics_of 先查 _lyrics_by_name），裁剪常驻歌词时这批不能丢。
+    # 加载前的常驻键集 = 基础库贡献；加载后新增的键 = 用户歌单贡献。
+    pre_user_lyric_keys = set(index.lyrics_by_name)
+
     user_count, err = _load_user_songs_into(index, Path(data_dir))
     if err:
         logs.append(("warning", err))
@@ -1042,7 +1081,80 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str,
     if extra_count:
         logs.append(("info", f"外部歌曲库已补充: {extra_count} 首歌"))
 
+    # ── v2.20.0 运行时内存优化：压实两张大表 + 裁剪常驻歌词 ──
+    # 实测（真实素材 + 36MB 同步库）：dict 形态子串索引 ~254MB、整句索引
+    # ~47MB、全量常驻歌词 ~23MB。98% 的子串桶只有 1 首歌，大头是 Python
+    # 对象开销。压实后两表合计 ~40MB；歌词改按需查库（_lyrics_of 的
+    # LRU + SQLite 链路本就存在），只保留「库里查不到」与「用户覆盖」的。
+    names: list[str] = []
+    name_ids: dict[str, int] = {}
+    index.songs_by_line = CompactIndex.from_mapping(
+        index.songs_by_line, names, name_ids)
+    index.subspans_by_gram = CompactIndex.from_mapping(
+        index.subspans_by_gram, names, name_ids)
+
+    # 运行时歌词回查只走 self.store（= data_dir/vcpedia_songs.db，
+    # 与 extra_song_dbs 配置无关），裁剪判定必须用同一个库，否则
+    # 「构建期认为查得到、运行时查不到」会丢歌词。
+    runtime_db = Path(data_dir) / VCPEDIA_DB_FILE
+    keep = _lyrics_keep_keys(index, runtime_db, pre_user_lyric_keys)
+    dropped = 0
+    for key in list(index.lyrics_by_name):
+        if key not in keep:
+            del index.lyrics_by_name[key]
+            dropped += 1
+    if dropped:
+        logs.append((
+            "info",
+            f"常驻歌词裁剪: {dropped} 首改为按需查库"
+            f"（保留 {len(index.lyrics_by_name)} 首库外/用户覆盖歌词）",
+        ))
+
     return index, logs
+
+
+def _lyrics_keep_keys(index: "_AssetIndex", runtime_db: Path,
+                      user_keys: set[str]) -> set[str]:
+    """裁剪常驻歌词时允许保留的归一化歌名键集合（v2.20.0）。
+
+    保留两类：
+    1. **用户自定义歌单**的歌（user_keys）——它们的歌词优先于库里同名歌，
+       必须常驻才能保证 _lyrics_of 的优先级语义不变；
+    2. **运行时查库取不到歌词**的歌——基础 knowledge_db 独有的歌、以及
+       同步库里歌词为空的歌。运行时 store 只指向同步库，这批歌的歌词
+       若不常驻就永远取不到了。
+
+    「取得到」的判定与运行时链路完全同口径：_song_record 先 get()（精确/
+    safe_name），落空再 get_by_clean_key（_clean 同口径、大小写无关）。
+    因此只要库里存在某首歌满足 _clean(库内歌名) == 常驻键 且歌词非空，
+    运行时就能取到 → 不必常驻。构建期一次性完成（worker 线程，只读 SQL）。
+    """
+    keep = set(user_keys)
+    # 运行时库里有歌词的歌，按 _clean 口径归一化成键集合
+    runtime_clean_keys: set[str] = set()
+    if runtime_db.is_file():
+        try:
+            conn = sqlite3.connect(f"file:{runtime_db}?mode=ro", uri=True)
+        except sqlite3.Error:
+            conn = None
+        if conn is not None:
+            try:
+                for (name,) in conn.execute(
+                    "SELECT name FROM songs "
+                    "WHERE lyrics IS NOT NULL AND TRIM(lyrics) != ''"
+                ):
+                    ck = _clean(str(name or ""))
+                    if ck:
+                        runtime_clean_keys.add(ck)
+            except sqlite3.Error:
+                pass
+            finally:
+                conn.close()
+    # 常驻键本就是 _clean(name)；运行时取不到歌词的才保留
+    for key in index.lyrics_by_name:
+        if key not in runtime_clean_keys:
+            keep.add(key)
+    return keep
 
 
 class PluginSection(PluginConfigBase):
@@ -1394,6 +1506,7 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         self._log_recent_songs_state()
         # 先初始化内置爬虫的歌曲库，索引构建会把它接进识别词库
         self._vcpedia_init()
+        self._wire_store_clean_fn()
         # config 追加梗词必须先于索引构建注册：索引准入与片段黑名单都依赖过滤表
         added = _register_meme_phrases(self.config.plugin.meme_phrases)
         if added:
@@ -1421,16 +1534,31 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
         self._last_recorded.clear()
         self._lyrics_lru.clear()
         self._record_lru.clear()
-        # 核心索引也释放：禁用/卸载时把常驻内存的大头还回去。
-        # on_config_update 里「启用且 _songs_by_line 为空则重载」的逻辑不受影响。
+        self._release_core_index()
+        self._subspan_n = 0
+        self._subspan_blocked = frozenset()
+
+    def _wire_store_clean_fn(self) -> None:
+        """给歌曲库注入 _clean 同口径函数（v2.20.0）。
+
+        get_by_clean_key 用它做大小写/标点无关回查：识别索引的歌名键是
+        _clean(name)，而 store.get 区分大小写，英文/混合歌名（TiMES→times）
+        必须靠同口径回查兜底。store 未初始化时静默跳过（降级语义不变）。
+        """
+        if self._store is not None:
+            self._store._clean_fn = _clean
+
+    def _release_core_index(self) -> None:
+        """释放核心索引的常驻内存（卸载 / 重建前调用）。
+
+        on_config_update 里「启用且 _songs_by_line 为空则重载」的逻辑不受影响。
+        """
         self._songs_by_line.clear()
         self._meta_by_name.clear()
         self._db_meta.clear()
         self._lyrics_by_name.clear()
         self._indexed_names.clear()
         self._subspans_by_gram.clear()
-        self._subspan_n = 0
-        self._subspan_blocked = frozenset()
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         if scope == "self":
@@ -1441,20 +1569,24 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             # 若从"禁用"切到"启用"，补一次数据加载
             if not self._songs_by_line:
                 self._vcpedia_init()
+                self._wire_store_clean_fn()
                 # 索引构建前先并入最新梗词（与 on_load 同序）
                 added = _register_meme_phrases(self.config.plugin.meme_phrases)
                 if added:
                     self.ctx.logger.info("梗过滤表: 并入 config 自定义梗词 %d 条", added)
                 await self._load_assets_async()
                 return
-            # 子串滑窗长度变了：片段索引的窗口数依赖 N，必须整库重建
+            # 子串滑窗长度变了：片段索引的窗口数依赖 N，必须整库重建。
+            # release_first：先释放旧索引再构建，避免新旧共存的峰值
+            # （4GB 真机可用内存只有几百 MB，见 docs/decisions-memory-optimization.md）
             new_n = max(0, int(self.config.plugin.subspan_min_chars or 0))
             if self._subspan_n != new_n:
                 self.ctx.logger.info(
                     "子串滑窗长度变更 (%d -> %d)，重建识别词库", self._subspan_n, new_n
                 )
                 self._vcpedia_init()
-                await self._load_assets_async()
+                self._wire_store_clean_fn()
+                await self._load_assets_async(release_first=True)
 
     # ---------- 数据加载 ----------
 
@@ -1466,17 +1598,34 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             self._subspans_by_gram, self._subspan_n,
         )
 
-    async def _load_assets_async(self) -> None:
+    async def _load_assets_async(self, release_first: bool = False) -> None:
         """worker 线程构建索引快照，回到事件循环一次性原子换入。
 
         构建涉及 5.7MB 关键词文件解析、约 6 万条索引、两个 SQLite 库读取，
         同步执行会把 Runner 的事件循环卡住数百毫秒到数秒（同进程其他插件
         一起被卡）；快照换入只是几次属性赋值，record_hit 不会读到半成品索引。
+
+        release_first=True（v2.20.0，滑窗长度变更重建专用）：先把旧索引
+        释放再构建。4GB 真机上「新旧索引共存」的瞬间峰值是最大内存风险；
+        代价是重建窗口期（秒级）识别降级为空索引——与既有「重建失败，
+        重启后生效」的降级语义同档。启动路径不用它（启动时本就没有旧索引）。
         """
+        if release_first:
+            self._release_core_index()
+            self._lyrics_lru.clear()
+            self._record_lru.clear()
+            self.ctx.logger.info(
+                "识别词库重建: 已先释放旧索引（重建期间歌词识别暂停，完成后自动恢复）"
+            )
         raw_cfg = str(self.config.plugin.extra_song_dbs or "")
         data_dir = str(self.ctx.paths.data_dir)
         n = max(0, int(self.config.plugin.subspan_min_chars or 0))
         index, logs = await asyncio.to_thread(_build_asset_index, raw_cfg, data_dir, n)
+        # 构建收尾在 worker 线程做（gc + 工作集裁剪，~百毫秒级）：
+        # 压实后旧 dict 已释放，但分配器仍保留这些页（Windows RSS 不回落），
+        # 裁剪后稳态 RSS 从 ~374MB 回到真实存活数据量级（实测 ~61MB 存活、
+        # 热工作集 ~10MB）。识别数据零影响，见 _trim_working_set 注释。
+        await asyncio.to_thread(_trim_working_set)
         self._songs_by_line = index.songs_by_line
         self._meta_by_name = index.meta_by_name
         self._db_meta = index.db_meta
@@ -2026,6 +2175,11 @@ class CVLyricContextPlugin(VCPediaMixin, VCPediaWebUIMixin, MaiBotPlugin):
             return cached
         try:
             record = self.store.get(name)
+            if not record:
+                # v2.20.0：get() 区分大小写，识别侧传来的是 _clean 键
+                # （小写），英文/混合歌名（TiMES→times）会落空；用同口径
+                # 回查兜底。结果同样进 LRU，冷启动后不再扫。
+                record = self.store.get_by_clean_key(_clean(name))
         except Exception:  # noqa: BLE001 - 库不可用时不影响注入已有信息
             return {}
         record = record or {}
