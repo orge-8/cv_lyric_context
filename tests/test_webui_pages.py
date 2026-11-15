@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
-"""自定义 WebUI 页面（webui.json 协议 v2）契约测试。
+"""自定义 WebUI 页面（webui.json 协议 v2，custom 模式）契约测试。
 
-覆盖三条链路，缺一条真机上就可能是「页面整块消失」或「点了按钮 502」：
+v2.19.0 起歌词页从声明式改为 custom HTML（``webui/lyrics.html``，视觉参考
+Mai_life 的设计语言，代码全部原创）。覆盖四条链路，缺一条真机上就可能是
+「页面整块消失」或「点了按钮 502」：
 
-1. 声明必须过宿主自己的 ``load_webui_extension``（extra=forbid 严格模型）；
+1. 声明必须过宿主自己的 ``load_webui_extension``（extra=forbid 严格模型，
+   custom 页的 entry 必须指向插件内真实 HTML，document 由宿主读取注入）；
 2. 页面绑定的每个 ``api`` 都必须在 ``get_components()`` 里静态注册（宿主对 dynamic 返 404）；
-3. API 返回值必须过宿主 ``validate_json``（≤512 KiB / ≤12 层 / ≤20000 元素）。
+3. API 返回值必须过宿主 ``validate_json``（≤512 KiB / ≤12 层 / ≤20000 元素）；
+4. HTML 里 ``query()/action()`` 用到的绑定名必须与 webui.json 声明一致
+   （custom 页没有声明式节点引用校验，拼错绑定名只会在真机上 502）。
 
 外加本插件特有的两条纪律：
 
-- **消息面参数一律声明成 string**：页面 input 节点交上来的是字符串，声明成 integer
-  会被宿主 ``Parameter.accepts`` 判掉（422），数字转换由插件侧 ``_webui_int`` 兜底；
+- **条数参数一律声明成 string**：与 ``_webui_int`` 的字符串兜底口径保持一致，
+  页面 JS 也统一传字符串，避免 integer 严格校验（``type(value) is int``）踩布尔/浮点坑；
 - **触发类操作不做「不限条数」**：命令侧 0 表示全量，页面继承这个语义就成了「误点一下
   跑几小时」，所以 ``_webui_resolve_limit`` 必须永远给出有限值。
 """
@@ -21,6 +26,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sys
 
 import pytest
@@ -92,7 +98,7 @@ def _plugin(tmp_path, *, songs=(), allow_sync=True, enabled=True):
 def test_declaration_loads_under_host_schema():
     ext = _extension()
     assert ext.schema_version == 2
-    assert ext.required_capabilities == ["declarative_basic"]
+    assert ext.required_capabilities == ["custom_pages"]
     page = ext.pages[0]
     # 1.4.0 起所有插件页面统一收进设置侧栏「插件扩展」分组（Layout.tsx:106-118）；
     # placement:"workspace" 已停用（宿主归一化 + UserWarning），声明里必须删掉，
@@ -101,40 +107,53 @@ def test_declaration_loads_under_host_schema():
     raw = json.loads((_PLUGIN_DIR / "webui.json").read_text(encoding="utf-8"))
     assert "placement" not in raw["pages"][0], "1.4.x 已停用 placement，别再写 workspace"
     assert (ext.workspace_title or "").strip(), "手机端分组标题仍用 workspace_title"
-    assert page.auto_refresh is True, "检索框靠 auto_refresh 才能自动重查"
     assert page.icon == "database"
+    # custom 页契约：entry 指向插件内 HTML，document 由宿主读取注入（非空）
+    assert page.mode == "custom"
+    assert page.entry == "webui/lyrics.html"
+    assert page.layout == "document"
+    assert page.document.strip(), "宿主必须能从 entry 读到非空 HTML"
+    assert "document" not in raw["pages"][0], "webui.json 不能内联 document（宿主直接拒绝）"
 
 
-def test_poll_interval_for_task_progress():
-    """「触发后台任务 + 看进度」型页面必须显式轮询：前端 seconds < 3 直接不轮询，
-    宿主也拒绝 1/2 秒。少了它，任务进度只能手动刷新。"""
+def test_custom_page_polls_task_progress():
+    """custom 页没有声明式的 poll_interval_seconds，轮询写在页面 JS 里。
+    「触发后台任务 + 看进度」型页面必须有 ≥3 秒的 setInterval（宿主对声明式
+    页面的下限是 3 秒，这里沿用同一口径），否则任务进度只能手动刷新。"""
+    html = (_PLUGIN_DIR / "webui" / "lyrics.html").read_text(encoding="utf-8")
+    # 回调体里可能含逗号（如 () => { a(); b(); }），用贪婪匹配取最后一个数字参数
+    intervals = [int(ms) for ms in re.findall(r"setInterval\(.*?,\s*(\d+)\s*\)", html)]
+    assert intervals, "页面 JS 必须有 setInterval 轮询任务进度"
+    assert min(intervals) >= 3000, f"轮询间隔不得小于 3 秒: {intervals}"
+    assert "window.maibot" in html and ".ready" in html, "必须等宿主桥接就绪后再发请求"
+
+
+def test_custom_page_respects_host_constraints():
+    """宿主 CSP 零网络 + 并发闸 2：页面不得引外部资源，必须自建 ≤2 的调度。"""
+    html = (_PLUGIN_DIR / "webui" / "lyrics.html").read_text(encoding="utf-8")
+    assert not re.search(r"(?:src|href)\s*=\s*[\"']https?://", html), "CSP 禁止外部资源"
+    assert "@import" not in html and "url(http" not in html, "CSP 禁止外部样式/字体"
+    assert re.search(r"active\s*<\s*2", html), "必须有并发 ≤2 的请求调度（宿主 pending>=2 直接 throw）"
+
+
+def test_html_bindings_match_declaration():
+    """custom 页没有声明式节点引用校验：JS 里 query()/action() 的绑定名
+    必须全部在 webui.json 声明，否则真机上一点就 502。"""
     page = _extension().pages[0]
-    assert page.poll_interval_seconds >= 3, (
-        "auto_refresh 只覆盖交互触发重查；后台任务进度需要 poll_interval_seconds ≥ 3"
-    )
-
-
-def test_input_labels_within_frontend_limit():
-    """input 节点 label 超过 20 字会被前端截断；协议没有 hint/placeholder，
-    括号内说明必须精简 label 或下沉为旁挂 text 节点。"""
-    page = _extension().pages[0]
-    pending = list(page.content)
-    checked = 0
-    while pending:
-        node = pending.pop()
-        children = getattr(node, "children", None)
-        if children:
-            pending.extend(children)
-        if getattr(node, "type", None) == "input":
-            checked += 1
-            label = node.label if isinstance(node.label, str) else str(node.label or "")
-            assert len(label) <= 20, f"input {node.name} 的 label {len(label)} 字超长: {label}"
-    assert checked, "页面上应至少有一个 input 节点"
+    declared = set(page.queries) | set(page.actions)
+    html = (_PLUGIN_DIR / "webui" / "lyrics.html").read_text(encoding="utf-8")
+    used = set(re.findall(r"\b(?:query|action)\(\s*[\"']([a-zA-Z_][a-zA-Z0-9_]*)[\"']", html))
+    assert used, "页面 JS 应至少调用一个绑定"
+    unknown = used - declared
+    assert not unknown, f"JS 调用了未声明的绑定: {sorted(unknown)}"
+    # 反向：声明的读绑定至少都被页面用到（写绑定允许只被按钮触发函数间接调用）
+    unused_queries = set(page.queries) - used
+    assert not unused_queries, f"声明了却没被页面使用的 query: {sorted(unused_queries)}"
 
 
 def test_manifest_declares_capability():
     manifest = json.loads((_PLUGIN_DIR / "_manifest.json").read_text(encoding="utf-8"))
-    assert "declarative_basic" in (manifest.get("capabilities") or [])
+    assert "custom_pages" in (manifest.get("capabilities") or [])
 
 
 def test_queries_have_no_arguments_and_optional_params():
@@ -142,11 +161,14 @@ def test_queries_have_no_arguments_and_optional_params():
     for name, binding in page.queries.items():
         binding.validate_args({})  # 一个参数都不传也要能过
         assert not binding.confirmation, f"query {name} 不得声明 confirmation"
-        assert not binding.arguments, f"query {name} 不得声明 arguments（宿主直接拒绝）"
+        # custom 页的 APIBinding 没有 arguments 字段（那是声明式 DeclarativeBinding
+        # 的表单引用机制）；这里断言它不存在，防止有人把声明式写法混进来。
+        assert not hasattr(binding, "arguments"), f"query {name} 不得带声明式 arguments"
 
 
 def test_numeric_params_declared_as_string():
-    """input 节点交上来的是字符串：声明成 integer 会被宿主 422 掉。"""
+    """条数参数统一 string：页面 JS 传字符串，插件侧 _webui_int 兜底转换，
+    避开宿主 integer 严格校验（type(value) is int）的布尔/浮点坑。"""
     page = _extension().pages[0]
     seen = set()
     for group in (page.queries, page.actions):

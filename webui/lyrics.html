@@ -1,0 +1,660 @@
+<style>
+  /* cv_lyric_context 歌词曲库自定义页面。
+     设计语言参考 Mai_life（GPL-3.0，仅借鉴形态，全部代码原创，MIT）。
+     主题：桥接宿主注入的 --maibot-* token，暗色由宿主 SDK 切换 html.dark。
+     约束：CSP 零网络（无外部资源）；宿主桥接并发上限 2、单次调用 10s 超时。 */
+  .cvl-root {
+    --cvl-bg: var(--maibot-background, #f7f8f6);
+    --cvl-panel: var(--maibot-surface, #fdfdfc);
+    --cvl-ink: var(--maibot-foreground, #17181a);
+    --cvl-dim: var(--maibot-muted, #6c6f74);
+    --cvl-tint: var(--maibot-soft, #eef0ec);
+    --cvl-line: var(--maibot-border, rgba(23, 24, 26, 0.10));
+    --cvl-accent: var(--maibot-primary, #3a6ea5);
+    --cvl-on-accent: var(--maibot-primary-foreground, #ffffff);
+    --cvl-alert: var(--maibot-danger, #c2453a);
+    --cvl-round: var(--maibot-radius, 12px);
+    --cvl-font: var(--maibot-font-body, system-ui, -apple-system, "Segoe UI", "Microsoft YaHei UI", sans-serif);
+    --cvl-mono: var(--maibot-font-mono, ui-monospace, "JetBrains Mono", Consolas, monospace);
+    /* 语义色（数据可视化用，亮/暗各一套） */
+    --cvl-ok: #178a4c;
+    --cvl-ok-soft: rgba(23, 138, 76, 0.10);
+    --cvl-warn: #b97d10;
+    --cvl-warn-soft: rgba(185, 125, 16, 0.12);
+    --cvl-bad: #c2453a;
+    --cvl-bad-soft: rgba(194, 69, 58, 0.10);
+    --cvl-track: rgba(23, 24, 26, 0.08);
+
+    font-family: var(--cvl-font);
+    color: var(--cvl-ink);
+    background: var(--cvl-bg);
+    padding: 20px 24px 44px;
+    max-width: 1400px;
+    margin: 0 auto;
+    box-sizing: border-box;
+    line-height: 1.5;
+  }
+  :root.dark .cvl-root,
+  html.dark .cvl-root {
+    --cvl-bg: var(--maibot-background, #101112);
+    --cvl-panel: var(--maibot-surface, #1a1b1d);
+    --cvl-ink: var(--maibot-foreground, #eceef0);
+    --cvl-dim: var(--maibot-muted, #9aa0a6);
+    --cvl-tint: var(--maibot-soft, #242628);
+    --cvl-line: var(--maibot-border, rgba(236, 238, 240, 0.12));
+    --cvl-ok: #3fbf74;
+    --cvl-ok-soft: rgba(63, 191, 116, 0.14);
+    --cvl-warn: #e0a83c;
+    --cvl-warn-soft: rgba(224, 168, 60, 0.16);
+    --cvl-bad: #e06c5f;
+    --cvl-bad-soft: rgba(224, 108, 95, 0.14);
+    --cvl-track: rgba(236, 238, 240, 0.10);
+  }
+  .cvl-root *, .cvl-root *::before, .cvl-root *::after { box-sizing: border-box; }
+  .cvl-root [hidden] { display: none !important; }
+
+  /* ---- 顶栏 ---- */
+  .cvl-head {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 12px; padding-bottom: 14px; margin-bottom: 18px;
+    border-bottom: 1px solid var(--cvl-line);
+  }
+  .cvl-brand { display: flex; align-items: center; gap: 12px; }
+  .cvl-logo {
+    width: 40px; height: 40px; border-radius: 11px; flex-shrink: 0;
+    background: var(--cvl-accent); color: var(--cvl-on-accent);
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 20px; font-weight: 700;
+  }
+  .cvl-title { margin: 0; font-size: 20px; font-weight: 700; }
+  .cvl-subtitle { font-size: 12px; color: var(--cvl-dim); margin-top: 2px; }
+  .cvl-head-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+  /* ---- 徽章 ---- */
+  .cvl-pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 2px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 500;
+    border: 1px solid var(--cvl-line); background: var(--cvl-tint); color: var(--cvl-ink);
+    white-space: nowrap;
+  }
+  .cvl-pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--cvl-dim); }
+  .cvl-pill.ok { color: var(--cvl-ok); border-color: var(--cvl-ok); background: var(--cvl-ok-soft); }
+  .cvl-pill.ok::before { background: var(--cvl-ok); }
+  .cvl-pill.warn { color: var(--cvl-warn); border-color: var(--cvl-warn); background: var(--cvl-warn-soft); }
+  .cvl-pill.warn::before { background: var(--cvl-warn); }
+  .cvl-pill.bad { color: var(--cvl-bad); border-color: var(--cvl-bad); background: var(--cvl-bad-soft); }
+  .cvl-pill.bad::before { background: var(--cvl-bad); }
+  .cvl-pill.run::before { animation: cvl-pulse 1.2s ease-in-out infinite; }
+  @keyframes cvl-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+  /* ---- 错误横幅 ---- */
+  .cvl-banner {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 11px 15px; margin-bottom: 16px; border-radius: var(--cvl-round);
+    border: 1px solid var(--cvl-bad); background: var(--cvl-bad-soft);
+    color: var(--cvl-bad); font-size: 13px;
+  }
+
+  /* ---- 卡片 ---- */
+  .cvl-card {
+    background: var(--cvl-panel); border: 1px solid var(--cvl-line);
+    border-radius: var(--cvl-round); padding: 18px 20px; margin-bottom: 16px;
+  }
+  .cvl-card-head {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 10px; padding-bottom: 12px; margin-bottom: 14px;
+    border-bottom: 1px solid var(--cvl-line);
+  }
+  .cvl-card-title { margin: 0; font-size: 15px; font-weight: 650; }
+  .cvl-card-note { font-size: 12px; color: var(--cvl-dim); }
+
+  /* ---- KPI 瓦片 ---- */
+  .cvl-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .cvl-kpi {
+    padding: 13px 15px; border-radius: calc(var(--cvl-round) - 2px);
+    border: 1px solid var(--cvl-line); background: var(--cvl-tint);
+  }
+  .cvl-kpi-label { font-size: 11.5px; color: var(--cvl-dim); margin-bottom: 4px; }
+  .cvl-kpi-value { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .cvl-kpi-sub { font-size: 11px; color: var(--cvl-dim); margin-top: 3px; }
+
+  /* ---- 覆盖率仪表 + 状态 kv ---- */
+  .cvl-overview { display: grid; grid-template-columns: 240px 1fr; gap: 18px; align-items: center; }
+  @media (max-width: 760px) { .cvl-overview { grid-template-columns: 1fr; } }
+  .cvl-gauge { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .cvl-gauge svg { width: 190px; height: 120px; }
+  .cvl-gauge-caption { font-size: 12px; color: var(--cvl-dim); }
+  .cvl-kv { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 7px 0; font-size: 13px; border-bottom: 1px solid var(--cvl-line); }
+  .cvl-kv:last-child { border-bottom: none; }
+  .cvl-kv-k { color: var(--cvl-dim); flex-shrink: 0; }
+  .cvl-kv-v { font-weight: 600; text-align: right; word-break: break-all; }
+
+  /* ---- 任务区 ---- */
+  .cvl-task-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .cvl-field-label { font-size: 12.5px; color: var(--cvl-dim); }
+  .cvl-input {
+    padding: 7px 12px; border-radius: calc(var(--cvl-round) - 4px);
+    border: 1px solid var(--cvl-line); background: var(--cvl-tint); color: var(--cvl-ink);
+    font: inherit; font-size: 13px;
+  }
+  .cvl-input:focus-visible { outline: 2px solid var(--cvl-accent); outline-offset: 1px; }
+  .cvl-input.num { width: 110px; }
+  .cvl-btn {
+    padding: 7px 14px; border-radius: calc(var(--cvl-round) - 4px);
+    border: 1px solid var(--cvl-line); background: var(--cvl-panel); color: var(--cvl-ink);
+    font: inherit; font-size: 13px; font-weight: 500; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .cvl-btn:hover:not(:disabled) { background: var(--cvl-tint); }
+  .cvl-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .cvl-btn.primary { background: var(--cvl-accent); border-color: var(--cvl-accent); color: var(--cvl-on-accent); }
+  .cvl-btn.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--cvl-accent); }
+  .cvl-btn.danger { background: transparent; border-color: var(--cvl-bad); color: var(--cvl-bad); }
+  .cvl-btn.danger:hover:not(:disabled) { background: var(--cvl-bad-soft); }
+  .cvl-progress-track { height: 9px; border-radius: 999px; background: var(--cvl-track); overflow: hidden; margin: 6px 0 12px; }
+  .cvl-progress-fill { height: 100%; border-radius: 999px; background: var(--cvl-accent); transition: width 0.4s ease; }
+  .cvl-task-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-bottom: 10px; }
+  .cvl-mini { padding: 9px 12px; border-radius: calc(var(--cvl-round) - 4px); background: var(--cvl-tint); border: 1px solid var(--cvl-line); }
+  .cvl-mini-label { font-size: 11px; color: var(--cvl-dim); }
+  .cvl-mini-value { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .cvl-summary { font-size: 12.5px; color: var(--cvl-dim); white-space: pre-wrap; word-break: break-word; }
+  .cvl-failures { margin: 8px 0 0; padding-left: 18px; font-size: 12px; color: var(--cvl-bad); }
+  .cvl-hint { font-size: 12px; color: var(--cvl-dim); margin-top: 8px; }
+  .cvl-block-reason { font-size: 12.5px; color: var(--cvl-warn); margin-top: 8px; }
+
+  /* ---- 检索：分栏阅读 ---- */
+  .cvl-search-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .cvl-search-bar .cvl-input.keyword { flex: 1 1 240px; min-width: 200px; }
+  .cvl-select {
+    padding: 7px 12px; border-radius: calc(var(--cvl-round) - 4px);
+    border: 1px solid var(--cvl-line); background: var(--cvl-tint); color: var(--cvl-ink);
+    font: inherit; font-size: 13px;
+  }
+  .cvl-reader { display: grid; grid-template-columns: 320px 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 900px) { .cvl-reader { grid-template-columns: 1fr; } }
+  .cvl-result-list { display: flex; flex-direction: column; gap: 8px; max-height: 520px; overflow-y: auto; padding-right: 4px; }
+  .cvl-result {
+    text-align: left; width: 100%; padding: 10px 12px; cursor: pointer;
+    border-radius: calc(var(--cvl-round) - 4px); border: 1px solid var(--cvl-line);
+    background: var(--cvl-tint); color: var(--cvl-ink); font: inherit;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .cvl-result:hover { border-color: var(--cvl-accent); }
+  .cvl-result.active { background: var(--cvl-panel); border-color: var(--cvl-accent); box-shadow: 0 0 0 1px var(--cvl-accent); }
+  .cvl-result-name { font-size: 13.5px; font-weight: 600; }
+  .cvl-result-meta { font-size: 11.5px; color: var(--cvl-dim); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .cvl-detail {
+    padding: 18px 22px; border-radius: calc(var(--cvl-round) - 2px);
+    border: 1px solid var(--cvl-line); background: var(--cvl-tint); min-height: 320px;
+  }
+  .cvl-detail-name { margin: 0 0 4px; font-size: 17px; font-weight: 700; }
+  .cvl-detail-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .cvl-detail-credits { font-size: 12px; color: var(--cvl-dim); margin-bottom: 10px; word-break: break-all; }
+  .cvl-lyrics {
+    font-size: 14px; line-height: 1.8; white-space: pre-wrap; word-break: break-word;
+    margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--cvl-line);
+    max-height: 380px; overflow-y: auto;
+  }
+  .cvl-placeholder { color: var(--cvl-dim); font-size: 13px; padding: 24px 0; text-align: center; }
+
+  /* ---- 双表 ---- */
+  .cvl-duo { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .cvl-duo { grid-template-columns: 1fr; } }
+  .cvl-table-wrap { width: 100%; overflow-x: auto; max-height: 340px; overflow-y: auto; }
+  .cvl-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .cvl-table th, .cvl-table td { padding: 7px 10px; border-bottom: 1px solid var(--cvl-line); text-align: left; }
+  .cvl-table th { color: var(--cvl-dim); font-weight: 600; font-size: 11.5px; white-space: nowrap; position: sticky; top: 0; background: var(--cvl-panel); }
+  .cvl-table td.num, .cvl-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .cvl-table tr:last-child td { border-bottom: none; }
+  .cvl-empty-row { color: var(--cvl-dim); font-size: 12.5px; padding: 14px 0; text-align: center; }
+  .cvl-foot { margin-top: 20px; font-size: 11.5px; color: var(--cvl-dim); text-align: center; }
+</style>
+
+<div class="cvl-root">
+  <header class="cvl-head">
+    <div class="cvl-brand">
+      <span class="cvl-logo" aria-hidden="true">♪</span>
+      <div>
+        <h1 class="cvl-title">歌词曲库</h1>
+        <div class="cvl-subtitle">中V歌词识别 · 歌曲库 — 覆盖率、检索与后台同步</div>
+      </div>
+    </div>
+    <div class="cvl-head-meta">
+      <span class="cvl-pill" id="cvl-status-pill">加载中</span>
+      <span class="cvl-pill" id="cvl-sync-pill">上次同步：—</span>
+    </div>
+  </header>
+
+  <div class="cvl-banner" id="cvl-banner" hidden>
+    <span id="cvl-banner-text"></span>
+    <button class="cvl-btn" id="cvl-banner-close" type="button">关闭</button>
+  </div>
+
+  <section class="cvl-kpis" aria-label="曲库概览">
+    <div class="cvl-kpi"><div class="cvl-kpi-label">曲库总数</div><div class="cvl-kpi-value" id="cvl-kpi-total">—</div><div class="cvl-kpi-sub">首歌曲</div></div>
+    <div class="cvl-kpi"><div class="cvl-kpi-label">歌词覆盖率</div><div class="cvl-kpi-value" id="cvl-kpi-coverage">—</div><div class="cvl-kpi-sub" id="cvl-kpi-coverage-sub">有歌词 / 总数</div></div>
+    <div class="cvl-kpi"><div class="cvl-kpi-label">缺歌词</div><div class="cvl-kpi-value" id="cvl-kpi-empty">—</div><div class="cvl-kpi-sub">待补抓</div></div>
+    <div class="cvl-kpi"><div class="cvl-kpi-label">已标注情感</div><div class="cvl-kpi-value" id="cvl-kpi-emotion">—</div><div class="cvl-kpi-sub" id="cvl-kpi-emotion-sub">待标注 —</div></div>
+  </section>
+
+  <section class="cvl-card">
+    <div class="cvl-card-head"><h2 class="cvl-card-title">曲库状态</h2><span class="cvl-card-note" id="cvl-categories-note"></span></div>
+    <div class="cvl-overview">
+      <div class="cvl-gauge">
+        <svg viewBox="0 0 190 120" role="img" aria-label="歌词覆盖率仪表">
+          <path d="M 20 105 A 75 75 0 0 1 170 105" fill="none" stroke="var(--cvl-track)" stroke-width="13" stroke-linecap="round"/>
+          <path id="cvl-gauge-arc" d="M 20 105 A 75 75 0 0 1 170 105" fill="none" stroke="var(--cvl-accent)" stroke-width="13" stroke-linecap="round" stroke-dasharray="0 999"/>
+          <text id="cvl-gauge-text" x="95" y="92" text-anchor="middle" font-size="26" font-weight="700" fill="var(--cvl-ink)">—</text>
+          <text x="95" y="112" text-anchor="middle" font-size="11" fill="var(--cvl-dim)">歌词覆盖率 %</text>
+        </svg>
+        <div class="cvl-gauge-caption" id="cvl-gauge-caption">—</div>
+      </div>
+      <div>
+        <div class="cvl-kv"><span class="cvl-kv-k">上次同步</span><span class="cvl-kv-v" id="cvl-kv-sync">—</span></div>
+        <div class="cvl-kv"><span class="cvl-kv-k">爬取分类</span><span class="cvl-kv-v" id="cvl-kv-categories">—</span></div>
+        <div class="cvl-kv"><span class="cvl-kv-k">待标注情感</span><span class="cvl-kv-v" id="cvl-kv-pending">—</span></div>
+        <div class="cvl-kv"><span class="cvl-kv-k">单次同步批量</span><span class="cvl-kv-v" id="cvl-kv-batch">—</span></div>
+        <div class="cvl-kv"><span class="cvl-kv-k">情感标签体系</span><span class="cvl-kv-v" id="cvl-kv-tags">—</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="cvl-card">
+    <div class="cvl-card-head">
+      <h2 class="cvl-card-title">后台任务（同步 / 补歌词）</h2>
+      <span class="cvl-pill" id="cvl-task-pill">空闲</span>
+    </div>
+    <div class="cvl-task-controls">
+      <label class="cvl-field-label" for="cvl-limit">本次条数</label>
+      <input class="cvl-input num" id="cvl-limit" type="number" min="0" step="1" placeholder="0 = 按配置">
+      <button class="cvl-btn primary" id="cvl-btn-sync" type="button">开始增量同步</button>
+      <button class="cvl-btn" id="cvl-btn-refetch" type="button">补抓缺歌词</button>
+      <button class="cvl-btn danger" id="cvl-btn-cancel" type="button" disabled>取消当前任务</button>
+    </div>
+    <div class="cvl-hint">留空或 0 表示按「单次同步批量」执行；配置为「不限」时按 50 首执行，避免误点触发全量任务。</div>
+    <div class="cvl-block-reason" id="cvl-block-reason" hidden></div>
+    <div id="cvl-task-progress" hidden>
+      <div class="cvl-progress-track"><div class="cvl-progress-fill" id="cvl-progress-fill" style="width:0%"></div></div>
+      <div class="cvl-task-stats">
+        <div class="cvl-mini"><div class="cvl-mini-label">进度</div><div class="cvl-mini-value" id="cvl-task-percent">0%</div></div>
+        <div class="cvl-mini"><div class="cvl-mini-label">已完成 / 总数</div><div class="cvl-mini-value" id="cvl-task-done">0 / 0</div></div>
+        <div class="cvl-mini"><div class="cvl-mini-label">新增</div><div class="cvl-mini-value" id="cvl-task-added">0</div></div>
+        <div class="cvl-mini"><div class="cvl-mini-label">更新</div><div class="cvl-mini-value" id="cvl-task-updated">0</div></div>
+        <div class="cvl-mini"><div class="cvl-mini-label">失败</div><div class="cvl-mini-value" id="cvl-task-failed">0</div></div>
+        <div class="cvl-mini"><div class="cvl-mini-label">已用时</div><div class="cvl-mini-value" id="cvl-task-elapsed">—</div></div>
+      </div>
+    </div>
+    <div class="cvl-summary" id="cvl-task-summary"></div>
+    <ul class="cvl-failures" id="cvl-task-failures" hidden></ul>
+  </section>
+
+  <section class="cvl-card">
+    <div class="cvl-card-head"><h2 class="cvl-card-title">曲库检索</h2><span class="cvl-card-note">点左侧结果，右侧看歌词</span></div>
+    <div class="cvl-search-bar">
+      <input class="cvl-input keyword" id="cvl-keyword" type="text" maxlength="60" placeholder="输入歌名 / 歌手 / UP 主，或歌词片段">
+      <select class="cvl-select" id="cvl-scope" aria-label="检索范围">
+        <option value="name">歌名 / 歌手 / UP 主</option>
+        <option value="lyrics">歌词片段</option>
+      </select>
+      <button class="cvl-btn primary" id="cvl-btn-search" type="button">检索</button>
+    </div>
+    <div class="cvl-reader">
+      <div class="cvl-result-list" id="cvl-results">
+        <div class="cvl-placeholder">输入关键词开始检索</div>
+      </div>
+      <div class="cvl-detail" id="cvl-detail">
+        <div class="cvl-placeholder">选中一首歌后，这里显示完整档案与歌词预览</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="cvl-duo">
+    <section class="cvl-card">
+      <div class="cvl-card-head">
+        <h2 class="cvl-card-title">缺歌词清单</h2>
+        <span class="cvl-card-note" id="cvl-empty-total"></span>
+      </div>
+      <div class="cvl-search-bar">
+        <label class="cvl-field-label" for="cvl-skip-days">跳过天数</label>
+        <input class="cvl-input num" id="cvl-skip-days" type="number" min="0" step="1" value="0">
+        <button class="cvl-btn" id="cvl-btn-empty" type="button">刷新</button>
+      </div>
+      <div class="cvl-hint">跳过最近 N 天内已确认无歌词的条目，避免反复重抓。0 = 不跳过。</div>
+      <div class="cvl-table-wrap">
+        <table class="cvl-table">
+          <thead><tr><th>歌名</th></tr></thead>
+          <tbody id="cvl-empty-body"><tr><td class="cvl-empty-row">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="cvl-card">
+      <div class="cvl-card-head">
+        <h2 class="cvl-card-title">最近命中</h2>
+        <span class="cvl-card-note">群里聊到并被识别的歌</span>
+      </div>
+      <div class="cvl-table-wrap">
+        <table class="cvl-table">
+          <thead><tr><th>时间</th><th>歌名</th><th>歌手</th></tr></thead>
+          <tbody id="cvl-recent-body"><tr><td colspan="3" class="cvl-empty-row">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <div class="cvl-foot">cv_lyric_context · 数据每 4 秒自动刷新 · 页面由宿主沙箱渲染，不发起任何外部请求</div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const bridge = window.maibot;
+
+  /* ---------- 宿主桥接：并发 ≤2 的调度器 ----------
+     宿主 SDK 在 pending >= 2 时直接 throw，这里用队列把并发压到 2 以内。
+     轮询与用户操作共用同一队列，避免互相踩闸。 */
+  const queue = [];
+  let active = 0;
+  function pump() {
+    while (active < 2 && queue.length) {
+      const job = queue.shift();
+      active += 1;
+      Promise.resolve()
+        .then(() => bridge[job.kind](job.name, job.args))
+        .then(job.resolve, job.reject)
+        .finally(() => { active -= 1; pump(); });
+    }
+  }
+  function call(kind, name, args) {
+    return new Promise((resolve, reject) => {
+      queue.push({ kind, name, args: args || {}, resolve, reject });
+      pump();
+    });
+  }
+  const query = (name, args) => call("query", name, args);
+  const action = (name, args) => call("action", name, args);
+
+  /* ---------- 工具 ---------- */
+  function esc(value) {
+    return String(value == null ? "" : value)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+  function num(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+  }
+  function showBanner(message) {
+    $("cvl-banner-text").textContent = message;
+    $("cvl-banner").hidden = false;
+  }
+  $("cvl-banner-close").addEventListener("click", () => { $("cvl-banner").hidden = true; });
+
+  /* ---------- 覆盖率仪表（原创 SVG：半圆弧 + dasharray 控制填充） ---------- */
+  const ARC_LEN = Math.PI * 75; // 半径 75 的半圆周长
+  function renderGauge(percent) {
+    const p = Math.max(0, Math.min(100, num(percent)));
+    $("cvl-gauge-arc").setAttribute("stroke-dasharray", (ARC_LEN * p / 100).toFixed(1) + " " + ARC_LEN.toFixed(1));
+    $("cvl-gauge-text").textContent = p.toFixed(1);
+    $("cvl-gauge-caption").textContent = p >= 99 ? "曲库几乎全部有歌词" : p >= 80 ? "覆盖率良好" : "仍有较多缺歌词，可补抓";
+  }
+
+  /* ---------- 概览渲染 ---------- */
+  function renderStats(data) {
+    const pill = $("cvl-status-pill");
+    if (!data || data.ready === false) {
+      pill.textContent = "曲库不可用";
+      pill.className = "cvl-pill bad";
+      if (data && data.reason) showBanner(data.reason);
+      return;
+    }
+    pill.textContent = "曲库就绪";
+    pill.className = "cvl-pill ok";
+    $("cvl-kpi-total").textContent = num(data.total).toLocaleString();
+    $("cvl-kpi-coverage").textContent = num(data.coverage_percent).toFixed(1) + "%";
+    $("cvl-kpi-coverage-sub").textContent = (num(data.total) - num(data.empty_lyrics)) + " / " + num(data.total) + " 有歌词";
+    $("cvl-kpi-empty").textContent = num(data.empty_lyrics).toLocaleString();
+    $("cvl-kpi-emotion").textContent = num(data.emotion_annotated).toLocaleString();
+    $("cvl-kpi-emotion-sub").textContent = "待标注 " + num(data.emotion_pending);
+    $("cvl-sync-pill").textContent = "上次同步：" + (data.last_sync || "从未同步");
+    $("cvl-kv-sync").textContent = data.last_sync || "从未同步";
+    $("cvl-kv-categories").textContent = data.categories || "—";
+    $("cvl-kv-pending").textContent = num(data.emotion_pending);
+    $("cvl-kv-tags").textContent = (data.emotion_tags || "").split(",").filter(Boolean).join(" / ") || "—";
+    $("cvl-categories-note").textContent = data.categories ? "分类：" + data.categories : "";
+    renderGauge(data.coverage_percent);
+  }
+
+  /* ---------- 任务渲染 ---------- */
+  let lastRunning = false;
+  function renderTask(data) {
+    if (!data) return;
+    const running = !!data.running;
+    const pill = $("cvl-task-pill");
+    if (running) {
+      pill.textContent = (data.kind || "任务") + "进行中";
+      pill.className = "cvl-pill warn run";
+    } else if (data.finished) {
+      pill.textContent = "上次任务已结束";
+      pill.className = "cvl-pill ok";
+    } else {
+      pill.textContent = "空闲";
+      pill.className = "cvl-pill";
+    }
+    $("cvl-btn-sync").disabled = running || !data.can_trigger;
+    $("cvl-btn-refetch").disabled = running || !data.can_trigger;
+    $("cvl-btn-cancel").disabled = !running;
+    const block = $("cvl-block-reason");
+    if (!data.can_trigger && data.trigger_block_reason) {
+      block.textContent = "触发受限：" + data.trigger_block_reason;
+      block.hidden = false;
+    } else {
+      block.hidden = true;
+    }
+    $("cvl-kv-batch").textContent = data.sync_batch_limit > 0 ? String(data.sync_batch_limit) : "不限（页面触发时按 50 首）";
+    $("cvl-task-progress").hidden = !(running || data.finished);
+    $("cvl-progress-fill").style.width = num(data.percent) + "%";
+    $("cvl-task-percent").textContent = num(data.percent).toFixed(1) + "%";
+    $("cvl-task-done").textContent = num(data.done) + " / " + num(data.total);
+    $("cvl-task-added").textContent = num(data.added);
+    $("cvl-task-updated").textContent = num(data.updated);
+    $("cvl-task-failed").textContent = num(data.failed);
+    $("cvl-task-elapsed").textContent = data.elapsed || "—";
+    $("cvl-task-summary").textContent = data.summary || "";
+    const failures = Array.isArray(data.failures) ? data.failures : [];
+    const failList = $("cvl-task-failures");
+    failList.hidden = failures.length === 0;
+    failList.innerHTML = failures.map((f) => "<li>" + esc(f) + "</li>").join("");
+    // 任务刚结束 → 立即拉一次统计与缺歌词清单，让 KPI 跟上
+    if (lastRunning && !running) {
+      refreshStats();
+      refreshEmpty();
+    }
+    lastRunning = running;
+  }
+
+  /* ---------- 检索与详情 ---------- */
+  let searchSeq = 0;
+  async function doSearch() {
+    const keyword = $("cvl-keyword").value.trim();
+    const scope = $("cvl-scope").value;
+    const list = $("cvl-results");
+    if (!keyword) {
+      list.innerHTML = '<div class="cvl-placeholder">输入关键词开始检索</div>';
+      return;
+    }
+    const seq = ++searchSeq;
+    list.innerHTML = '<div class="cvl-placeholder">检索中…</div>';
+    try {
+      const data = await query("search", { keyword, scope, limit: "30" });
+      if (seq !== searchSeq) return; // 已有更新的检索，丢弃旧结果
+      if (!data || data.ready === false) {
+        list.innerHTML = '<div class="cvl-placeholder">' + esc((data && data.reason) || "曲库不可用") + "</div>";
+        return;
+      }
+      const rows = Array.isArray(data.rows) ? data.rows : [];
+      if (!rows.length) {
+        list.innerHTML = '<div class="cvl-placeholder">没有匹配「' + esc(keyword) + "」的歌曲</div>";
+        return;
+      }
+      list.innerHTML = "";
+      rows.forEach((row) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "cvl-result";
+        const lyricBadge = row.has_lyrics
+          ? '<span class="cvl-pill ok">有歌词</span>'
+          : '<span class="cvl-pill warn">缺歌词</span>';
+        const emotion = row.emotion ? '<span class="cvl-pill">' + esc(row.emotion) + "</span>" : "";
+        btn.innerHTML =
+          '<span class="cvl-result-name">' + esc(row.name) + "</span>" +
+          '<span class="cvl-result-meta">' + esc(row.singers || row.uploader || "未知歌手") +
+          " · " + num(row.lyrics_chars) + " 字 " + lyricBadge + emotion + "</span>";
+        btn.addEventListener("click", () => {
+          list.querySelectorAll(".cvl-result.active").forEach((el) => el.classList.remove("active"));
+          btn.classList.add("active");
+          openDetail(row.name);
+        });
+        list.appendChild(btn);
+      });
+    } catch (err) {
+      if (seq !== searchSeq) return;
+      list.innerHTML = '<div class="cvl-placeholder">检索失败：' + esc(err && err.message ? err.message : err) + "</div>";
+    }
+  }
+
+  let detailSeq = 0;
+  async function openDetail(name) {
+    const pane = $("cvl-detail");
+    const seq = ++detailSeq;
+    pane.innerHTML = '<div class="cvl-placeholder">加载「' + esc(name) + "」…</div>";
+    try {
+      const info = await query("song", { name });
+      if (seq !== detailSeq) return;
+      if (!info || info.found === false) {
+        pane.innerHTML = '<div class="cvl-placeholder">' + esc((info && info.reason) || "未找到这首歌") + "</div>";
+        return;
+      }
+      const badges = [];
+      badges.push(info.has_lyrics ? '<span class="cvl-pill ok">有歌词 · ' + num(info.lyrics_chars) + " 字</span>" : '<span class="cvl-pill warn">缺歌词</span>');
+      String(info.emotion || "").split("、").filter(Boolean).forEach((tag) => badges.push('<span class="cvl-pill">' + esc(tag) + "</span>"));
+      const credits = info.credits ? '<div class="cvl-detail-credits">创作者分工：' + esc(info.credits) + "</div>" : "";
+      const tags = info.tags ? '<div class="cvl-detail-credits">标签：' + esc(info.tags) + "</div>" : "";
+      const lyrics = info.lyrics_preview
+        ? '<div class="cvl-lyrics">' + esc(info.lyrics_preview) + "</div>"
+        : '<div class="cvl-placeholder">这首歌还没有歌词，可在上方「补抓缺歌词」</div>';
+      pane.innerHTML =
+        '<h3 class="cvl-detail-name">' + esc(info.name) + "</h3>" +
+        '<div class="cvl-detail-meta">' + badges.join("") + "</div>" +
+        '<div class="cvl-detail-credits">演唱 / UP 主：' + esc(info.singers || info.uploader || "—") + "</div>" +
+        credits + tags + lyrics;
+    } catch (err) {
+      if (seq !== detailSeq) return;
+      pane.innerHTML = '<div class="cvl-placeholder">加载失败：' + esc(err && err.message ? err.message : err) + "</div>";
+    }
+  }
+
+  /* ---------- 缺歌词 / 最近命中 ---------- */
+  async function refreshEmpty() {
+    const body = $("cvl-empty-body");
+    try {
+      const skip = $("cvl-skip-days").value || "0";
+      const data = await query("empty", { limit: "50", skip_days: skip });
+      if (!data || data.ready === false) {
+        body.innerHTML = '<tr><td class="cvl-empty-row">' + esc((data && data.reason) || "曲库不可用") + "</td></tr>";
+        $("cvl-empty-total").textContent = "";
+        return;
+      }
+      $("cvl-empty-total").textContent = "共 " + num(data.total) + " 首";
+      const rows = Array.isArray(data.rows) ? data.rows : [];
+      body.innerHTML = rows.length
+        ? rows.map((r) => "<tr><td>" + esc(r.name) + "</td></tr>").join("")
+        : '<tr><td class="cvl-empty-row">当前没有缺歌词的歌</td></tr>';
+    } catch (err) {
+      body.innerHTML = '<tr><td class="cvl-empty-row">加载失败：' + esc(err && err.message ? err.message : err) + "</td></tr>";
+    }
+  }
+
+  async function refreshRecent() {
+    const body = $("cvl-recent-body");
+    try {
+      const data = await query("recent", { limit: "20" });
+      if (!data || data.ready === false) {
+        body.innerHTML = '<tr><td colspan="3" class="cvl-empty-row">' + esc((data && data.reason) || "记录不可用") + "</td></tr>";
+        return;
+      }
+      const rows = Array.isArray(data.rows) ? data.rows : [];
+      body.innerHTML = rows.length
+        ? rows.map((r) => "<tr><td>" + esc(r.time) + "</td><td>" + esc(r.name) + "</td><td>" + esc(r.artist) + "</td></tr>").join("")
+        : '<tr><td colspan="3" class="cvl-empty-row">还没有命中记录</td></tr>';
+    } catch (err) {
+      body.innerHTML = '<tr><td colspan="3" class="cvl-empty-row">加载失败：' + esc(err && err.message ? err.message : err) + "</td></tr>";
+    }
+  }
+
+  async function refreshStats() {
+    try { renderStats(await query("stats")); } catch (err) { showBanner("读取曲库统计失败：" + (err && err.message ? err.message : err)); }
+  }
+  async function refreshTask() {
+    try { renderTask(await query("task")); } catch (err) { /* 轮询失败静默，下一轮重试 */ }
+  }
+
+  /* ---------- 写操作 ---------- */
+  async function trigger(name) {
+    const limit = $("cvl-limit").value.trim();
+    try {
+      const result = await action(name, { limit: limit || "0" });
+      if (!result || result.ok === false) {
+        showBanner((result && result.reason) || "触发失败");
+        return;
+      }
+      if (result.note) showBanner(result.note);
+      refreshTask();
+    } catch (err) {
+      showBanner("触发失败：" + (err && err.message ? err.message : err));
+    }
+  }
+  $("cvl-btn-sync").addEventListener("click", () => trigger("start_sync"));
+  $("cvl-btn-refetch").addEventListener("click", () => trigger("start_refetch"));
+  $("cvl-btn-cancel").addEventListener("click", async () => {
+    try {
+      const result = await action("cancel");
+      if (!result || result.ok === false) showBanner((result && result.reason) || "取消失败");
+      refreshTask();
+    } catch (err) {
+      // 用户在宿主确认框点了「取消」也会走到这里，不当错误刷屏
+      if (!/cancelled/i.test(String(err && err.message))) showBanner("取消失败：" + (err && err.message ? err.message : err));
+    }
+  });
+
+  /* ---------- 检索交互 ---------- */
+  $("cvl-btn-search").addEventListener("click", doSearch);
+  $("cvl-keyword").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+  let debounceTimer = 0;
+  $("cvl-keyword").addEventListener("input", () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(doSearch, 500);
+  });
+  $("cvl-scope").addEventListener("change", () => { if ($("cvl-keyword").value.trim()) doSearch(); });
+  $("cvl-btn-empty").addEventListener("click", refreshEmpty);
+
+  /* ---------- 启动与轮询 ---------- */
+  async function boot() {
+    if (!bridge || !bridge.ready) {
+      showBanner("宿主桥接未注入，页面无法加载数据");
+      return;
+    }
+    await bridge.ready;
+    // 首批只发 2 个请求（宿主并发闸），其余排队
+    refreshStats();
+    refreshTask();
+    refreshRecent();
+    refreshEmpty();
+    // 任务进度与统计每 4 秒轮询（宿主声明式页面最小 3 秒，这里取 4 秒留余量）
+    setInterval(() => { refreshTask(); refreshStats(); }, 4000);
+    // 命中记录低频刷新
+    setInterval(refreshRecent, 15000);
+  }
+  boot();
+})();
+</script>

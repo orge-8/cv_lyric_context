@@ -25,7 +25,7 @@
   "capabilities": [
     "send.text",
     "llm.generate",
-    "declarative_basic",
+    "custom_pages",
     "api.list"
   ],
   "i18n": {

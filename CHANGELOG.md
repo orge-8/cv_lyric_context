@@ -71,18 +71,44 @@
   9 个页面 API 全部误报「未注册」（单独跑绿、全量跑红）。改用文件顶部
   已加载的命名空间包模块 `_MOD`，不再受路径顺序影响。
 
+### WebUI 歌词页 custom 化（视觉参考 Mai_life，代码全部原创）
+
+- **声明式歌词页 → custom HTML 大屏**：新增 `webui/lyrics.html`，
+  `webui.json` 改 `mode:"custom"` + `entry:"webui/lyrics.html"` +
+  `layout:"document"`，`required_capabilities` 改 `["custom_pages"]`。
+  声明式页面没有 CSS 注入通道，视觉上限就是宿主默认渲染；custom 页
+  拥有完全视觉自由。**9 个 `lyrics.*` API 原样绑定，后端零改动。**
+- **设计语言**（参考 github.com/octmicy/Mai_life，GPL-3.0，**仅借鉴形态、
+  代码全部原创**，本插件 MIT）：宿主 `--maibot-*` token 桥接为本地
+  `--cvl-*` 变量（带亮/暗两套兜底，暗色跟随宿主 `html.dark` 零 JS）；
+  顶栏品牌区 + 状态徽章；4 KPI 瓦片；**原创 SVG 半圆覆盖率仪表**；
+  曲库状态 kv 表；任务进度条 + 6 迷你统计 + 失败样本；检索改**分栏阅读**
+  （左结果列表右歌词 pane，替代原弹窗，点行即读）；缺歌词 / 最近命中双表。
+- **宿主契约对齐**（v1.4.4 源码逐条核实）：CSP 零网络（无外部资源，
+  SVG 内联）；自建 **≤2 并发调度队列**（宿主 `pending>=2` 直接 throw）；
+  `await maibot.ready` 后才发请求；任务进度 4s 轮询、命中记录 15s；
+  条数参数仍传字符串（`_webui_int` 兜底口径不变）；取消按钮保留
+  confirmation（宿主弹框）。
+- `_manifest.json` capabilities：`declarative_basic` → `custom_pages`
+  （与内置 custom 页插件惯例一致；**改 capabilities 需完整重启 MaiBot**）。
+- 回归：`test_webui_pages.py` 重写为 custom 契约（19 项：entry/document
+  注入、JS 绑定名与声明双向一致、轮询 ≥3s、并发 ≤2、零外部资源、
+  manifest 能力）；**新增 `test_webui_render.py`**——Node 最小 DOM stub +
+  模拟宿主桥接，用**真实插件 API 返回**驱动页面 JS 完整渲染，20 项断言
+  （KPI/仪表/徽章/表格/检索详情/触发链路/并发峰值），无 Node 则 skip。
+
 ### 验证
 
-- devkit venv（SDK 2.22.1）全量 pytest：**235 passed**
+- devkit venv（SDK 2.22.1）全量 pytest：**237 passed**
   （联动加固 +18：探测 17 项 + 契约转绿 1 项；WebUI 分组不变量 +2；
-  设 `MAIBOT_HOST_DIR` 后页面测试 8 项 skip 转绿）；
-  契约相关 92 项、E2E 8 项全绿。
+  custom 页契约重写净 +1、渲染冒烟 +1；设 `MAIBOT_HOST_DIR` 后页面测试
+  8 项 skip 转绿）；契约相关 92 项、E2E 8 项全绿。
 - **新增 `tests/smoke_test.py`**（本仓库此前没有冒烟层）：生命周期 +
   组件注册（含两个 API 的 `timeout_ms=3000` metadata 断言）+ 契约形状 +
   帮助/状态命令 + 注入探测降级全链路，零网络。
 - `gate.sh` **PASS 4 / SKIP 0 / FAIL 0**：check_plugin PASS 38 / WARN 5 /
   FAIL 0（WARN 为存量：4 处装饰器命名风格、llm.generate 经 mixin 调用
-  静态扫描不到）；contracts PASS；smoke OK；pytest 235 passed。
+  静态扫描不到）；contracts PASS；smoke OK；pytest 237 passed。
 - **官方最新实测（2026-11-14，交付准入依据）**：
   - 官方渠道核对：MaiBot **v1.4.4**（2026-11-14 发布，较上轮基线 1.4.3 新）、
     SDK **2.23.0**。v1.4.4 源码经 git tag 浅拉取 + archive 导出；
@@ -92,13 +118,21 @@
     **加载成功，28 组件 / 4 能力**；manifest 收紧后严格区间
     host 1.0.0~1.4.4 / sdk 2.1.0~2.23.0 无警告通过。
   - SDK 2.23.0 隔离 venv（Python 3.13.12 + pytest 9.2.0）：
-    pytest **235 passed**、smoke OK、
+    pytest **237 passed**、smoke OK、
     `test_vcpedia_schema.py` **103/103**、`test_annotate_llm.py` **7/7**。
   - WebUI 变更后复跑官方 v1.4.4 loader 探针：加载成功，28 组件 / 4 能力；
     `audit_webui_json.py --host-dir` 权威校验 0 error / 0 warning。
   - 据此放宽 `_manifest.json`：host max 1.3.99→**1.4.4**、
     sdk max 2.16.99→**2.23.0**（实测后才 bump，未写占位大数）。
-- **未真机验证**：探测降级与超时收紧需真机回归（部署指南随交付给出）。
+- **custom 页改造后复验（2026-11-14）**：官方 v1.4.4 loader 探针加载成功
+  （28 组件 / 4 能力，9 个 `lyrics.*` API 全注册）；`load_webui_extension`
+  权威校验通过（entry 读取 + document 注入 + custom_pages 能力）；
+  页面 JS 经 `node --check` 语法校验 + Node 渲染冒烟 20 项断言全过
+  （真实 API 数据驱动，并发峰值实测 =2）；devkit 与 SDK 2.23.0 两环境
+  pytest 均 **237 passed**；gate.sh **PASS 4 / SKIP 0 / FAIL 0**。
+- **未真机验证**：探测降级与超时收紧需真机回归（部署指南随交付给出）；
+  custom 页需真机 dashboard 打开确认渲染与暗色跟随（本地已用真实 API
+  数据 + 模拟宿主桥接做渲染冒烟，但宿主主题探针 / 字体注入未模拟）。
 
 ## [2.18.0] - 2026-11-06
 

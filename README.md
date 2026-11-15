@@ -990,24 +990,37 @@ async def api_get_recent_songs(self, limit: int = 10) -> dict
 > **2.1.0** 才引入（实测 2.0.0 / 2.0.1 的 `maibot_sdk` 没有 `API`，2.1.0 起可用）。
 > 此前声明的 2.0.0 是**低估**——本版开始真正用 `@API`，按"声明要准"改为实际引入版本。
 
-## dashboard 自定义页面（v2.12.0 新增）
+## dashboard 自定义页面（v2.12.0 新增，v2.19.0 改 custom 大屏）
 
-`webui.json` 声明一个**声明式**页面（协议 v2，`declarative_basic`），在 dashboard 的
-**顶部工作区 tab「歌词曲库」**里用：
+`webui.json` 声明一个 **custom HTML 页面**（协议 v2，`custom_pages`，
+入口 `webui/lyrics.html`），在 dashboard **设置侧栏「插件扩展 → 歌词曲库」**里用。
+v2.19.0 前是声明式页面；声明式没有 CSS 注入通道，视觉上限就是宿主默认渲染，
+故改为 custom 页获得完全视觉自由。**视觉语言参考 Mai_life（GPL-3.0，仅借鉴
+形态，页面代码全部原创，本插件 MIT）**：宿主主题 token 桥接 + 暗色跟随、
+KPI 瓦片、SVG 覆盖率仪表、分栏检索阅读。
 
 | 区块 | 内容 | 绑定的 API |
 |---|---|---|
-| 看板 | 曲库总数 / 缺歌词 / 歌词覆盖率 / 已标注情感 | `lyrics.stats` |
-| 曲库状态 | 上次同步、爬取分类、待标注数、配置的单次批量 | `lyrics.stats` / `lyrics.task` |
-| 后台任务 | 触发增量同步、批量补歌词、取消；进度条 + 已完成/新增/失败 | `lyrics.task` / `lyrics.start_sync` / `lyrics.start_refetch` / `lyrics.cancel` |
-| 曲库检索 | 关键词 + 范围（歌名/歌手/UP主 或 歌词片段），点行看歌词预览 | `lyrics.search` |
-| 缺歌词清单（默认收起） | 可按「跳过最近 N 天已确认无歌词」过滤 | `lyrics.empty` |
-| 最近命中 | 群里聊到过的歌（`recent_songs.json`） | `lyrics.recent` |
-| 单曲档案 | 按歌名取完整档案（创作者分工 / 标签 / 歌词预览） | `lyrics.song` |
+| KPI 看板 | 曲库总数 / 歌词覆盖率 / 缺歌词 / 已标注情感 | `lyrics.stats` |
+| 曲库状态 | SVG 覆盖率仪表 + 上次同步、爬取分类、待标注数、单次批量、情感标签体系 | `lyrics.stats` / `lyrics.task` |
+| 后台任务 | 触发增量同步、批量补歌词、取消；进度条 + 6 项统计 + 失败样本，4s 轮询 | `lyrics.task` / `lyrics.start_sync` / `lyrics.start_refetch` / `lyrics.cancel` |
+| 曲库检索 | 关键词 + 范围（歌名/歌手/UP主 或 歌词片段），**左结果列表右歌词阅读 pane** | `lyrics.search` / `lyrics.song` |
+| 缺歌词清单 | 可按「跳过最近 N 天已确认无歌词」过滤 | `lyrics.empty` |
+| 最近命中 | 群里聊到过的歌（`recent_songs.json`），15s 低频刷新 | `lyrics.recent` |
 
-**页面位置必须是 workspace**：sidebar 页只在 dashboard 的「设置」工作区才进左侧栏菜单
-（`Layout.tsx:127-135` 的过滤），用户停在别的插件工作区时整个消失 —— identity-guard
-v1.1.0 真机踩过。顶栏最多直显 2 个工作区 tab，超出的在「更多」菜单里。
+**页面位置**：1.4.0 起所有插件页面统一收进设置侧栏「插件扩展」分组，
+`placement:"workspace"` 已停用（声明里不再写）。
+
+**宿主契约**（v1.4.4 源码核实，页面 JS 已对齐）：
+
+- **CSP 零网络**：页面跑在沙箱 iframe，`connect-src 'none'`，不能引任何外部
+  资源（字体/图表库/图片），SVG 全部内联手写。
+- **并发闸 2**：宿主桥接 `pending >= 2` 直接 throw，页面自建 ≤2 的调度队列，
+  轮询与用户操作共用，避免互相踩闸。
+- **单次调用 10s 超时**：抓取是分钟级任务，触发类 API 只负责起任务，
+  进度靠轮询 `lyrics.task`。
+- **主题跟随**：宿主注入 `--maibot-*` token 并切换 `html.dark`，页面桥接为
+  本地 `--cvl-*` 变量（亮/暗两套兜底），暗色零 JS。
 
 **几个刻意的取舍**（详见 `docs/decisions-lyrics-webui.md`）：
 
@@ -1020,22 +1033,21 @@ v1.1.0 真机踩过。顶栏最多直显 2 个工作区 tab，超出的在「更
   替换原因会在返回结果里说明。
 - **单条写入不做**：改歌词/改情感用 `/歌词 重抓 <歌名>`；页面的单条编辑要和导入链路、
   标注覆盖规则对齐，边界多收益低。
-- **条数参数在声明里是 string**：声明式页面的输入框只能给字符串，声明成 integer 会被宿主
-  判不合规（422，前端只显示「插件 API 执行失败」）。数字转换与范围夹取在插件侧完成。
+- **条数参数在声明里是 string**：页面 JS 统一传字符串，与插件侧 `_webui_int` 的
+  兜底口径一致，避开宿主 integer 严格校验（`type(value) is int`）的布尔/浮点坑。
 
-**2026-10-17 优化轮**（仍属 v2.12.0，细节见 `docs/decisions-lyrics-webui.md`）：
+**历史优化轮**（声明式时代，细节见 `docs/decisions-lyrics-webui.md`）：
 
-- 页面补 `poll_interval_seconds: 3`——`auto_refresh` 只管交互触发重查，没有它后台任务
-  进度不会自动刷新（前端 `seconds < 3` 直接不轮询）；任务区新增「任务类型 / 已用时」。
-- 输入框长 label 精简（协议没有 hint/placeholder，说明下沉为旁挂 text 节点）。
-- 配置页：19 个字段改手工 label（自动推导的 12 字硬切会产出 dangling 括号 / 「的」收尾），
-  11 个格式敏感字段补 placeholder 示例，爬取/选歌/标注/联动四个配套节默认收起
-  （v2.13.0 起 `crawler` 不再收起——它含管理员配置，收起等于藏起来）。
+- 2026-10-17：补 `poll_interval_seconds: 3`、输入框长 label 精简、配置页 19 个字段
+  手工 label + 11 个 placeholder + 配套节收起策略。
+- 2026-11-14（v2.19.0）：配置页节内字段分组（group 小标题）、UX Writing、
+  删 `placement`；歌词页整体 custom 化（见上）。
 
 > 各版本的变更摘要与根因记录见 [**CHANGELOG.md**](CHANGELOG.md)。
 
-**要求**：宿主 **1.3.6+**（协议 v2 起点；1.3.5 及更早会拒绝声明并**连累整个插件加载失败**），
-且 dashboard 前端包含插件页面路由。`@API` 组件自 SDK 2.1.0 起可用（本插件已声明该下限）。
+**要求**：宿主 **1.4.0+**（custom 页 + 侧栏「插件扩展」分组；协议 v2 起点是 1.3.6，
+1.3.5 及更早会拒绝声明并**连累整个插件加载失败**），且 dashboard 前端包含插件页面
+路由与 custom 页沙箱。`@API` 组件自 SDK 2.1.0 起可用（本插件已声明该下限）。
 
 ## 本地测试
 
