@@ -62,10 +62,16 @@ def _load_config() -> Dict[str, str]:
 
 
 def _build_ssl_context(ca_bundle: str) -> ssl.SSLContext:
-    """部分网络出口有 TLS 中间人代理，需要指定代理根证书（同 vcpedia_client）。"""
+    """部分网络出口有 TLS 中间人代理，需要指定代理根证书（同 vcpedia_client）。
+
+    注意不能写成 create_default_context(cafile=...)：CPython 只要传了
+    cafile/capath/cadata 就不再调 load_default_certs()，等于丢掉系统根证书库、
+    只信任这一个文件。这里先建默认上下文（含系统根），再追加自定义 CA。
+    """
+    ctx = ssl.create_default_context()
     if ca_bundle and Path(ca_bundle).is_file():
-        return ssl.create_default_context(cafile=ca_bundle)
-    return ssl.create_default_context()
+        ctx.load_verify_locations(cafile=ca_bundle)
+    return ctx
 
 
 def call_llm(

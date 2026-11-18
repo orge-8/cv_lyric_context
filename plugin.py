@@ -1311,13 +1311,9 @@ class CrawlerSection(PluginConfigBase):
             "避免它们堵在队首被反复重抓（0 表示每次都重抓）"
         ),
     )
-    verify_ssl: bool = Field(
-        default=True,
-        description="是否校验 SSL 证书。网络出口有中间人代理导致报证书错误时可临时关闭（不安全）",
-    )
     ca_bundle: str = Field(
         default="",
-        description="CA 证书文件路径（PEM）。网络出口有中间人代理时，填代理根证书比关掉校验更好",
+        description="CA 证书文件路径（PEM）。网络出口有中间人代理导致证书错误时，填代理根证书（在系统根证书库之上追加信任，证书校验仍开启）",
     )
 
 
@@ -2953,7 +2949,6 @@ _WEBUI_FIELD_GROUPS: dict = {
         "max_fail": "请求与失败策略",
         "sync_batch_limit": "请求与失败策略",
         "refill_cooldown_days": "请求与失败策略",
-        "verify_ssl": "SSL 证书",
         "ca_bundle": "SSL 证书",
     },
     "emotion": {
@@ -2996,7 +2991,7 @@ _WEBUI_LABEL_OVERRIDES: dict = {
 #: 格式敏感字段的占位提示（可视化模式输入框灰字，不改校验语义）。
 _WEBUI_FIELD_PLACEHOLDERS: dict = {
     "meme_phrases": "如：yyds  awsl  爷青回（空格或逗号分隔）",
-    "extra_song_dbs": "如：extra.db 或 D:/libs/a.db, D:/libs/b.db",
+    "extra_song_dbs": "如：extra.db 或 libs/a.db, libs/b.db（相对数据目录，也可填绝对路径）",
     "categories": "如：Category:洛天依歌曲, Category:殿堂曲",
     "sync_admin_ids": "如：123456789, 987654321",
     "ca_bundle": "如：C:/path/to/proxy-root-ca.pem",

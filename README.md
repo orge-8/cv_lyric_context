@@ -442,7 +442,7 @@ MaiBot**，加载时会自动导入，日志里会有 `歌词文件已入库: �
 - 插件**不读宿主的数据库或日志**，也不读其它插件的文件。`sqlite3` 只用在自己数据目录下的运行时曲库、随仓库分发的只读素材库 `assets/knowledge_db.db`，以及你在 `plugin.extra_song_dbs` 里显式指定的外部曲库上——素材库与外部曲库一律以 `mode=ro` 只读打开。
 - 不修改宿主的任何文件，也不改动其它插件或适配器的组件开关状态；配置读写交给宿主的配置管理层，插件不自己写回 `config.toml`。
 - 仓库内不含任何凭据。情绪标注只走 MaiBot 自己的 LLM 通道（宿主配好模型任务即可），插件不持有任何 API key；`config.toml` 由宿主运行时生成，同样不入库。
-- `verify_ssl = false` 默认关闭（默认值 `true`）；只有自己搭了中间人代理、又不想配 `ca_bundle` 时才该打开，插件会在打开时打 warning 日志。详见「公司网络 / 安全软件导致证书错误」。
+- **TLS 证书链校验恒开启**，不提供关闭校验的开关。网络出口有中间人代理（公司网关/安全软件）导致证书错误时，配 `crawler.ca_bundle` 指到代理根证书即可——它在系统根证书库之上**追加**信任，校验仍然开启。详见「公司网络 / 安全软件导致证书错误」。
 
 ## VCPedia 同步
 
@@ -653,8 +653,7 @@ extra_song_dbs = "我的歌库.db"
 | `crawler.max_fail` | 30 | 连续失败达到该次数时提前中止同步 |
 | `crawler.sync_batch_limit` | 0 | 单次同步最多抓取多少首，`0` 表示不限 |
 | `crawler.refill_cooldown_days` | 7 | `/歌词 补歌词` 跳过多少天内已确认无歌词的条目，`0` 表示每次都重抓 |
-| `crawler.verify_ssl` | true | 是否校验 SSL 证书（见下） |
-| `crawler.ca_bundle` | 空 | CA 证书文件路径（PEM），用于有 TLS 中间人的网络 |
+| `crawler.ca_bundle` | 空 | CA 证书文件路径（PEM），用于有 TLS 中间人的网络（证书校验恒开启，见下） |
 
 ### 扩展功能（`[recommend]` / `[emotion]` / `[integration]`）
 
@@ -808,20 +807,15 @@ ca_bundle = "D:/certs/proxy-root-ca.cer"
 | mitmproxy | `~/.mitmproxy/mitmproxy-ca-cert.pem` |
 | Clash Verge | 设置里一般有「系统代理 CA」；找不到就用上面的 `openssl` 命令反查 |
 
-**临时方案：关掉校验**
+**没有「关掉校验」这个选项**
 
-```toml
-[crawler]
-verify_ssl = false
-```
+插件**不提供**关闭证书校验的开关——跳过证书链校验会让流量暴露于中间人窃听，
+而上面的 `ca_bundle` 已经能安全覆盖中间人场景（只追加信任你指定的代理根证书，
+系统根证书库仍然生效，校验全程开启）。拿不到代理根证书时，正确做法是换一个
+不做中间人的网络出口，而不是降级信任。
 
-这会跳过证书链校验，**存在被中间人窃听的风险**。只在确认那个代理是你自己的
-（公司网关、本机安全软件）时才用，公网上不要开。插件关闭校验时会打一条 warning 日志。
-
-> **默认行为**：`crawler.verify_ssl` 的默认值是 **`true`**——即**开箱即用就是完整证书链校验**，
-> 不会静默降级。只有用户显式把它设为 `false` 才会走 `ssl.CERT_NONE` 分支，且那一刻
-> 日志里必有 warning（`已关闭 SSL 证书校验（verify_ssl=false）…`）。优先用上面的
-> `ca_bundle`（只追加信任代理根证书，系统根证书库仍然生效）。
+> **默认行为**：开箱即用就是完整证书链校验，不会静默降级。配了 `ca_bundle`
+> 时在系统根证书库之上追加信任该 CA；未配置则用系统根证书库。
 
 `ca_bundle` 指向的文件不存在或格式非法时，会自动回退到系统证书并记日志，不会让插件起不来。
 
@@ -895,7 +889,7 @@ verify_ssl = false
 | 回「重任务命令默认关闭」 | 没有配置管理员 QQ 号。按[配管理员](#配管理员重任务命令的开关)在「同步与权限」页签填上自己的 QQ 号，保存后通常 1 秒内热更新生效 |
 | 回「这个命令只有管理员能触发」 | 已配白名单，但你的号不在名单里。注意英文逗号分隔、前后不要空格、不要带引号 |
 | 回「未能识别发送者 QQ 号」 | 宿主没把发送者 ID 传进命令载荷。日志里有 `[诊断] 同步命令未能识别发送者字段`，把字段列表反馈给开发者；临时可在本机控制台（若 `allow_local_operator = true`）触发 |
-| `CERTIFICATE_VERIFY_FAILED: self-signed certificate in certificate chain` | 网络出口有 TLS 中间人。配 `crawler.ca_bundle` 指到代理根证书，或临时 `verify_ssl = false`。详见上一节 |
+| `CERTIFICATE_VERIFY_FAILED: self-signed certificate in certificate chain` | 网络出口有 TLS 中间人。配 `crawler.ca_bundle` 指到代理根证书（证书校验仍开启）。详见上一节 |
 | `pass-challenge 返回 403（invalid response.）` | 站点 Anubis 版本升级改变了校验方式，需对照前端 `main.mjs` 调整 |
 | 同步全量失败、日志刷 403/超时 | 请求过密被临时限流。调大 `crawler.request_interval`，等一段时间再试 |
 | 本地 `getaddrinfo failed` / 连不上站 | 网络环境的 DNS 拒绝解析该域名，换 DNS 或网络环境 |
@@ -1083,10 +1077,10 @@ python test_annotate_llm.py
 > **v2.9.0 门禁实测（2026-10-05）**：devkit `run_gates` PASS 2 / SKIP 0 / FAIL 0
 > （`check_plugin` PASS 35 / WARN 4 / FAIL 0、pytest 24 passed）；三层自检
 > pytest 24 + `test_vcpedia_schema.py` 103/103 + `test_annotate_llm.py` 7/7 全绿。
-> 本仓库没有 `tests/smoke_test.py`（自检形态就是上面三条），插件中心自查器
-> `check_submission.py` 报 1 个 FAIL：命中 `vcpedia_client.py` 的 `ssl.CERT_NONE`。
-> 该代码是 v2.x 起就有的**用户显式开关**（`crawler.verify_ssl`，**默认 true 即默认开启校验**，
-> 关闭时打 warning 日志），本版未改动它。
+> 本仓库没有 `tests/smoke_test.py`（自检形态就是上面三条）。
+> **v2.22.0 起已移除「关闭证书校验」开关**（旧 `crawler.verify_ssl` 及其不校验分支）：
+> 证书链校验恒开启，中间人场景统一走 `crawler.ca_bundle`（追加信任代理根，
+> 系统根证书库仍生效）。插件中心自查器 `check_submission.py` 的 TLS FAIL 据此消除。
 >
 > **全检加固（2026-10-05）**：命中记录的降级不再静默——取歌手失败、写盘失败、
 > 加载期坏文件被备份重建，三处都会打 warning（带歌名/路径/原因），

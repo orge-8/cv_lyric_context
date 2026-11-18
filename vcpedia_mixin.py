@@ -288,7 +288,6 @@ class VCPediaMixin:
                 timeout=float(self.config.crawler.timeout),
                 interval=float(self.config.crawler.request_interval),
                 logger=self.ctx.logger,
-                verify_ssl=bool(self.config.crawler.verify_ssl),
                 ca_bundle=str(self.config.crawler.ca_bundle or ""),
             )
         return self._client

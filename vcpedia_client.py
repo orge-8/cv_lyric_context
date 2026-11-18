@@ -91,7 +91,6 @@ class VCPediaClient:
         interval: float = 0.8,
         max_retries: int = 3,
         logger: Optional[logging.Logger] = None,
-        verify_ssl: bool = True,
         ca_bundle: str = "",
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -99,8 +98,9 @@ class VCPediaClient:
         self.interval = interval
         # 有些网络出口（公司代理、部分安全软件）会做 TLS 中间人，用自签证书
         # 替换站点证书，Python 默认校验就会报 CERTIFICATE_VERIFY_FAILED。
-        # 这种情况把 ca_bundle 指到代理根证书即可；不想折腾也可以关掉校验。
-        self.verify_ssl = bool(verify_ssl)
+        # 解法是把 ca_bundle 指到代理根证书（在系统根证书库之上追加信任）。
+        # 证书链校验恒开启，不提供「完全关闭校验」的降级——那会让流量暴露于
+        # 中间人窃听，且 ca_bundle 已能安全覆盖中间人场景。
         self.ca_bundle = str(ca_bundle or "").strip()
         # 站点偶发返回 403/连接超时（反爬限流或网络抖动），失败若干次后重试
         self.max_retries = max(1, int(max_retries))
@@ -116,27 +116,11 @@ class VCPediaClient:
         self._auth_checked = False
 
     def _build_ssl_context(self) -> ssl.SSLContext:
-        """按配置构造 SSL 上下文。
+        """构造 SSL 上下文：证书链校验恒开启。
 
-        优先级：verify_ssl=false（总开关）> ca_bundle（追加信任）> 系统根证书库。
-        顺序不能反：verify_ssl 是用户明确表达的意图，ca_bundle 是修补手段，
-        被修补手段盖掉总开关会导致「我明明关了校验怎么还在报证书错」。
+        配置了 ca_bundle 时在系统根证书库之上**追加**信任该 CA（中间人代理
+        场景）；未配置则用系统根证书库。不提供关闭校验的降级分支。
         """
-        if not self.verify_ssl:
-            if self.ca_bundle:
-                self.logger.warning(
-                    "VCPedia: verify_ssl=false 已生效，ca_bundle（%s）本次被忽略",
-                    self.ca_bundle,
-                )
-            self.logger.warning(
-                "VCPedia: 已关闭 SSL 证书校验（verify_ssl=false）。"
-                "只有在确认网络出口是自己的代理时才该这么做，否则有被中间人窃听的风险。"
-            )
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            return ctx
-
         if self.ca_bundle:
             path = Path(self.ca_bundle).expanduser()
             if not path.is_file():
@@ -350,8 +334,8 @@ class VCPediaClient:
         if "CERTIFICATE_VERIFY_FAILED" in detail or "certificate verify failed" in detail:
             text += (
                 "。这通常是网络出口做了 TLS 中间人（公司代理或安全软件替换了证书），"
-                "可以把代理根证书路径填进 crawler.ca_bundle，"
-                "或临时把 crawler.verify_ssl 设为 false"
+                "把代理根证书路径填进 crawler.ca_bundle 即可（在系统根证书库之上追加信任，"
+                "证书校验仍然开启）"
             )
         elif "getaddrinfo failed" in detail or "Name or service not known" in detail:
             text += "。DNS 解析失败，请检查网络环境能否访问该域名"
