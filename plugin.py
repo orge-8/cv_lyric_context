@@ -59,6 +59,7 @@ import lyrics_import
 from compact_index import CompactIndex
 from lyrics_import import ImportReport
 from recent_songs import DEFAULT_FLUSH_THROTTLE_SEC, RecentSongsLog
+from subspan_events import SubspanEventLog
 from vcpedia_mixin import DB_FILE as VCPEDIA_DB_FILE, VCPediaMixin
 from vcpedia_sync import SyncStats
 from vcpedia_webui import VCPediaWebUIMixin
@@ -554,7 +555,7 @@ class _AssetIndex:
     """
 
     __slots__ = ("songs_by_line", "meta_by_name", "db_meta", "lyrics_by_name", "indexed_names",
-                 "subspans_by_gram", "subspan_n")
+                 "subspans_by_gram", "subspan_n", "subspan_events")
 
     def __init__(self, songs_by_line=None, meta_by_name=None, db_meta=None,
                  lyrics_by_name=None, indexed_names=None,
@@ -573,6 +574,10 @@ class _AssetIndex:
         # 变更须整库重建（见 on_config_update）。0 表示子串匹配关闭。
         self.subspans_by_gram = subspans_by_gram if subspans_by_gram is not None else {}
         self.subspan_n = subspan_n
+        # v2.21.0 构建峰值优化：全量构建期子串事件流（SubspanEventLog）。
+        # 非 None 时 _add_subspans_into 记事件而不物化 dict；构建末尾
+        # finalize() 生成紧凑层。运行时增量合并（_live_index）恒为 None。
+        self.subspan_events: SubspanEventLog | None = None
 
 
 def _add_subspans_into(index: _AssetIndex, key: str, name: str) -> None:
@@ -587,13 +592,20 @@ def _add_subspans_into(index: _AssetIndex, key: str, name: str) -> None:
     n = index.subspan_n
     if n <= 0 or len(key) < n:
         return
+    # v2.21.0 全量构建期：事件流替代 dict 物化（峰值 500→~400MB，
+    # 见 subspan_events.py 与 docs/decisions-build-peak.md）。
+    # 事件序 = 这里的插入序，上限「先到先得」语义由 finalize 保序分组保证。
+    if index.subspan_events is not None:
+        index.subspan_events.record(key, name)
+        return
     table = index.subspans_by_gram
     for i in range(len(key) - n + 1):
         gram = key[i:i + n]
-        bucket = table.get(gram)
-        if bucket is None:
-            table[gram] = [name]
-        elif name not in bucket and len(bucket) < _SUBSPAN_MAX_SONGS:
+        # 桶视图（CompactIndex.setdefault）：get 返回的是副本，直接 append
+        # 会丢写（v2.20.0 增量路径缺陷，v2.21.0 修复）；必须走 setdefault
+        # 拿可写视图。dict 形态（测试/旧路径）下 setdefault 语义相同。
+        bucket = table.setdefault(gram, [])
+        if name not in bucket and len(bucket) < _SUBSPAN_MAX_SONGS:
             bucket.append(name)
 
 
@@ -977,6 +989,15 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str,
     index = _AssetIndex(subspan_n=max(0, int(subspan_n or 0)))
     logs: list[tuple[str, str]] = []
     intern: dict[str, str] = {}
+    # v2.21.0 构建峰值优化：子串事件流（names/name_ids 与整句压实层共享，
+    # 在下方压实段创建后回填）。构建期 _add_subspans_into 只记事件，
+    # 不物化 150 万键的子串 dict；末尾 finalize 生成紧凑层。
+    ev_names: list[str] = []
+    ev_name_ids: dict[str, int] = {}
+    index.subspan_events = SubspanEventLog(
+        index.subspan_n, _SUBSPAN_MAX_SONGS, ev_names, ev_name_ids)
+    # 事件流与整句压实层共享歌名 ID 空间：record 期事件先注册歌名，
+    # 整句 from_mapping 复用同一张表（names/name_ids 原地扩展语义）。
 
     # 旧版把用户数据放在插件目录里，先搬走再读（幂等，无存量时只是一次 exists 判断）
     logs.extend(_migrate_legacy_user_data(data_dir))
@@ -1086,12 +1107,14 @@ def _build_asset_index(raw_extra_dbs: str, data_dir: str,
     # ~47MB、全量常驻歌词 ~23MB。98% 的子串桶只有 1 首歌，大头是 Python
     # 对象开销。压实后两表合计 ~40MB；歌词改按需查库（_lyrics_of 的
     # LRU + SQLite 链路本就存在），只保留「库里查不到」与「用户覆盖」的。
-    names: list[str] = []
-    name_ids: dict[str, int] = {}
+    # 歌名 ID 空间由事件流先注册（record 期覆盖全部准入歌名），整句压实
+    # 复用同一张表；两表共享 names 列表，查询侧歌名 str 只存一份。
     index.songs_by_line = CompactIndex.from_mapping(
-        index.songs_by_line, names, name_ids)
-    index.subspans_by_gram = CompactIndex.from_mapping(
-        index.subspans_by_gram, names, name_ids)
+        index.songs_by_line, ev_names, ev_name_ids)
+    # v2.21.0：子串表不再物化 dict——事件流排序+流式分组直接生成紧凑层
+    # （保序 = 插入序，_SUBSPAN_MAX_SONGS 先到先得语义不变，见 subspan_events.py）。
+    index.subspans_by_gram = index.subspan_events.finalize()
+    index.subspan_events = None
 
     # 运行时歌词回查只走 self.store（= data_dir/vcpedia_songs.db，
     # 与 extra_song_dbs 配置无关），裁剪判定必须用同一个库，否则

@@ -80,6 +80,56 @@ def test_index_idempotent_same_song():
     assert index.subspans_by_gram[_clean("并不喜欢吃鱼")] == ["歌A"]
 
 
+# ── 增量写入 × CompactIndex（v2.21.0 修复回归）────────────────────
+# v2.20.0 的 _add_subspans_into 用 get()+append：CompactIndex.get 返回
+# 副本，append 丢写——同步后新歌的已有片段不登记。修复改走 setdefault
+# 桶视图。以下用压实层做底座验证增量语义与 dict 版一致。
+
+def _compact_base_index(n: int = 6):
+    """先建 dict 底座再压实，模拟「启动构建完成后的运行时索引」。"""
+    from compact_index import CompactIndex
+    index = _make_index(n)
+    key = _clean("其实也并不喜欢吃鱼")
+    _add_subspans_into(index, key, "歌A")
+    names, name_ids = [], {}
+    index.subspans_by_gram = CompactIndex.from_mapping(
+        index.subspans_by_gram, names, name_ids)
+    return index, key
+
+
+def test_incremental_append_on_compact_index():
+    index, key = _compact_base_index()
+    gram = _clean("并不喜欢吃鱼")
+    assert index.subspans_by_gram.get(gram) == ["歌A"]
+    # 增量：新歌进已有片段（v2.20.0 在这里丢写）
+    _add_subspans_into(index, key, "歌B")
+    assert index.subspans_by_gram.get(gram) == ["歌A", "歌B"]
+
+
+def test_incremental_new_gram_on_compact_index():
+    index, _ = _compact_base_index()
+    new_key = _clean(" completely 不同的新句子歌词")
+    _add_subspans_into(index, new_key, "歌C")
+    for i in range(len(new_key) - 6 + 1):
+        assert index.subspans_by_gram.get(new_key[i:i + 6]) == ["歌C"]
+
+
+def test_incremental_cap_on_compact_index():
+    index, key = _compact_base_index()
+    gram = _clean("并不喜欢吃鱼")
+    for song in ("歌B", "歌C", "歌D"):
+        _add_subspans_into(index, key, song)
+    # 上限 3：歌D 不入选（与 dict 版先到先得一致）
+    assert index.subspans_by_gram.get(gram) == ["歌A", "歌B", "歌C"]
+
+
+def test_incremental_dedup_on_compact_index():
+    index, key = _compact_base_index()
+    gram = _clean("并不喜欢吃鱼")
+    _add_subspans_into(index, key, "歌A")  # 已有歌重复登记
+    assert index.subspans_by_gram.get(gram) == ["歌A"]
+
+
 # ── 匹配侧 ──────────────────────────────────────────────────────
 
 def test_find_returns_hit_for_paraphrased_quote():
